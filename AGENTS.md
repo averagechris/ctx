@@ -48,17 +48,31 @@ This is a hard fork of [ctxrs/ctx](https://github.com/ctxrs/ctx) maintained at
 
 ## Release flow
 
-- Bump the version in `crates/ctx-cli/Cargo.toml` (and `Cargo.lock`), update
-  the artifact filenames in `.builds/release-linux-x86_64.yml` to match, run
-  `jj lint`, push, wait for CI green, then
-  `jj tag-push vX.Y.Z --revision main --remote origin`.
-- The `.builds/release-linux-x86_64.yml` manifest builds the Linux
-  `release-artifact` and publishes the downloads page
-  (https://averagechris.srht.site/ctx/) via `build-pages` + `publish-pages`.
-- The darwin artifact is built/published locally:
-  `nix build .#release-artifact`, copy the outputs into `dist/downloads/`,
-  then `nix run .#build-pages -- --include-existing-downloads` and
-  `nix run .#publish-pages`.
+- Standard interface (no hand-editing manifests, no host jj aliases — the old
+  host-level `jj tag-push` is superseded by `nix run .#release-tag`):
+  - `nix run .#prepare-release -- --version X.Y.Z` bumps
+    `crates/ctx-cli/Cargo.toml` + `Cargo.lock`, converts the CHANGELOG.md
+    `## Unreleased` section into a dated `## vX.Y.Z` entry (generating bullets
+    from conventional commits if it is empty), and rewrites the artifact
+    filenames in `builds/release-linux-x86_64.yml`.
+  - `nix run .#release-tag` creates `vX.Y.Z` from the Cargo.toml version via
+    `jj tag set` and pushes it to origin.
+  - `nix run .#release -- --version X.Y.Z [--publish-pages]
+    [--submit-linux-build] [--skip-validate|--skip-tag|--skip-artifact|--skip-pages]`
+    orchestrates the whole flow: prepare → validate (`ci-fmt`, `ci-clippy`,
+    `ci-test`, `ci-docs`) → tag + move the `main` bookmark → build the local
+    `release-artifact` into `dist/downloads/` → `build-pages` (pages publish
+    and Linux build submission are opt-in flags).
+- `builds/release-linux-x86_64.yml` builds the Linux `release-artifact` and
+  publishes the downloads page (https://averagechris.srht.site/ctx/) via
+  `build-pages` + `publish-pages`. It lives in `builds/` (not `.builds/`) so
+  it does not auto-run on every push; submit it explicitly with
+  `nix run .#release -- --submit-linux-build` or
+  `hut builds submit builds/release-linux-x86_64.yml`.
+- The darwin artifact is built/published locally by the orchestrator, or by
+  hand: `nix build .#release-artifact`, copy the outputs into
+  `dist/downloads/`, then `nix run .#build-pages -- --include-existing-downloads`
+  and `nix run .#publish-pages`.
 
 ## Upstream review memory
 

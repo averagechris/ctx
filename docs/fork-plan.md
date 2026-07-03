@@ -46,6 +46,7 @@ exposes deterministic search, read-only SQL, and an MCP server. An audit
 | 8 | MCP `sql` tool | Keep. Document the secrets-exposure risk; this is a personal/trusted-team tool. |
 | 9 | Schema | Leave upstream schema v15 untouched for now. If we ever diverge, start our migration numbering at 1000 to avoid colliding with upstream's chain. |
 | 10 | VCS | jj. Remote `upstream` = github.com/ctxrs/ctx (fetch-only for selective porting), remote `origin` = git.sr.ht/~averagechris/ctx. Trunk bookmark: `main`. |
+| 11 | Versioning | Rebaselined to `1.0.0` at first fork release. Upstream stayed at 0.x; a disjoint major makes fork releases unambiguous. Releases are SourceHut `vX.Y.Z` tags on `main`. |
 
 ## Plan
 

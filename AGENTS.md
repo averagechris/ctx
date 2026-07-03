@@ -14,7 +14,9 @@ This is a hard fork of [ctxrs/ctx](https://github.com/ctxrs/ctx) maintained at
   `cargo test --workspace`. Or run the CI wrappers directly: `nix run .#ci-fmt`,
   `nix run .#ci-clippy`, `nix run .#ci-test`, `nix run .#ci-docs`.
   `nix flake check` builds the package with the full test suite. SourceHut CI
-  runs the same wrappers via `.builds/ci.yml`.
+  runs the same wrappers via `.builds/ci.yml`. `jj lint` runs the fast gates
+  (`ci-fmt`, `ci-clippy`, `ci-docs`) from `.jj-lint.toml` — run it before
+  pushing.
 - `crates/ctx-cli/tests/cli.rs` is the behavioral contract — lean on it when
   refactoring; extend it when changing command behavior.
 

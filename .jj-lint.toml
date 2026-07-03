@@ -1,0 +1,5 @@
+lints = [
+  { name = "ci fmt", command = "nix run .#ci-fmt" },
+  { name = "ci clippy", command = "nix run .#ci-clippy" },
+  { name = "ci docs", command = "nix run .#ci-docs" },
+]

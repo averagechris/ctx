@@ -40,6 +40,7 @@ use ctx_history_capture::{
     GeminiCliImportOptions, HermesSqliteImportOptions, NanoClawImportOptions,
     OpenClawImportOptions, OpenCodeSqliteImportOptions, PiSessionImportOptions,
     ProviderImportSummary, ProviderImportSupport, ProviderSource, ProviderSourceStatus,
+    OPENCODE_CURSOR_V2_PREFIX,
 };
 use ctx_history_core::{
     database_path, default_data_root, utc_now, CaptureProvider, ContextCitation,
@@ -2267,6 +2268,7 @@ fn source_import_json(
         "skipped": summary.skipped,
         "failed": summary.failed,
         "failures": provider_failures_json(summary),
+        "notes": summary.notes,
     })
 }
 
@@ -2372,6 +2374,9 @@ fn print_source_imported(source: &SourceInfo, summary: &ProviderImportSummary) {
         summary.skipped,
         summary.failed
     );
+    for note in &summary.notes {
+        println!("  note: {note}");
+    }
 }
 
 fn print_history_source_plugin_imported(
@@ -4784,6 +4789,7 @@ fn import_one_source_inner(
     let tool_output_mode = codex_tool_output_mode()?;
     let event_mode = codex_event_import_mode()?;
     let include_notices = codex_include_notices();
+    let full_rescan = full_rescan || source_cursor_requires_rescan(store, source)?;
     if !full_rescan && source_uses_import_file_manifest(source) {
         return import_manifested_source(
             store,
@@ -5092,6 +5098,31 @@ fn import_manifested_source(
     Ok(summary)
 }
 
+/// Detect stores written by an older adapter whose sync cursor format has
+/// since changed, and force one full rescan so history the old adapter
+/// missed is picked up.
+///
+/// OpenCode: cursors written before the message/part-aware adapter look like
+/// `session_message:<session_id>:seq:<n>`. The new adapter prefixes all
+/// cursors with `opencode-v2:`. An old-format cursor means the store may only
+/// contain the (nearly empty) session_message projection, so re-scan the
+/// database once; event-level dedupe keeps this idempotent.
+fn source_cursor_requires_rescan(store: &Store, source: &SourceInfo) -> Result<bool> {
+    if source.provider != CaptureProvider::OpenCode {
+        return Ok(false);
+    }
+    let machine_id = OpenCodeSqliteImportOptions::default().machine_id;
+    let stream = format!(
+        "provider:{}:{}",
+        source.provider.as_str(),
+        source.source_format
+    );
+    let Some(cursor) = store.get_sync_cursor(None, &machine_id, &stream)? else {
+        return Ok(false);
+    };
+    Ok(!cursor.cursor.starts_with(OPENCODE_CURSOR_V2_PREFIX))
+}
+
 fn source_uses_import_file_manifest(source: &SourceInfo) -> bool {
     !matches!(
         source.source_format,
@@ -5118,6 +5149,7 @@ fn merge_provider_import_summary(
     summary.imported_edges += other.imported_edges;
     summary.skipped_edges += other.skipped_edges;
     summary.failures.extend(other.failures);
+    summary.notes.extend(other.notes);
 }
 
 fn collect_source_import_files(source: &SourceInfo) -> Result<Vec<SourceImportFile>> {
@@ -5916,5 +5948,44 @@ mod tests {
 
         fs::write(&path, "mutated\n").unwrap();
         assert!(!catalog_import_checkpoint_matches(&path, 7, Some(&prefix_hash)).unwrap());
+    }
+
+    #[test]
+    fn opencode_old_format_cursor_forces_full_rescan_once() {
+        use super::{provider_source_for_path, source_cursor_requires_rescan};
+        use ctx_history_capture::{OpenCodeSqliteImportOptions, OPENCODE_CURSOR_V2_PREFIX};
+        use ctx_history_core::{utc_now, CaptureProvider, EntityTimestamps, SyncCursor};
+        use ctx_history_store::Store;
+        use uuid::Uuid;
+
+        let temp = tempdir().unwrap();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let source =
+            provider_source_for_path(CaptureProvider::OpenCode, temp.path().join("opencode.db"));
+        let machine_id = OpenCodeSqliteImportOptions::default().machine_id;
+
+        // No cursor yet: nothing to migrate.
+        assert!(!source_cursor_requires_rescan(&store, &source).unwrap());
+
+        let mut cursor = SyncCursor {
+            id: Uuid::new_v4(),
+            team_id: None,
+            device_id: machine_id,
+            stream: format!("provider:opencode:{}", source.source_format),
+            cursor: "session_message:ses_123:seq:1".to_owned(),
+            last_synced_at: None,
+            timestamps: EntityTimestamps {
+                created_at: utc_now(),
+                updated_at: utc_now(),
+            },
+        };
+        store.upsert_sync_cursor(&cursor).unwrap();
+        // Old-format cursor written by the pre-message/part adapter: rescan.
+        assert!(source_cursor_requires_rescan(&store, &source).unwrap());
+
+        cursor.cursor = format!("{OPENCODE_CURSOR_V2_PREFIX}message_part:ses_123:prt_1");
+        store.upsert_sync_cursor(&cursor).unwrap();
+        // New-format cursor: no rescan needed.
+        assert!(!source_cursor_requires_rescan(&store, &source).unwrap());
     }
 }

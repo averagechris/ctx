@@ -84,6 +84,61 @@ history, requiring API keys, or making network calls:
 cargo test -p ctx --test cli
 ```
 
+## OpenCode
+
+OpenCode ships from a fast-moving development branch, so the adapter detects
+the schema of `opencode.db` at import time (via `sqlite_master` and
+`pragma table_info`) instead of assuming a version. The
+`__drizzle_migrations` table is recorded only as a diagnostic hint in source
+metadata, never used for dispatch.
+
+Source preference, richest first:
+
+- `session` joined with `message` + `part` — the current schema, where the
+  full history lives. Parts map to ctx events: `text` → message, `tool` →
+  tool_call (with input/output previews), `reasoning`/`compaction` → summary,
+  `patch` → file_touched; `step-start`/`step-finish`/`snapshot` bookkeeping
+  parts are skipped and reported in import notes. Later-added session columns
+  (`workspace_id`, `path`, `agent`, `model`, token counters) are optional.
+- `session_message` / `session_entry` rows are also imported, but rows whose
+  external IDs already appeared in the `message`/`part` tables are
+  deduplicated, so a nearly empty `session_message` table can never mask a
+  populated `message`/`part` store and nothing is double-imported.
+- In databases where `part` is absent or empty, message content is read
+  inline from `message.data` (very old schemas).
+
+Sessions with no message rows are still imported so the session catalog
+matches the provider database, and subagent sessions keep their `parent_id`
+hierarchy. If the database contains sessions and message rows but the adapter
+produces zero events, the import reports a loud schema-mismatch failure
+instead of silently succeeding. Import notes (`ctx import --json` `notes`
+field) explain everything that was skipped and why.
+
+### Cursor format and migration
+
+Adapter sync cursors are prefixed `opencode-v2:`
+(`opencode-v2:message_part:<session_id>:<row_id>` for message/part events,
+`opencode-v2:session_message:<session_id>:seq:<n>` for fallback rows).
+Versions before the message/part-aware adapter wrote
+`session_message:<session_id>:seq:<n>` and could import almost nothing from a
+current-schema database. On upgrade, a stored old-format cursor forces one
+full rescan of the database (bypassing the unchanged-file manifest check), so
+existing history is picked up automatically; event-level deduplication keeps
+the rescan idempotent and previously imported stub sessions are not
+duplicated. `ctx import --provider opencode --resume` forces the same full
+rescan manually.
+
+### Legacy JSON storage
+
+Very old OpenCode versions stored sessions as JSON files under
+`~/.local/share/opencode/storage/` (`message/<session_id>/*.json`,
+`part/<message_id>/*.json`) before `opencode.db` existed; newer OpenCode
+builds migrate that data into the database themselves. ctx does not ship an
+in-tree adapter for the JSON tree; if you have unmigrated JSON-only history,
+export it through a history-source plugin using `ctx-history-jsonl-v1`.
+Databases and storage trees can coexist — the adapter only reads
+`opencode.db` and never touches `storage/`.
+
 ## Import Rules
 
 Provider imports should be:

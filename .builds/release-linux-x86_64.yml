@@ -18,5 +18,5 @@ tasks:
       nix run .#build-pages -- --include-existing-downloads
       nix run .#publish-pages
 artifacts:
-  - artifacts/ctx-v1.0.0-x86_64-linux.tar.gz
-  - artifacts/ctx-v1.0.0-x86_64-linux.tar.gz.sha256
+  - artifacts/ctx-v1.0.1-x86_64-linux.tar.gz
+  - artifacts/ctx-v1.0.1-x86_64-linux.tar.gz.sha256

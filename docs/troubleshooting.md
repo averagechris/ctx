@@ -34,6 +34,19 @@ populate touched-file metadata and unredacted local transcript text.
 If the raw provider file moved, indexed text may still be searchable, but source
 citations should report that the raw path is unavailable.
 
+## OpenCode Import Finds Few or No Sessions
+
+Versions before the message/part-aware adapter read OpenCode's
+`session_message` table, which is nearly empty on current OpenCode builds, so
+large databases imported almost nothing. After upgrading ctx, the first
+`ctx import --provider opencode` detects the old cursor format and
+automatically rescans the whole database; `--resume` forces the same full
+rescan manually. The rescan is idempotent — previously imported sessions and
+events are not duplicated. If a populated database still yields zero events,
+the import reports a schema-mismatch failure with table row counts; file an
+issue with that message. See [providers.md](providers.md#opencode) for the
+adapter's schema-detection rules.
+
 ## JSON Consumer Fails
 
 Run the same command without `--json` to inspect warnings, then run:

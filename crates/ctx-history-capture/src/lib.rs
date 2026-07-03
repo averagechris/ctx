@@ -241,6 +241,11 @@ pub struct ProviderImportSummary {
     pub imported_edges: usize,
     pub skipped_edges: usize,
     pub failures: Vec<ProviderImportFailure>,
+    /// Human-readable diagnostics about what the adapter saw and skipped
+    /// (e.g., schema detection results, deduplicated rows). Surfaced in
+    /// `ctx import --json` output.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1684,6 +1689,7 @@ impl ProviderImportSummary {
         self.imported_edges += other.imported_edges;
         self.skipped_edges += other.skipped_edges;
         self.failures.extend(other.failures);
+        self.notes.extend(other.notes);
     }
 }
 
@@ -8190,6 +8196,126 @@ fn astrbot_selected_conversation(conn: &Connection) -> Result<Option<String>> {
     Ok(value)
 }
 
+/// Prefix for the v2 OpenCode cursor format written by the message/part-aware
+/// adapter. Old cursors looked like `session_message:<session_id>:seq:<n>`;
+/// v2 cursors are:
+///
+///   - `opencode-v2:message_part:<session_id>:<row_id>` for events derived
+///     from the `message`/`part` tables (the current OpenCode schema), and
+///   - `opencode-v2:session_message:<session_id>:seq:<n>` for events from the
+///     `session_message`/`session_entry` fallback tables.
+///
+/// The adapter itself always performs a full scan and dedupes against the
+/// store, so cursors are checkpoints for diagnostics and for the CLI-side
+/// migration check: a stored cursor without this prefix forces one full
+/// rescan so history missed by the old adapter is picked up.
+pub const OPENCODE_CURSOR_V2_PREFIX: &str = "opencode-v2:";
+
+/// Event indices for message/part-derived events start here so they can never
+/// collide with `session_message`/`session_entry` seq-based indices (small
+/// integers) already present in existing stores.
+const OPENCODE_MESSAGE_PART_EVENT_INDEX_BASE: i64 = 100_000;
+
+struct OpenCodeCaptureContext<'a> {
+    context: &'a ProviderAdapterContext,
+    raw_source_path: String,
+    source_metadata: Value,
+    session_started: BTreeMap<String, DateTime<Utc>>,
+    sessions_by_id: BTreeMap<String, OpenCodeSessionRow>,
+    line: usize,
+}
+
+impl OpenCodeCaptureContext<'_> {
+    fn next_line(&mut self) -> usize {
+        self.line += 1;
+        self.line
+    }
+
+    fn capture(
+        &self,
+        session: &OpenCodeSessionRow,
+        event: Option<ProviderEventEnvelope>,
+    ) -> ProviderCaptureEnvelope {
+        let is_subagent = session.parent_id.is_some();
+        let cursor = event.as_ref().and_then(|event| {
+            event.cursor.as_ref().map(|cursor| ProviderCursorRange {
+                before: None,
+                after: Some(ProviderCursorCheckpoint {
+                    stream: provider_cursor_stream(
+                        CaptureProvider::OpenCode,
+                        OPENCODE_SQLITE_SOURCE_FORMAT,
+                    ),
+                    cursor: cursor.clone(),
+                    observed_at: event.occurred_at,
+                }),
+            })
+        });
+        let started_at = self
+            .session_started
+            .get(&session.id)
+            .copied()
+            .unwrap_or(self.context.imported_at);
+        ProviderCaptureEnvelope {
+            schema_version: PROVIDER_CAPTURE_ENVELOPE_SCHEMA_VERSION,
+            provider: CaptureProvider::OpenCode,
+            source: ProviderSourceEnvelope {
+                source_format: OPENCODE_SQLITE_SOURCE_FORMAT.to_owned(),
+                machine_id: self.context.machine_id.clone(),
+                observed_at: self.context.imported_at,
+                raw_source_path: Some(self.raw_source_path.clone()),
+                raw_retention: ProviderRawRetention::PathReference,
+                redaction_boundary: ProviderRedactionBoundary::BeforeExport,
+                trust: ProviderSourceTrust::ProviderNative,
+                fidelity: Fidelity::Imported,
+                cursor,
+                idempotency_key: Some(format!(
+                    "provider-source:opencode:{OPENCODE_SQLITE_SOURCE_FORMAT}:{}",
+                    session.id
+                )),
+                metadata: self.source_metadata.clone(),
+            },
+            session: ProviderSessionEnvelope {
+                provider_session_id: session.id.clone(),
+                parent_provider_session_id: session.parent_id.clone(),
+                root_provider_session_id: session.parent_id.clone(),
+                external_agent_id: session.agent.clone(),
+                agent_type: if is_subagent {
+                    AgentType::Subagent
+                } else {
+                    AgentType::Primary
+                },
+                role_hint: session
+                    .agent
+                    .clone()
+                    .or_else(|| Some(if is_subagent { "subagent" } else { "primary" }.to_owned())),
+                is_primary: !is_subagent,
+                status: SessionStatus::Imported,
+                started_at,
+                ended_at: None,
+                cwd: Some(session.directory.clone()),
+                fidelity: Fidelity::Imported,
+                idempotency_key: Some(format!("provider-session:opencode:{}", session.id)),
+                artifacts: Vec::new(),
+                metadata: json!({
+                    "source_format": OPENCODE_SQLITE_SOURCE_FORMAT,
+                    "title": session.title,
+                    "model": parse_json_object_string(session.model.as_deref()),
+                    "agent": session.agent,
+                    "time_updated": session.time_updated,
+                    "tokens": {
+                        "input": session.tokens_input,
+                        "output": session.tokens_output,
+                        "reasoning": session.tokens_reasoning,
+                        "cache_read": session.tokens_cache_read,
+                        "cache_write": session.tokens_cache_write,
+                    },
+                }),
+            },
+            event,
+        }
+    }
+}
+
 fn normalize_opencode_sqlite(
     path: &Path,
     context: &ProviderAdapterContext,
@@ -8202,30 +8328,387 @@ fn normalize_opencode_sqlite(
     conn.pragma_update(None, "query_only", true)?;
     let user_version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     let schema_fingerprint = opencode_schema_fingerprint(&conn)?;
-    let legacy_message_rows = opencode_count(&conn, "message").unwrap_or(0);
-    let legacy_part_rows = opencode_count(&conn, "part").unwrap_or(0);
     let sessions = opencode_sessions(&conn)?;
-    let messages = opencode_session_messages(&conn)?;
-    let mut result = ProviderNormalizationResult::default();
-    let session_started = sessions
-        .iter()
-        .map(|session| {
-            (
-                session.id.clone(),
-                timestamp_millis_utc(session.time_created, context.imported_at),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    let sessions_by_id = sessions
-        .into_iter()
-        .map(|session| (session.id.clone(), session))
-        .collect::<BTreeMap<_, _>>();
+    let has_message = sqlite_table_exists(&conn, "message")?;
+    let has_part = sqlite_table_exists(&conn, "part")?;
+    let has_session_message = sqlite_table_exists(&conn, "session_message")?;
+    let has_session_entry = sqlite_table_exists(&conn, "session_entry")?;
+    let message_rows = if has_message {
+        opencode_count(&conn, "message").unwrap_or(0)
+    } else {
+        0
+    };
+    let part_rows = if has_part {
+        opencode_count(&conn, "part").unwrap_or(0)
+    } else {
+        0
+    };
+    let session_message_rows = if has_session_message {
+        opencode_count(&conn, "session_message").unwrap_or(0)
+    } else {
+        0
+    };
+    let session_entry_rows = if has_session_entry {
+        opencode_count(&conn, "session_entry").unwrap_or(0)
+    } else {
+        0
+    };
+    // Diagnostic hint only; never used for schema dispatch. Schema detection
+    // is via sqlite_master + pragma table_info above.
+    let drizzle_migrations = opencode_count(&conn, "__drizzle_migrations").ok();
 
-    for row in messages {
-        let Some(session) = sessions_by_id.get(&row.session_id) else {
+    let session_order = sessions
+        .iter()
+        .map(|session| session.id.clone())
+        .collect::<Vec<_>>();
+    let mut ctx = OpenCodeCaptureContext {
+        context,
+        raw_source_path: path.display().to_string(),
+        source_metadata: json!({
+            "adapter": OPENCODE_SQLITE_SOURCE_FORMAT,
+            "sqlite_user_version": user_version,
+            "schema_fingerprint": schema_fingerprint,
+            "drizzle_migrations": drizzle_migrations,
+            "message_rows": message_rows,
+            "part_rows": part_rows,
+            "session_message_rows": session_message_rows,
+            "session_entry_rows": session_entry_rows,
+        }),
+        session_started: sessions
+            .iter()
+            .map(|session| {
+                (
+                    session.id.clone(),
+                    timestamp_millis_utc(session.time_created, context.imported_at),
+                )
+            })
+            .collect(),
+        sessions_by_id: sessions
+            .into_iter()
+            .map(|session| (session.id.clone(), session))
+            .collect(),
+        line: 0,
+    };
+
+    let mut result = ProviderNormalizationResult::default();
+    let mut known_row_ids = BTreeSet::<String>::new();
+    let mut sessions_with_events = BTreeSet::<String>::new();
+    let mut skipped_bookkeeping_parts = 0usize;
+    let mut skipped_partless_messages = 0usize;
+    let mut deduped_fallback_rows = 0usize;
+
+    if has_message {
+        normalize_opencode_message_parts(
+            &conn,
+            // Only fall back to message-level events when the part table is
+            // absent or empty (very old schemas stored content inline in
+            // message.data). In part-populated databases a part-less message
+            // is either content-free or still being streamed by a live
+            // OpenCode process; emitting an event for it would consume an
+            // event index that its parts will need on the next import.
+            has_part && part_rows > 0,
+            &mut ctx,
+            &mut result,
+            &mut known_row_ids,
+            &mut sessions_with_events,
+            &mut skipped_bookkeeping_parts,
+            &mut skipped_partless_messages,
+        )?;
+    }
+    if has_session_message {
+        let rows = opencode_session_message_rows(&conn)?;
+        emit_opencode_fallback_rows(
+            rows,
+            &mut ctx,
+            &mut result,
+            &known_row_ids,
+            &mut sessions_with_events,
+            &mut deduped_fallback_rows,
+        );
+    }
+    if has_session_entry {
+        let rows = opencode_session_entry_rows(&conn)?;
+        emit_opencode_fallback_rows(
+            rows,
+            &mut ctx,
+            &mut result,
+            &known_row_ids,
+            &mut sessions_with_events,
+            &mut deduped_fallback_rows,
+        );
+    }
+
+    let event_captures = result
+        .captures
+        .iter()
+        .filter(|(_, capture)| capture.event.is_some())
+        .count();
+
+    // Sessions without any event rows are still imported so the session
+    // catalog matches the provider database.
+    for session_id in &session_order {
+        if sessions_with_events.contains(session_id) {
+            continue;
+        }
+        let Some(session) = ctx.sessions_by_id.get(session_id) else {
+            continue;
+        };
+        let capture = ctx.capture(session, None);
+        let line = ctx.next_line();
+        result.captures.push((line, capture));
+    }
+
+    if skipped_bookkeeping_parts > 0 {
+        result.summary.notes.push(format!(
+            "opencode: skipped {skipped_bookkeeping_parts} bookkeeping part row(s) (step-start/step-finish/snapshot) with no conversational content"
+        ));
+    }
+    if skipped_partless_messages > 0 {
+        result.summary.notes.push(format!(
+            "opencode: skipped {skipped_partless_messages} message row(s) without part rows (content-free or still being written by a live OpenCode session; picked up on a later import once parts exist)"
+        ));
+    }
+    if deduped_fallback_rows > 0 {
+        result.summary.notes.push(format!(
+            "opencode: deduplicated {deduped_fallback_rows} session_message/session_entry row(s) already imported from the message/part tables"
+        ));
+    }
+    let total_source_rows = message_rows + session_message_rows + session_entry_rows;
+    if !session_order.is_empty() && event_captures == 0 && total_source_rows > 0 {
+        result.summary.failed += 1;
+        result.summary.failures.push(ProviderImportFailure {
+            line: 0,
+            error: format!(
+                "found {} session(s) and {total_source_rows} message row(s) in the OpenCode database but the adapter produced 0 events — schema mismatch? (tables: message={message_rows}, part={part_rows}, session_message={session_message_rows}, session_entry={session_entry_rows}, drizzle_migrations={drizzle_migrations:?}, sqlite_user_version={user_version})",
+                session_order.len(),
+            ),
+        });
+    }
+    result.summary.notes.push(format!(
+        "opencode: sessions={} message_rows={message_rows} part_rows={part_rows} session_message_rows={session_message_rows} session_entry_rows={session_entry_rows} event_captures={event_captures}",
+        session_order.len(),
+    ));
+
+    Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn normalize_opencode_message_parts(
+    conn: &Connection,
+    parts_populated: bool,
+    ctx: &mut OpenCodeCaptureContext<'_>,
+    result: &mut ProviderNormalizationResult,
+    known_row_ids: &mut BTreeSet<String>,
+    sessions_with_events: &mut BTreeSet<String>,
+    skipped_bookkeeping_parts: &mut usize,
+    skipped_partless_messages: &mut usize,
+) -> Result<()> {
+    let msg_columns = sqlite_table_columns(conn, "message")?;
+    ensure_sqlite_table_columns(
+        &msg_columns,
+        "OpenCode SQLite message table",
+        &["id", "session_id", "data"],
+    )?;
+    let m_time_created = optional_column_expr(&msg_columns, "time_created", "0");
+    let m_time_updated = optional_column_expr(&msg_columns, "time_updated", m_time_created);
+    let order_by = if msg_columns.contains("time_created") {
+        "session_id, time_created, id"
+    } else {
+        "session_id, id"
+    };
+    let msg_sql = format!(
+        "select id, session_id, {m_time_created}, {m_time_updated}, data from message order by {order_by}"
+    );
+
+    let mut part_stmt = if parts_populated {
+        let part_columns = sqlite_table_columns(conn, "part")?;
+        ensure_sqlite_table_columns(
+            &part_columns,
+            "OpenCode SQLite part table",
+            &["id", "message_id", "data"],
+        )?;
+        let p_time_created = optional_column_expr(&part_columns, "time_created", "0");
+        let p_time_updated = optional_column_expr(&part_columns, "time_updated", p_time_created);
+        Some(conn.prepare(&format!(
+            "select id, {p_time_created}, {p_time_updated}, data from part where message_id = ?1 order by id"
+        ))?)
+    } else {
+        None
+    };
+
+    let mut next_index_by_session = BTreeMap::<String, i64>::new();
+    let mut next_index = |session_id: &str| -> i64 {
+        let entry = next_index_by_session
+            .entry(session_id.to_owned())
+            .and_modify(|index| *index += 1)
+            .or_insert(OPENCODE_MESSAGE_PART_EVENT_INDEX_BASE);
+        *entry
+    };
+
+    let mut msg_stmt = conn.prepare(&msg_sql)?;
+    let mut msg_rows = msg_stmt.query([])?;
+    while let Some(row) = msg_rows.next()? {
+        let message_id: String = row.get(0)?;
+        let session_id: String = row.get(1)?;
+        let time_created: i64 = row.get(2)?;
+        let time_updated: i64 = row.get(3)?;
+        let data: String = row.get(4)?;
+        known_row_ids.insert(message_id.clone());
+        let line = ctx.next_line();
+        let Some(session) = ctx.sessions_by_id.get(&session_id).cloned() else {
             result.summary.failed += 1;
             result.summary.failures.push(ProviderImportFailure {
-                line: row.seq.max(0) as usize,
+                line,
+                error: format!(
+                    "OpenCode message {message_id} references missing session {session_id}"
+                ),
+            });
+            continue;
+        };
+        let message_data: Value = match serde_json::from_str(&data) {
+            Ok(data) => data,
+            Err(err) => {
+                result.summary.failed += 1;
+                result.summary.failures.push(ProviderImportFailure {
+                    line,
+                    error: format!("invalid JSON in message {message_id}: {err}"),
+                });
+                continue;
+            }
+        };
+        drop(data);
+
+        let mut had_parts = false;
+        if let Some(stmt) = part_stmt.as_mut() {
+            let mut part_rows = stmt.query([&message_id])?;
+            while let Some(part_row) = part_rows.next()? {
+                had_parts = true;
+                let part_id: String = part_row.get(0)?;
+                let part_time_created: i64 = part_row.get(1)?;
+                let part_time_updated: i64 = part_row.get(2)?;
+                let part_data_raw: String = part_row.get(3)?;
+                known_row_ids.insert(part_id.clone());
+                let part_line = ctx.next_line();
+                let part_data: Value = match serde_json::from_str(&part_data_raw) {
+                    Ok(data) => data,
+                    Err(err) => {
+                        result.summary.failed += 1;
+                        result.summary.failures.push(ProviderImportFailure {
+                            line: part_line,
+                            error: format!("invalid JSON in part {part_id}: {err}"),
+                        });
+                        continue;
+                    }
+                };
+                drop(part_data_raw);
+                let part_type = part_data
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_owned();
+                if matches!(
+                    part_type.as_str(),
+                    "step-start" | "step-finish" | "snapshot"
+                ) {
+                    *skipped_bookkeeping_parts += 1;
+                    continue;
+                }
+                let index = next_index(&session_id);
+                let occurred_at = opencode_event_time(&part_data).unwrap_or_else(|| {
+                    timestamp_millis_utc(part_time_created, ctx.context.imported_at)
+                });
+                let event = opencode_part_event(OpenCodePartEventInput {
+                    session_id: &session_id,
+                    message_id: &message_id,
+                    part_id: &part_id,
+                    index: index.max(0) as u64,
+                    part_type: &part_type,
+                    part_data: &part_data,
+                    message_data: &message_data,
+                    occurred_at,
+                    time_created: part_time_created,
+                    time_updated: part_time_updated,
+                });
+                result
+                    .files_touched
+                    .extend(provider_file_touches_from_raw_value(
+                        CaptureProvider::OpenCode,
+                        &session_id,
+                        OPENCODE_SQLITE_SOURCE_FORMAT,
+                        &part_data,
+                        &event,
+                        part_line,
+                    ));
+                sessions_with_events.insert(session_id.clone());
+                let capture = ctx.capture(&session, Some(event));
+                result.captures.push((part_line, capture));
+            }
+        }
+
+        if !had_parts {
+            if parts_populated {
+                // Current-schema databases keep all content in part rows;
+                // a message without parts is content-free (or mid-write by a
+                // live OpenCode session). Do not consume an event index for
+                // it, so its parts import cleanly next time.
+                *skipped_partless_messages += 1;
+                continue;
+            }
+            // Very old OpenCode schemas stored message content inline in
+            // message.data with no part rows.
+            let index = next_index(&session_id);
+            let occurred_at = opencode_event_time(&message_data)
+                .unwrap_or_else(|| timestamp_millis_utc(time_created, ctx.context.imported_at));
+            let entry_type = opencode_message_type_from_data(&message_data)
+                .unwrap_or_else(|| "message".to_owned());
+            let row = OpenCodeMessageRow {
+                id: message_id.clone(),
+                session_id: session_id.clone(),
+                entry_type,
+                seq: index,
+                time_created,
+                time_updated,
+                data: String::new(),
+            };
+            let cursor =
+                format!("{OPENCODE_CURSOR_V2_PREFIX}message_part:{session_id}:{message_id}");
+            let event = opencode_event(&row, &message_data, occurred_at, cursor);
+            result
+                .files_touched
+                .extend(provider_file_touches_from_raw_value(
+                    CaptureProvider::OpenCode,
+                    &session_id,
+                    OPENCODE_SQLITE_SOURCE_FORMAT,
+                    &message_data,
+                    &event,
+                    line,
+                ));
+            sessions_with_events.insert(session_id.clone());
+            let capture = ctx.capture(&session, Some(event));
+            result.captures.push((line, capture));
+        }
+    }
+    Ok(())
+}
+
+fn emit_opencode_fallback_rows(
+    rows: Vec<OpenCodeMessageRow>,
+    ctx: &mut OpenCodeCaptureContext<'_>,
+    result: &mut ProviderNormalizationResult,
+    known_row_ids: &BTreeSet<String>,
+    sessions_with_events: &mut BTreeSet<String>,
+    deduped_fallback_rows: &mut usize,
+) {
+    for row in rows {
+        if known_row_ids.contains(&row.id) {
+            *deduped_fallback_rows += 1;
+            continue;
+        }
+        let line = ctx.next_line();
+        let Some(session) = ctx.sessions_by_id.get(&row.session_id).cloned() else {
+            result.summary.failed += 1;
+            result.summary.failures.push(ProviderImportFailure {
+                line,
                 error: format!(
                     "OpenCode session_message {} references missing session {}",
                     row.id, row.session_id
@@ -8238,20 +8721,19 @@ fn normalize_opencode_sqlite(
             Err(err) => {
                 result.summary.failed += 1;
                 result.summary.failures.push(ProviderImportFailure {
-                    line: row.seq.max(0) as usize,
+                    line,
                     error: format!("invalid JSON in session_message {}: {err}", row.id),
                 });
                 continue;
             }
         };
         let occurred_at = opencode_event_time(&data)
-            .or_else(|| Some(timestamp_millis_utc(row.time_created, context.imported_at)))
-            .unwrap_or(context.imported_at);
-        let started_at = session_started
-            .get(&session.id)
-            .copied()
-            .unwrap_or(occurred_at);
-        let event = opencode_event(&row, &data, occurred_at);
+            .unwrap_or_else(|| timestamp_millis_utc(row.time_created, ctx.context.imported_at));
+        let cursor = format!(
+            "{OPENCODE_CURSOR_V2_PREFIX}session_message:{}:seq:{}",
+            row.session_id, row.seq
+        );
+        let event = opencode_event(&row, &data, occurred_at, cursor);
         result
             .files_touched
             .extend(provider_file_touches_from_raw_value(
@@ -8260,94 +8742,12 @@ fn normalize_opencode_sqlite(
                 OPENCODE_SQLITE_SOURCE_FORMAT,
                 &data,
                 &event,
-                row.seq.max(0) as usize,
+                line,
             ));
-        let is_subagent = session.parent_id.is_some();
-        result.captures.push((
-            row.seq.max(0) as usize,
-            ProviderCaptureEnvelope {
-                schema_version: PROVIDER_CAPTURE_ENVELOPE_SCHEMA_VERSION,
-                provider: CaptureProvider::OpenCode,
-                source: ProviderSourceEnvelope {
-                    source_format: OPENCODE_SQLITE_SOURCE_FORMAT.to_owned(),
-                    machine_id: context.machine_id.clone(),
-                    observed_at: context.imported_at,
-                    raw_source_path: Some(path.display().to_string()),
-                    raw_retention: ProviderRawRetention::PathReference,
-                    redaction_boundary: ProviderRedactionBoundary::BeforeExport,
-                    trust: ProviderSourceTrust::ProviderNative,
-                    fidelity: Fidelity::Imported,
-                    cursor: Some(ProviderCursorRange {
-                        before: None,
-                        after: Some(ProviderCursorCheckpoint {
-                            stream: provider_cursor_stream(
-                                CaptureProvider::OpenCode,
-                                OPENCODE_SQLITE_SOURCE_FORMAT,
-                            ),
-                            cursor: format!("session_message:{}:seq:{}", row.session_id, row.seq),
-                            observed_at: occurred_at,
-                        }),
-                    }),
-                    idempotency_key: Some(format!(
-                        "provider-source:opencode:{OPENCODE_SQLITE_SOURCE_FORMAT}:{}",
-                        session.id
-                    )),
-                    metadata: json!({
-                        "adapter": OPENCODE_SQLITE_SOURCE_FORMAT,
-                        "sqlite_user_version": user_version,
-                        "schema_fingerprint": schema_fingerprint,
-                        "legacy_message_rows": legacy_message_rows,
-                        "legacy_part_rows": legacy_part_rows,
-                    }),
-                },
-                session: ProviderSessionEnvelope {
-                    provider_session_id: session.id.clone(),
-                    parent_provider_session_id: session.parent_id.clone(),
-                    root_provider_session_id: session.parent_id.clone(),
-                    external_agent_id: session.agent.clone(),
-                    agent_type: if is_subagent {
-                        AgentType::Subagent
-                    } else {
-                        AgentType::Primary
-                    },
-                    role_hint: session
-                        .agent
-                        .clone()
-                        .or_else(|| Some(if is_subagent { "subagent" } else { "primary" }.to_owned())),
-                    is_primary: !is_subagent,
-                    status: SessionStatus::Imported,
-                    started_at,
-                    ended_at: None,
-                    cwd: Some(session.directory.clone()),
-                    fidelity: Fidelity::Imported,
-                    idempotency_key: Some(format!("provider-session:opencode:{}", session.id)),
-                    artifacts: Vec::new(),
-                    metadata: json!({
-                        "source_format": OPENCODE_SQLITE_SOURCE_FORMAT,
-                        "title": session.title,
-                        "model": parse_json_object_string(session.model.as_deref()),
-                        "agent": session.agent,
-                        "time_updated": session.time_updated,
-                        "tokens": {
-                            "input": session.tokens_input,
-                            "output": session.tokens_output,
-                            "reasoning": session.tokens_reasoning,
-                            "cache_read": session.tokens_cache_read,
-                            "cache_write": session.tokens_cache_write,
-                        },
-                        "legacy_projection": {
-                            "message_rows": legacy_message_rows,
-                            "part_rows": legacy_part_rows,
-                            "import_policy": "session_message is authoritative; legacy message/part rows are retained as schema reference rows to avoid duplicate turn import"
-                        },
-                    }),
-                },
-                event: Some(event),
-            },
-        ));
+        sessions_with_events.insert(row.session_id.clone());
+        let capture = ctx.capture(&session, Some(event));
+        result.captures.push((line, capture));
     }
-
-    Ok(result)
 }
 
 fn opencode_sessions(conn: &Connection) -> Result<Vec<OpenCodeSessionRow>> {
@@ -8404,25 +8804,6 @@ fn opencode_sessions(conn: &Connection) -> Result<Vec<OpenCodeSessionRow>> {
     })?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(CaptureError::from)
-}
-
-fn opencode_session_messages(conn: &Connection) -> Result<Vec<OpenCodeMessageRow>> {
-    if sqlite_table_exists(conn, "session_message")? {
-        let rows = opencode_session_message_rows(conn)?;
-        if !rows.is_empty() {
-            return Ok(rows);
-        }
-    }
-    if sqlite_table_exists(conn, "session_entry")? {
-        let rows = opencode_session_entry_rows(conn)?;
-        if !rows.is_empty() {
-            return Ok(rows);
-        }
-    }
-    if sqlite_table_exists(conn, "message")? {
-        return opencode_message_rows(conn);
-    }
-    Ok(Vec::new())
 }
 
 fn opencode_session_message_rows(conn: &Connection) -> Result<Vec<OpenCodeMessageRow>> {
@@ -8511,48 +8892,6 @@ fn opencode_session_entry_rows(conn: &Connection) -> Result<Vec<OpenCodeMessageR
     for row in rows {
         let (id, session_id, entry_type, time_created, time_updated, data) = row?;
         let seq = next_opencode_seq(&mut next_seq_by_session, &session_id);
-        messages.push(OpenCodeMessageRow {
-            id,
-            session_id,
-            entry_type,
-            seq,
-            time_created,
-            time_updated,
-            data,
-        });
-    }
-    Ok(messages)
-}
-
-fn opencode_message_rows(conn: &Connection) -> Result<Vec<OpenCodeMessageRow>> {
-    let columns = sqlite_table_columns(conn, "message")?;
-    ensure_sqlite_table_columns(
-        &columns,
-        "OpenCode SQLite message table",
-        &["id", "session_id", "time_created", "time_updated", "data"],
-    )?;
-    let mut stmt = conn.prepare(
-        "select id, session_id, time_created, time_updated, data \
-         from message order by session_id, time_created, id",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, i64>(2)?,
-            row.get::<_, i64>(3)?,
-            row.get::<_, String>(4)?,
-        ))
-    })?;
-    let mut messages = Vec::new();
-    let mut next_seq_by_session = BTreeMap::<String, i64>::new();
-    for row in rows {
-        let (id, session_id, time_created, time_updated, data) = row?;
-        let seq = next_opencode_seq(&mut next_seq_by_session, &session_id);
-        let entry_type = serde_json::from_str::<Value>(&data)
-            .ok()
-            .and_then(|value| opencode_message_type_from_data(&value))
-            .unwrap_or_else(|| "message".to_owned());
         messages.push(OpenCodeMessageRow {
             id,
             session_id,
@@ -8658,6 +8997,7 @@ fn opencode_event(
     row: &OpenCodeMessageRow,
     data: &Value,
     occurred_at: DateTime<Utc>,
+    cursor: String,
 ) -> ProviderEventEnvelope {
     let event_type = opencode_event_type(&row.entry_type, data);
     let role = Some(provider_role(Some(&row.entry_type)));
@@ -8666,10 +9006,7 @@ fn opencode_event(
     ProviderEventEnvelope {
         provider_event_index: row.seq.max(0) as u64,
         provider_event_hash: Some(row.id.clone()),
-        cursor: Some(format!(
-            "session_message:{}:seq:{}",
-            row.session_id, row.seq
-        )),
+        cursor: Some(cursor),
         event_type,
         role,
         occurred_at,
@@ -8710,6 +9047,153 @@ fn opencode_event_type(entry_type: &str, data: &Value) -> EventType {
         "assistant" | "user" | "system" => EventType::Message,
         "shell" => EventType::CommandOutput,
         _ => EventType::Notice,
+    }
+}
+
+struct OpenCodePartEventInput<'a> {
+    session_id: &'a str,
+    message_id: &'a str,
+    part_id: &'a str,
+    index: u64,
+    part_type: &'a str,
+    part_data: &'a Value,
+    message_data: &'a Value,
+    occurred_at: DateTime<Utc>,
+    time_created: i64,
+    time_updated: i64,
+}
+
+fn opencode_part_event(input: OpenCodePartEventInput<'_>) -> ProviderEventEnvelope {
+    let message_role = input
+        .message_data
+        .get("role")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let event_type = opencode_part_event_type(input.part_type);
+    let role = Some(match input.part_type {
+        "tool" => EventRole::Tool,
+        _ => provider_role(message_role.as_deref()),
+    });
+    let text = opencode_part_event_text(input.part_type, input.part_data);
+    let (text, truncated) = provider_local_preview(&text, PROVIDER_MAX_TEXT_CHARS);
+    ProviderEventEnvelope {
+        provider_event_index: input.index,
+        provider_event_hash: Some(input.part_id.to_owned()),
+        cursor: Some(format!(
+            "{OPENCODE_CURSOR_V2_PREFIX}message_part:{}:{}",
+            input.session_id, input.part_id
+        )),
+        event_type,
+        role,
+        occurred_at: input.occurred_at,
+        fidelity: Fidelity::Imported,
+        redaction_state: RedactionState::LocalPreview,
+        idempotency_key: Some(format!(
+            "provider-event:opencode:{}:{}",
+            input.session_id, input.part_id
+        )),
+        artifacts: Vec::new(),
+        payload: json!({
+            "entry_type": input.part_type,
+            "message_id": input.message_id,
+            "part_id": input.part_id,
+            "message_role": message_role,
+            "text": text,
+            "truncated": truncated,
+            "body": provider_capped_json(input.part_data, PROVIDER_MAX_PREVIEW_CHARS),
+        }),
+        metadata: json!({
+            "source": "opencode_sqlite",
+            "source_format": OPENCODE_SQLITE_SOURCE_FORMAT,
+            "message_id": input.message_id,
+            "part_id": input.part_id,
+            "part_type": input.part_type,
+            "message_role": message_role,
+            "time_created": input.time_created,
+            "time_updated": input.time_updated,
+            "agent": input.message_data.get("agent").cloned(),
+            "model_id": input.message_data.get("modelID").cloned(),
+            "provider_id": input.message_data.get("providerID").cloned(),
+            "cost": input.message_data.get("cost").cloned(),
+            "tokens": input.message_data.get("tokens").cloned(),
+        }),
+    }
+}
+
+fn opencode_part_event_type(part_type: &str) -> EventType {
+    match part_type {
+        "text" => EventType::Message,
+        "tool" => EventType::ToolCall,
+        "reasoning" | "compaction" => EventType::Summary,
+        "patch" => EventType::FileTouched,
+        _ => EventType::Notice,
+    }
+}
+
+fn opencode_part_event_text(part_type: &str, data: &Value) -> String {
+    if let Some(text) = data.get("text").and_then(Value::as_str) {
+        if !text.trim().is_empty() {
+            return text.to_owned();
+        }
+    }
+    match part_type {
+        "tool" => {
+            let tool = data.get("tool").and_then(Value::as_str).unwrap_or("tool");
+            let mut text = format!("tool call: {tool}");
+            if let Some(input) = data.pointer("/state/input") {
+                if !input.is_null() {
+                    let input = serde_json::to_string(input).unwrap_or_default();
+                    let (input, _) = provider_local_preview(&input, PROVIDER_MAX_PREVIEW_CHARS);
+                    text.push_str("\ninput: ");
+                    text.push_str(&input);
+                }
+            }
+            if let Some(output) = data.pointer("/state/output").and_then(Value::as_str) {
+                if !output.trim().is_empty() {
+                    text.push_str("\noutput: ");
+                    text.push_str(output);
+                }
+            }
+            if let Some(error) = data.pointer("/state/error").and_then(Value::as_str) {
+                if !error.trim().is_empty() {
+                    text.push_str("\nerror: ");
+                    text.push_str(error);
+                }
+            }
+            text
+        }
+        "patch" => {
+            let files = data
+                .get("files")
+                .and_then(Value::as_array)
+                .map(|files| {
+                    files
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            format!("patch: {files}")
+        }
+        "file" => {
+            let filename = data
+                .get("filename")
+                .or_else(|| data.get("url"))
+                .and_then(Value::as_str)
+                .unwrap_or("file");
+            format!("attached file: {filename}")
+        }
+        "agent" => {
+            let name = data.get("name").and_then(Value::as_str).unwrap_or("agent");
+            format!("agent: {name}")
+        }
+        "compaction" => "session compacted".to_owned(),
+        "retry" => {
+            let attempt = data.get("attempt").and_then(Value::as_i64).unwrap_or(0);
+            format!("retry attempt {attempt}")
+        }
+        _ => serde_json::to_string(data).unwrap_or_else(|_| part_type.to_owned()),
     }
 }
 
@@ -12930,6 +13414,201 @@ mod tests {
     }
 
     #[test]
+    fn native_opencode_imports_current_message_part_schema() {
+        let temp = tempdir();
+        let fixture = write_opencode_message_part_db(&temp, false);
+        let mut store = Store::open(temp.path().join("work.sqlite")).unwrap();
+
+        let summary = import_opencode_sqlite(
+            &fixture,
+            &mut store,
+            OpenCodeSqliteImportOptions {
+                allow_partial_failures: true,
+                ..OpenCodeSqliteImportOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(summary.failed, 0, "{:?}", summary.failures);
+        // root + child + empty session all import, even though `session_message`
+        // only holds a single unrelated event row.
+        assert_eq!(summary.imported_sessions, 3);
+        assert_eq!(summary.imported_edges, 1);
+        // root: user text + assistant tool + assistant text + model-switched
+        // notice; child: reasoning + text. step-start/step-finish are skipped.
+        assert_eq!(summary.imported_events, 6);
+        assert!(summary
+            .notes
+            .iter()
+            .any(|note| note.contains("bookkeeping part row(s)")));
+
+        let root_id = provider_session_uuid(CaptureProvider::OpenCode, "mp-root");
+        let child_id = provider_session_uuid(CaptureProvider::OpenCode, "mp-child");
+        let empty_id = provider_session_uuid(CaptureProvider::OpenCode, "mp-empty");
+        assert_eq!(
+            store.get_session(child_id).unwrap().parent_session_id,
+            Some(root_id)
+        );
+        assert!(!store.get_session(child_id).unwrap().is_primary);
+        assert!(store.get_session(empty_id).unwrap().is_primary);
+        assert!(store.events_for_session(empty_id).unwrap().is_empty());
+
+        let root_events = store.events_for_session(root_id).unwrap();
+        assert_eq!(root_events.len(), 4);
+        // session_message-derived notice sorts first (seq below the
+        // message/part index base).
+        assert_eq!(root_events[0].event_type, EventType::Notice);
+        assert_eq!(
+            root_events[1].payload["body"]["text"].as_str(),
+            Some("find the bug")
+        );
+        assert_eq!(root_events[1].event_type, EventType::Message);
+        assert_eq!(root_events[1].role, Some(EventRole::User));
+        assert_eq!(root_events[2].event_type, EventType::ToolCall);
+        assert!(root_events[2].payload["body"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("tool call: read"));
+        assert_eq!(root_events[3].event_type, EventType::Message);
+        assert_eq!(root_events[3].role, Some(EventRole::Assistant));
+
+        let child_events = store.events_for_session(child_id).unwrap();
+        assert_eq!(child_events.len(), 2);
+        assert_eq!(child_events[0].event_type, EventType::Summary);
+    }
+
+    #[test]
+    fn native_opencode_message_part_import_is_idempotent() {
+        let temp = tempdir();
+        let fixture = write_opencode_message_part_db(&temp, false);
+        let mut store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let options = || OpenCodeSqliteImportOptions {
+            allow_partial_failures: true,
+            ..OpenCodeSqliteImportOptions::default()
+        };
+
+        let first = import_opencode_sqlite(&fixture, &mut store, options()).unwrap();
+        assert_eq!(first.failed, 0, "{:?}", first.failures);
+        assert_eq!(first.imported_events, 6);
+
+        let second = import_opencode_sqlite(&fixture, &mut store, options()).unwrap();
+        assert_eq!(second.failed, 0, "{:?}", second.failures);
+        assert_eq!(second.imported_sessions, 0);
+        assert_eq!(second.imported_events, 0);
+        assert_eq!(second.imported_edges, 0);
+        assert_eq!(second.skipped_events, 6);
+    }
+
+    #[test]
+    fn native_opencode_dedupes_session_message_rows_mirroring_message_table() {
+        let temp = tempdir();
+        let fixture = write_opencode_message_part_db(&temp, true);
+        let mut store = Store::open(temp.path().join("work.sqlite")).unwrap();
+
+        let summary = import_opencode_sqlite(
+            &fixture,
+            &mut store,
+            OpenCodeSqliteImportOptions {
+                allow_partial_failures: true,
+                ..OpenCodeSqliteImportOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(summary.failed, 0, "{:?}", summary.failures);
+        // Overlapping session_message rows (same external ids as message/part
+        // rows) are deduplicated, so counts match the non-overlapping fixture.
+        assert_eq!(summary.imported_events, 6);
+        assert!(summary
+            .notes
+            .iter()
+            .any(|note| note.contains("deduplicated 2 session_message/session_entry row(s)")));
+    }
+
+    #[test]
+    fn native_opencode_upgrade_from_session_message_stub_does_not_duplicate() {
+        let temp = tempdir();
+        let mut store = Store::open(temp.path().join("work.sqlite")).unwrap();
+
+        // Old-adapter era: a database where only session_message had data for
+        // the session; the old code imported it as a single stub event.
+        let stub = write_opencode_stub_then_full_db(&temp, false);
+        let first = import_opencode_sqlite(
+            &stub,
+            &mut store,
+            OpenCodeSqliteImportOptions {
+                allow_partial_failures: true,
+                ..OpenCodeSqliteImportOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(first.failed, 0, "{:?}", first.failures);
+        assert_eq!(first.imported_sessions, 1);
+        assert_eq!(first.imported_events, 1);
+
+        // Upgrade era: the same session now visible with full message/part
+        // history plus the same session_message stub row.
+        let full = write_opencode_stub_then_full_db(&temp, true);
+        let second = import_opencode_sqlite(
+            &full,
+            &mut store,
+            OpenCodeSqliteImportOptions {
+                allow_partial_failures: true,
+                ..OpenCodeSqliteImportOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(second.failed, 0, "{:?}", second.failures);
+        assert_eq!(second.imported_sessions, 0);
+        // Stub event dedupes; the two new part events import.
+        assert_eq!(second.skipped_events, 1);
+        assert_eq!(second.imported_events, 2);
+
+        let session_id = provider_session_uuid(CaptureProvider::OpenCode, "stub-session");
+        let events = store.events_for_session(session_id).unwrap();
+        assert_eq!(events.len(), 3);
+    }
+
+    #[test]
+    fn native_opencode_reports_schema_mismatch_when_rows_yield_no_events() {
+        let temp = tempdir();
+        let path = temp.path().join("opencode-mismatch.db");
+        let conn = Connection::open(&path).unwrap();
+        // A populated message store the adapter cannot decode into events:
+        // every message row holds malformed JSON.
+        conn.execute_batch(
+            "create table session (
+                id text primary key, title text not null, directory text not null,
+                time_created integer not null, time_updated integer not null
+            );
+            create table message (
+                id text primary key, session_id text not null,
+                time_created integer not null, time_updated integer not null, data text not null
+            );
+            insert into session values ('mismatch-1', 'root', '/workspace', 1782259200000, 1782259200000);
+            insert into message values ('mm-1', 'mismatch-1', 1782259200000, 1782259200000, 'not json');",
+        )
+        .unwrap();
+        drop(conn);
+        let mut store = Store::open(temp.path().join("work.sqlite")).unwrap();
+
+        let summary = import_opencode_sqlite(
+            &path,
+            &mut store,
+            OpenCodeSqliteImportOptions {
+                allow_partial_failures: true,
+                ..OpenCodeSqliteImportOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(summary.failures.iter().any(|failure| failure
+            .error
+            .contains("adapter produced 0 events")
+            && failure.error.contains("schema mismatch?")));
+    }
+
+    #[test]
     fn native_jsonl_tree_imports_gemini_droid_and_copilot_smokes() {
         let temp = tempdir();
         let mut store = Store::open(temp.path().join("work.sqlite")).unwrap();
@@ -13238,6 +13917,240 @@ mod tests {
             [],
         )
         .unwrap();
+        path
+    }
+
+    fn write_opencode_message_part_db(temp: &TempDir, overlap_session_message: bool) -> PathBuf {
+        let path = temp.path().join(if overlap_session_message {
+            "opencode-message-part-overlap.db"
+        } else {
+            "opencode-message-part.db"
+        });
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "create table session (
+                id text primary key,
+                project_id text not null,
+                parent_id text,
+                slug text not null,
+                directory text not null,
+                title text not null,
+                version text not null,
+                share_url text,
+                revert text,
+                permission text,
+                time_created integer not null,
+                time_updated integer not null,
+                workspace_id text,
+                path text,
+                agent text,
+                model text,
+                cost real default 0 not null,
+                tokens_input integer default 0 not null,
+                tokens_output integer default 0 not null,
+                tokens_reasoning integer default 0 not null,
+                tokens_cache_read integer default 0 not null,
+                tokens_cache_write integer default 0 not null,
+                metadata text
+            );
+            create table message (
+                id text primary key, session_id text not null,
+                time_created integer not null, time_updated integer not null, data text not null
+            );
+            create table part (
+                id text primary key, message_id text not null, session_id text not null,
+                time_created integer not null, time_updated integer not null, data text not null
+            );
+            create table session_message (
+                id text primary key, session_id text not null, type text not null,
+                time_created integer not null, time_updated integer not null,
+                data text not null, seq integer not null
+            );
+            create table __drizzle_migrations (
+                id integer primary key autoincrement, hash text not null, created_at numeric
+            );",
+        )
+        .unwrap();
+        for (id, parent, agent) in [
+            ("mp-root", None::<&str>, "build"),
+            ("mp-child", Some("mp-root"), "explore"),
+            ("mp-empty", None, "build"),
+        ] {
+            conn.execute(
+                "insert into session (
+                    id, project_id, parent_id, slug, directory, title, version,
+                    time_created, time_updated, workspace_id, agent, model
+                ) values (?1, 'project-1', ?2, ?1, '/workspace', ?1, '1.2.3',
+                    1782259200000, 1782259200000, 'ws-1', ?3,
+                    '{\"providerID\":\"openrouter\",\"modelID\":\"anthropic/claude\"}')",
+                rusqlite::params![id, parent, agent],
+            )
+            .unwrap();
+        }
+        let messages: [(&str, &str, i64, &str); 3] = [
+            (
+                "msg-root-1",
+                "mp-root",
+                1782259200000,
+                "{\"role\":\"user\",\"time\":{\"created\":1782259200000}}",
+            ),
+            (
+                "msg-root-2",
+                "mp-root",
+                1782259201000,
+                "{\"role\":\"assistant\",\"modelID\":\"anthropic/claude\",\"providerID\":\"openrouter\",\"time\":{\"created\":1782259201000}}",
+            ),
+            (
+                "msg-child-1",
+                "mp-child",
+                1782259202000,
+                "{\"role\":\"assistant\",\"time\":{\"created\":1782259202000}}",
+            ),
+        ];
+        for (id, session_id, time, data) in messages {
+            conn.execute(
+                "insert into message values (?1, ?2, ?3, ?3, ?4)",
+                rusqlite::params![id, session_id, time, data],
+            )
+            .unwrap();
+        }
+        let parts: [(&str, &str, &str, i64, &str); 7] = [
+            (
+                "prt-root-1a",
+                "msg-root-1",
+                "mp-root",
+                1782259200000,
+                "{\"type\":\"text\",\"text\":\"find the bug\"}",
+            ),
+            (
+                "prt-root-1b",
+                "msg-root-1",
+                "mp-root",
+                1782259200001,
+                "{\"type\":\"step-start\",\"snapshot\":\"abc\"}",
+            ),
+            (
+                "prt-root-2a",
+                "msg-root-2",
+                "mp-root",
+                1782259201000,
+                "{\"type\":\"tool\",\"callID\":\"call-1\",\"tool\":\"read\",\"state\":{\"status\":\"completed\",\"input\":{\"filePath\":\"/workspace/src/lib.rs\"},\"output\":\"fn main() {}\"}}",
+            ),
+            (
+                "prt-root-2b",
+                "msg-root-2",
+                "mp-root",
+                1782259201001,
+                "{\"type\":\"text\",\"text\":\"the bug is in lib.rs\"}",
+            ),
+            (
+                "prt-root-2c",
+                "msg-root-2",
+                "mp-root",
+                1782259201002,
+                "{\"type\":\"step-finish\",\"reason\":\"stop\",\"cost\":0.1}",
+            ),
+            (
+                "prt-child-1a",
+                "msg-child-1",
+                "mp-child",
+                1782259202000,
+                "{\"type\":\"reasoning\",\"text\":\"thinking about the bug\"}",
+            ),
+            (
+                "prt-child-1b",
+                "msg-child-1",
+                "mp-child",
+                1782259202001,
+                "{\"type\":\"text\",\"text\":\"child answer\"}",
+            ),
+        ];
+        for (id, message_id, session_id, time, data) in parts {
+            conn.execute(
+                "insert into part values (?1, ?2, ?3, ?4, ?4, ?5)",
+                rusqlite::params![id, message_id, session_id, time, data],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "insert into session_message values ('sm-evt-1', 'mp-root', 'model-switched',
+                1782259199000, 1782259199000,
+                '{\"time\":{\"created\":1782259199000},\"model\":{\"id\":\"anthropic/claude\"}}', 1)",
+            [],
+        )
+        .unwrap();
+        if overlap_session_message {
+            // Newer OpenCode builds mirror message/part rows into
+            // session_message under the same external ids.
+            conn.execute(
+                "insert into session_message values ('msg-root-1', 'mp-root', 'user',
+                    1782259200000, 1782259200000,
+                    '{\"role\":\"user\",\"time\":{\"created\":1782259200000}}', 2)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "insert into session_message values ('prt-root-2a', 'mp-root', 'part',
+                    1782259201000, 1782259201000,
+                    '{\"type\":\"tool\",\"tool\":\"read\"}', 3)",
+                [],
+            )
+            .unwrap();
+        }
+        path
+    }
+
+    fn write_opencode_stub_then_full_db(temp: &TempDir, full: bool) -> PathBuf {
+        let path = temp.path().join(if full {
+            "opencode-stub-v1.db"
+        } else {
+            "opencode-stub-v0.db"
+        });
+        let _ = fs::remove_file(&path);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "create table session (
+                id text primary key, parent_id text, title text not null, directory text not null,
+                time_created integer not null, time_updated integer not null
+            );
+            create table session_message (
+                id text primary key, session_id text not null, type text not null, seq integer not null,
+                time_created integer not null, time_updated integer not null, data text not null
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "insert into session values ('stub-session', null, 'stub', '/workspace',
+                1782259200000, 1782259200000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into session_message values ('sm-stub-1', 'stub-session', 'model-switched', 1,
+                1782259200000, 1782259200000,
+                '{\"time\":{\"created\":1782259200000},\"model\":{\"id\":\"gpt\"}}')",
+            [],
+        )
+        .unwrap();
+        if full {
+            conn.execute_batch(
+                "create table message (
+                    id text primary key, session_id text not null,
+                    time_created integer not null, time_updated integer not null, data text not null
+                );
+                create table part (
+                    id text primary key, message_id text not null, session_id text not null,
+                    time_created integer not null, time_updated integer not null, data text not null
+                );
+                insert into message values ('msg-stub-1', 'stub-session', 1782259201000,
+                    1782259201000, '{\"role\":\"user\",\"time\":{\"created\":1782259201000}}');
+                insert into part values ('prt-stub-1a', 'msg-stub-1', 'stub-session',
+                    1782259201000, 1782259201000, '{\"type\":\"text\",\"text\":\"hello stub\"}');
+                insert into part values ('prt-stub-1b', 'msg-stub-1', 'stub-session',
+                    1782259201001, 1782259201001, '{\"type\":\"text\",\"text\":\"second part\"}');",
+            )
+            .unwrap();
+        }
         path
     }
 

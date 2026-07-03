@@ -4171,6 +4171,80 @@ fn native_provider_cli_flow_imports_new_supported_provider_paths() {
 }
 
 #[test]
+fn opencode_old_cursor_triggers_rescan_that_imports_message_part_history() {
+    let temp = tempdir();
+    let path = write_native_opencode_fixture(&temp, "opencode-cursor-migration-oracle");
+
+    // Simulate a store written by the old adapter: the same database was
+    // recorded as fully indexed, but the sync cursor still has the old
+    // pre-message/part format and no events were imported.
+    let first = json_output(ctx(&temp).args([
+        "import",
+        "--provider",
+        "opencode",
+        "--path",
+        &path,
+        "--json",
+    ]));
+    assert_eq!(first["totals"]["failed"], 0);
+    assert!(first["totals"]["imported_events"].as_u64().unwrap() >= 1);
+
+    let conn = Connection::open(temp.path().join("work.sqlite")).unwrap();
+    let updated = conn
+        .execute(
+            "UPDATE sync_cursors SET cursor = 'session_message:ses_old:seq:1'
+             WHERE stream LIKE 'provider:opencode:%'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(updated, 1);
+    drop(conn);
+
+    // Old-format cursor forces a full rescan even though the database file is
+    // unchanged and the import file manifest says it is already indexed; the
+    // rescan is idempotent (everything dedupes to skipped).
+    let second = json_output(ctx(&temp).args([
+        "import",
+        "--provider",
+        "opencode",
+        "--path",
+        &path,
+        "--json",
+    ]));
+    assert_eq!(second["totals"]["failed"], 0);
+    assert_eq!(second["totals"]["imported_events"], 0);
+    assert!(second["totals"]["skipped"].as_u64().unwrap() >= 1);
+
+    let conn = Connection::open(temp.path().join("work.sqlite")).unwrap();
+    let cursor: String = conn
+        .query_row(
+            "SELECT cursor FROM sync_cursors WHERE stream LIKE 'provider:opencode:%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        cursor.starts_with("opencode-v2:"),
+        "cursor not migrated: {cursor}"
+    );
+    drop(conn);
+
+    // With a v2 cursor and an unchanged database the manifest short-circuits
+    // again: nothing is re-read.
+    let third = json_output(ctx(&temp).args([
+        "import",
+        "--provider",
+        "opencode",
+        "--path",
+        &path,
+        "--json",
+    ]));
+    assert_eq!(third["totals"]["failed"], 0);
+    assert_eq!(third["totals"]["imported_events"], 0);
+    assert_eq!(third["totals"]["skipped"], 0);
+}
+
+#[test]
 fn personal_agent_provider_imports_are_idempotent_and_incremental() {
     for (cli_provider, stored_provider, fixture, append_event) in [
         (
@@ -4393,7 +4467,17 @@ fn write_native_opencode_fixture(temp: &TempDir, query: &str) -> String {
         [
             "opencode-cli-native-user",
             "opencode-cli-native",
-            &format!(r#"{{"role":"user","time":{{"created":1782259200000}},"text":"{query}"}}"#),
+            r#"{"role":"user","time":{"created":1782259200000}}"#,
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        "insert into part values (?1, ?2, ?3, 1782259200000, 1782259200000, ?4)",
+        [
+            "opencode-cli-native-part",
+            "opencode-cli-native-user",
+            "opencode-cli-native",
+            &format!(r#"{{"type":"text","text":"{query}"}}"#),
         ],
     )
     .unwrap();

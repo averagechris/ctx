@@ -1,6 +1,6 @@
 [package]
 name = "ctx"
-version = "1.0.0"
+version = "1.0.1"
 description = "Local CLI for indexing and searching agent session history"
 edition.workspace = true
 autobins = false

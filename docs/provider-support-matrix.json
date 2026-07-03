@@ -187,7 +187,8 @@
             "ctx import --provider opencode"
           ],
           "notes": [
-            "Reads OpenCode SQLite history from ~/.local/share/opencode/opencode.db using a read-only connection."
+            "Reads OpenCode SQLite history from ~/.local/share/opencode/opencode.db using a read-only connection.",
+            "Detects the schema at import time: prefers session joined with message/part (current drizzle schema), deduplicates session_message/session_entry rows, and falls back to inline message.data for very old schemas."
           ]
         }
       ],

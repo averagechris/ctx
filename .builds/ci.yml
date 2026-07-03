@@ -1,0 +1,19 @@
+image: nixos/unstable
+arch: x86_64
+environment:
+  NIX_CONFIG: "experimental-features = nix-command flakes"
+sources:
+  - https://git.sr.ht/~averagechris/ctx
+tasks:
+  - fmt: |
+      cd ctx
+      nix run .#ci-fmt
+  - clippy: |
+      cd ctx
+      nix run .#ci-clippy
+  - test: |
+      cd ctx
+      nix run .#ci-test
+  - docs: |
+      cd ctx
+      nix run .#ci-docs

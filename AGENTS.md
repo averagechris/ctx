@@ -9,9 +9,12 @@ This is a hard fork of [ctxrs/ctx](https://github.com/ctxrs/ctx) maintained at
 - Use `jj`, not `git`. Trunk bookmark is `main` → remote `origin`
   (`git@git.sr.ht:~averagechris/ctx`). Remote `upstream` is
   github.com/ctxrs/ctx and is fetch-only, used for selectively porting fixes.
-- Build/test with cargo (via the flake devShell once Phase 4 lands):
+- Build/test via the Nix flake: `nix develop` for a cargo devShell, then
   `cargo fmt --all --check`, `cargo clippy --locked --all-targets -- -D warnings`,
-  `cargo test --workspace`.
+  `cargo test --workspace`. Or run the CI wrappers directly: `nix run .#ci-fmt`,
+  `nix run .#ci-clippy`, `nix run .#ci-test`, `nix run .#ci-docs`.
+  `nix flake check` builds the package with the full test suite. SourceHut CI
+  runs the same wrappers via `.builds/ci.yml`.
 - `crates/ctx-cli/tests/cli.rs` is the behavioral contract — lean on it when
   refactoring; extend it when changing command behavior.
 
@@ -51,4 +54,4 @@ This is a hard fork of [ctxrs/ctx](https://github.com/ctxrs/ctx) maintained at
 - To refresh upstream refs: `jj git fetch --remote upstream` (exposed as
   `main@upstream`).
 
-<!-- Last audited: 2026-07-02 | fork plan committed; phases 1-4 pending -->
+<!-- Last audited: 2026-07-03 | phases 1-4 landed 2026-07-03 -->

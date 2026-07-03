@@ -54,7 +54,15 @@
           clippy
           rustc
           rustfmt
+          # build scripts and libsqlite3-sys (bundled) need a C compiler
+          stdenv.cc
         ];
+
+        # On darwin the test binaries link against -liconv; make it findable
+        # outside a full stdenv build environment.
+        darwinLinkEnv = lib.optionalString pkgs.stdenv.isDarwin ''
+          export LIBRARY_PATH="${pkgs.libiconv}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
+        '';
 
         ci-fmt = pkgs.writeShellApplication {
           name = "ci-fmt";
@@ -68,6 +76,7 @@
           name = "ci-clippy";
           runtimeInputs = rustToolchain;
           text = ''
+            ${darwinLinkEnv}
             cargo clippy --locked --all-targets -- -D warnings
           '';
         };
@@ -76,6 +85,7 @@
           name = "ci-test";
           runtimeInputs = rustToolchain ++ [pkgs.python3];
           text = ''
+            ${darwinLinkEnv}
             cargo test --workspace
           '';
         };

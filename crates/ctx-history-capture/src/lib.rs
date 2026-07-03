@@ -5662,10 +5662,8 @@ fn provider_file_touch_envelopes(
 
 fn collect_patch_file_touches(value: &Value, out: &mut Vec<FileTouchDraft>) {
     match value {
-        Value::String(text) => {
-            if text.contains("*** Begin Patch") {
-                out.extend(parse_apply_patch_file_touches(text));
-            }
+        Value::String(text) if text.contains("*** Begin Patch") => {
+            out.extend(parse_apply_patch_file_touches(text));
         }
         Value::Array(items) => {
             for item in items {

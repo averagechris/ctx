@@ -1730,6 +1730,11 @@ fn provider_help_matches_implemented_importers() {
 #[test]
 fn provider_json_names_are_accepted_as_cli_filter_aliases() {
     let temp = tempdir();
+    // `--refresh off` requires an initialized store, so set one up first.
+    ctx(&temp)
+        .args(["setup", "--json", "--progress", "none"])
+        .assert()
+        .success();
     for (provider, expected) in [
         ("copilot_cli", "copilot_cli"),
         ("factory_ai_droid", "factory_ai_droid"),

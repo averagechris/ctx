@@ -28,6 +28,9 @@ nix build .#ctx
 
 Or add `sourcehut:~averagechris/ctx` as a flake input.
 
+Hosted release downloads and checksums:
+[https://averagechris.srht.site/ctx/](https://averagechris.srht.site/ctx/)
+
 From source with cargo:
 
 ```bash

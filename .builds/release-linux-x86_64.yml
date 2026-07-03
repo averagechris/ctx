@@ -1,0 +1,22 @@
+image: nixos/unstable
+arch: x86_64
+oauth: pages.sr.ht/PAGES:RW
+environment:
+  NIX_CONFIG: "experimental-features = nix-command flakes"
+sources:
+  - https://git.sr.ht/~averagechris/ctx
+tasks:
+  - build: |
+      cd ctx
+      nix build .#release-artifact --out-link result-release-artifact
+      mkdir -p ~/artifacts
+      cp -p result-release-artifact/* ~/artifacts/
+      mkdir -p dist/downloads
+      cp -p result-release-artifact/* dist/downloads/
+  - publish: |
+      cd ctx
+      nix run .#build-pages -- --include-existing-downloads
+      nix run .#publish-pages
+artifacts:
+  - artifacts/ctx-v1.0.0-x86_64-linux.tar.gz
+  - artifacts/ctx-v1.0.0-x86_64-linux.tar.gz.sha256

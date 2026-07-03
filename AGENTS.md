@@ -46,6 +46,20 @@ This is a hard fork of [ctxrs/ctx](https://github.com/ctxrs/ctx) maintained at
   tests run against temp homes; keep it that way. The suite must pass on
   macOS, not just Linux.
 
+## Release flow
+
+- Bump the version in `crates/ctx-cli/Cargo.toml` (and `Cargo.lock`), update
+  the artifact filenames in `.builds/release-linux-x86_64.yml` to match, run
+  `jj lint`, push, wait for CI green, then
+  `jj tag-push vX.Y.Z --revision main --remote origin`.
+- The `.builds/release-linux-x86_64.yml` manifest builds the Linux
+  `release-artifact` and publishes the downloads page
+  (https://averagechris.srht.site/ctx/) via `build-pages` + `publish-pages`.
+- The darwin artifact is built/published locally:
+  `nix build .#release-artifact`, copy the outputs into `dist/downloads/`,
+  then `nix run .#build-pages -- --include-existing-downloads` and
+  `nix run .#publish-pages`.
+
 ## Upstream review memory
 
 - Forked at upstream `main` commit `38241f0c` ("Require search intent in

@@ -16,7 +16,10 @@ by Nix. See [docs/fork-plan.md](docs/fork-plan.md) for the decision record.
 With Nix (flakes):
 
 ```bash
-# run directly
+# run directly from the latest release tag
+nix run 'git+https://git.sr.ht/~averagechris/ctx?ref=refs/tags/v1.0.0'
+
+# or track main
 nix run sourcehut:~averagechris/ctx
 
 # or build locally

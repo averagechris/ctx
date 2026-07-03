@@ -11,25 +11,10 @@ Default root:
 ~/.ctx/
   work.sqlite
   config.toml
-  upgrade-state.json
-  upgrade.lock
-  logs/
-    upgrade.log
 ```
 
 `CTX_DATA_ROOT` or `--data-root` may point ctx somewhere else. The configured
 root is used directly; ctx does not append another directory.
-
-Official installer-managed binaries also have a sidecar next to the installed
-binary, for example:
-
-```text
-~/.local/bin/ctx
-~/.local/bin/ctx.install.json
-```
-
-The sidecar is outside the ctx data root because it describes ownership of the
-installed executable, not indexed provider history.
 
 ## What SQLite Stores
 
@@ -69,8 +54,7 @@ is known.
 
 ## Command Read/Write Behavior
 
-This table describes core command effects. It excludes the optional first-party
-analytics marker described under network behavior.
+This table describes core command effects.
 
 | Command | Reads | Writes |
 | --- | --- | --- |
@@ -83,7 +67,6 @@ analytics marker described under network behavior.
 | `ctx search` | native provider transcript files, path metadata, enabled auto history-source plugin stdout, and SQLite index | SQLite index for newly discovered native provider or plugin history |
 | `ctx sql` | existing SQLite index only | none |
 | `ctx docs` | embedded documentation in the binary | selected topic `--out` path for `ctx docs show --out` or selected `--out` directory for `ctx docs man --out` |
-| `ctx upgrade` | signed release metadata and installed binary/sidecar metadata | installed binary for manual upgrade, install sidecar, `upgrade-state.json`, `upgrade.lock`, and `logs/upgrade.log` |
 | `ctx doctor` | SQLite index and data root metadata | none |
 
 Setup, import, and search do not require source repository writes, model APIs,
@@ -95,19 +78,8 @@ API keys, or remote accounts.
 `config.toml` under the configured data root when `CTX_DATA_ROOT` or
 `--data-root` points elsewhere. Existing config files are left in place.
 
-The day-1 generated config is:
-
-```toml
-[upgrade]
-auto = "apply"
-channel = "stable"
-interval_hours = 24
-```
-
-`upgrade.auto = "apply"` only takes effect for official installer-managed
-binaries with a valid install sidecar. Unmanaged installs do not self-upgrade.
-Set `auto = "off"` or use `ctx upgrade disable` to disable background
-auto-upgrade for the configured data root.
+The day-1 generated config contains only comments; there are no supported
+configuration keys today.
 
 ## Index Lifecycle
 
@@ -140,7 +112,7 @@ explicit import and stream the same JSONL format to stdout. Failed plugin runs
 do not advance cursors. Explicit file paths and plugin manifests are not added
 to `config.toml` or treated as fixed provider homes.
 
-## Upgrade Reindexing
+## Version Upgrade Reindexing
 
 When an existing `0.8.x` or `0.9.x` data root is opened by `0.10.x` or newer, ctx keeps
 the SQLite database and migrates it in place. The migration rebuilds derived
@@ -239,49 +211,5 @@ originally produced provider transcripts may have used the network according to
 their own configuration; ctx indexing those transcripts does not repeat that
 behavior.
 
-Official installer-managed binaries can contact the signed release metadata
-endpoint for `ctx upgrade` and for background auto-upgrade checks after
-successful normal commands. These checks are skipped for JSON commands, MCP,
-`ctx docs`, `ctx sql`, `ctx upgrade`, CI, unmanaged installs, and process-level
-opt-outs such as `CTX_UPGRADE_OFF=1` or `CTX_DISABLE_AUTO_UPGRADE=1`. Upgrade
-metadata checks do not send provider transcript text, search queries, result
-snippets, source paths, repository names, or command output.
-
-First-party analytics are default-on and may create `install.json` plus a
-separate device identity file in OS user state, then send coarse product
-metadata. They do not send session text, prompts, transcripts, search queries,
-result snippets, source paths, repository or branch names, native session IDs,
-command text, command output, usernames, hostnames, raw IP addresses, or
-hardware-derived machine fingerprints.
-
-Analytics may include:
-
-- generated random install and device identifiers that are hashed server-side;
-- ctx version, OS, architecture, command name, success state, and duration
-  bucket;
-- JSON-output and option booleans such as whether a search used filters;
-- bucketed counts such as indexed sessions, import totals, result counts, and
-  validation finding counts;
-- bucketed search query length and term count, but not query content;
-- provider identifiers such as `codex` or `claude` when selected as filters;
-- coarse Cloudflare-derived geography such as country, region, colo, ASN, and
-  AS organization.
-
-The install identifier lives in `install.json` under the configured ctx data
-root and represents that local index. The device identifier is a random UUID
-created only when analytics are enabled and an event is sent; it lives outside
-the ctx data root in OS user state, such as `$XDG_STATE_HOME/ctx/device.json` or
-`~/.local/state/ctx/device.json` on Linux.
-
-`ctx sql` and MCP do not send first-party analytics events.
-
-To disable analytics, add:
-
-```toml
-[analytics]
-enabled = false
-```
-
-Equivalent environment opt-outs are `CTX_ANALYTICS_OFF=1`,
-`CTX_DISABLE_ANALYTICS=1`, or `CTX_ANALYTICS_ENABLED=false`. Use an opt-out when
-a strict local-only no-network mode is required.
+This fork makes no network calls; there is no telemetry and no self-update.
+Update via Nix / SourceHut release tags.

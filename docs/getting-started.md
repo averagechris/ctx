@@ -40,9 +40,8 @@ CTX_DATA_ROOT=/tmp/ctx-demo ctx status
 ```
 
 Setup does not write to source repositories, call model APIs, or require API
-keys. Official installer-managed binaries can run a signed background
-auto-upgrade check after later successful non-JSON commands; that updater does
-not collect provider history.
+keys. This fork makes no network calls; there is no telemetry and no
+self-update. Update via Nix / SourceHut release tags.
 
 ## 3. See Available Sources
 
@@ -125,21 +124,14 @@ supported machine-readable retrieval API for scripts and exact field
 extraction. It contains cited snippets and source metadata, but it is retrieved
 source material rather than generated analysis.
 
-## 7. Built-In Docs And Upgrades
+## 7. Built-In Docs
 
 ```bash
 ctx docs search "file path"
 ctx docs show cli-reference
 ctx docs man --print ctx
-ctx upgrade status
-ctx upgrade check
 ```
 
 `ctx docs` reads embedded public docs from the installed binary. Agents should
 prefer `ctx docs search` and `ctx docs show` over man pages; man pages are
 available for human shell use.
-
-`ctx upgrade` works for official installer-managed binaries. Source builds,
-`cargo install`, package-manager installs, and copied binaries are treated as
-unmanaged and will not self-upgrade. Use `ctx upgrade disable` or
-`CTX_UPGRADE_OFF=1` to disable managed background auto-upgrade.

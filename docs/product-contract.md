@@ -28,8 +28,6 @@ product boundary is retrieval, not interpretation.
   for advanced inspection when normal search is not expressive enough.
 - `ctx doctor` reports local storage health.
 - `ctx docs` exposes embedded public documentation and generated man pages.
-- `ctx upgrade` checks and applies signed CLI releases for official
-  installer-managed binaries.
 - JSON output supports local agents and scripts.
 
 ## Out Of Scope
@@ -42,8 +40,8 @@ product boundary is retrieval, not interpretation.
 - write-capable SQL access;
 - API-key requirements for core setup/import/search;
 - background collection;
-- self-upgrade for unmanaged source builds, package-manager installs, or copied
-  binaries;
+- telemetry, self-upgrade, and any other network calls (this fork makes no
+  network calls; update via Nix / SourceHut release tags);
 - provider-native import claims that are not listed in the support matrix.
 
 ## Determinism

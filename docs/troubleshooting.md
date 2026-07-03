@@ -45,34 +45,10 @@ ctx doctor --json
 Check the command contract in [contracts/json.md](contracts/json.md), including
 whether the field is documented as nullable or compatibility-only.
 
-## Upgrade Problems
+## Upgrades
 
-Run:
-
-```bash
-ctx upgrade status
-ctx upgrade check
-```
-
-Self-upgrade requires an official installer-managed binary and matching
-`ctx.install.json` sidecar. Source builds, `cargo install`, copied binaries,
-package-manager installs, and binaries whose SHA-256 no longer matches the
-sidecar are intentionally unmanaged.
-
-Disable managed background auto-upgrade with:
-
-```bash
-ctx upgrade disable
-```
-
-or for one process:
-
-```bash
-CTX_UPGRADE_OFF=1 ctx search "query"
-```
-
-Background checks log to `~/.ctx/logs/upgrade.log` and should not write to
-stdout or stderr.
+This fork makes no network calls; there is no telemetry and no self-update.
+Update via Nix / SourceHut release tags.
 
 ## Store Problems
 

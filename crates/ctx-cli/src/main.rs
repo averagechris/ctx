@@ -15,17 +15,12 @@ use serde_json::{json, Number, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-mod analytics;
 mod config;
 mod docs;
 mod history_source_plugins;
-mod identity;
 mod mcp;
-mod net;
-mod upgrade;
 
-use analytics::{AnalyticsEvent, AnalyticsProperties};
-use config::{AppConfig, CONFIG_FILE};
+use config::CONFIG_FILE;
 use ctx_history_capture::{
     catalog_codex_session_tree, discover_provider_sources, discover_provider_sources_for_provider,
     import_antigravity_cli_history, import_astrbot_sqlite, import_claude_projects_jsonl_tree,
@@ -99,8 +94,6 @@ enum CommandRoot {
     Docs(docs::DocsArgs),
     #[command(about = "Serve read-only ctx tools over MCP")]
     Mcp(mcp::McpArgs),
-    #[command(about = "Check or apply signed ctx CLI upgrades")]
-    Upgrade(upgrade::UpgradeArgs),
     #[command(about = "Check local ctx health")]
     Doctor(DoctorArgs),
 }
@@ -383,10 +376,6 @@ impl SqlArgs {
             self.format
         }
     }
-
-    fn json_output(&self) -> bool {
-        self.output_format() == SqlFormat::Json
-    }
 }
 
 pub(crate) struct SearchFilterInput {
@@ -507,75 +496,6 @@ fn search_no_results_target(query: &str, terms: &[String]) -> String {
     }
 }
 
-impl CommandRoot {
-    fn name(&self) -> &'static str {
-        match self {
-            Self::Setup(_) => "setup",
-            Self::Status(_) => "status",
-            Self::Sources(_) => "sources",
-            Self::Import(_) => "import",
-            Self::Show(_) => "show",
-            Self::Locate(_) => "locate",
-            Self::Search(_) => "search",
-            Self::Sql(_) => "sql",
-            Self::Docs(_) => "docs",
-            Self::Mcp(_) => "mcp",
-            Self::Upgrade(_) => "upgrade",
-            Self::Doctor(_) => "doctor",
-        }
-    }
-
-    fn sends_analytics(&self) -> bool {
-        match self {
-            Self::Sql(_) | Self::Mcp(_) => false,
-            Self::Upgrade(args) if args.background() => false,
-            _ => true,
-        }
-    }
-
-    fn json_output(&self) -> bool {
-        match self {
-            Self::Setup(args) => args.json,
-            Self::Status(args) => args.json,
-            Self::Sources(args) => args.json,
-            Self::Import(args) => args.json,
-            Self::Show(args) => args.json_output(),
-            Self::Locate(args) => args.json_output(),
-            Self::Search(args) => args.json,
-            Self::Sql(args) => args.json_output(),
-            Self::Docs(args) => args.json_output(),
-            Self::Mcp(_) => false,
-            Self::Upgrade(args) => args.json_output(),
-            Self::Doctor(args) => args.json,
-        }
-    }
-
-    fn allows_background_upgrade(&self) -> bool {
-        !matches!(
-            self,
-            Self::Docs(_) | Self::Mcp(_) | Self::Sql(_) | Self::Upgrade(_)
-        )
-    }
-}
-
-impl ShowArgs {
-    fn json_output(&self) -> bool {
-        match &self.target {
-            ShowTarget::Session(args) => args.json || args.format == OutputFormat::Json,
-            ShowTarget::Event(args) => args.json || args.format == OutputFormat::Json,
-        }
-    }
-}
-
-impl LocateArgs {
-    fn json_output(&self) -> bool {
-        match &self.target {
-            LocateTarget::Session(args) => args.json || args.format == LocateFormat::Json,
-            LocateTarget::Event(args) => args.json || args.format == LocateFormat::Json,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum TranscriptMode {
     Full,
@@ -630,15 +550,6 @@ enum SqlFormat {
     Json,
     Csv,
     Raw,
-}
-
-impl LocateFormat {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Text => "text",
-            Self::Json => "json",
-        }
-    }
 }
 
 impl OutputFormat {
@@ -1375,195 +1286,27 @@ struct ShowDto;
 struct SearchDto;
 
 fn main() -> Result<()> {
-    let started = Instant::now();
     let cli = Cli::parse();
-    let action = cli.command.name();
-    let sends_analytics = cli.command.sends_analytics();
-    let json_output = cli.command.json_output();
-    let allow_background_upgrade = cli.command.allows_background_upgrade();
-    let mut analytics_properties = command_analytics_properties(&cli.command);
     let data_root = cli
         .data_root
         .clone()
         .map(Ok)
         .unwrap_or_else(default_data_root)
         .context("resolve ctx data root")?;
-    let config = AppConfig::load(&data_root)?;
 
-    let result = match cli.command {
-        CommandRoot::Setup(args) => run_setup(args, data_root.clone(), &mut analytics_properties),
-        CommandRoot::Status(args) => run_status(args, data_root.clone(), &mut analytics_properties),
-        CommandRoot::Sources(args) => {
-            run_sources(args, data_root.clone(), &mut analytics_properties)
-        }
-        CommandRoot::Import(args) => run_import(args, data_root.clone(), &mut analytics_properties),
-        CommandRoot::Show(args) => run_show(args, data_root.clone(), &mut analytics_properties),
-        CommandRoot::Locate(args) => run_locate(args, data_root.clone(), &mut analytics_properties),
-        CommandRoot::Search(args) => run_search(args, data_root.clone(), &mut analytics_properties),
+    match cli.command {
+        CommandRoot::Setup(args) => run_setup(args, data_root.clone()),
+        CommandRoot::Status(args) => run_status(args, data_root.clone()),
+        CommandRoot::Sources(args) => run_sources(args, data_root.clone()),
+        CommandRoot::Import(args) => run_import(args, data_root.clone()),
+        CommandRoot::Show(args) => run_show(args, data_root.clone()),
+        CommandRoot::Locate(args) => run_locate(args, data_root.clone()),
+        CommandRoot::Search(args) => run_search(args, data_root.clone()),
         CommandRoot::Sql(args) => run_sql(args, data_root.clone()),
         CommandRoot::Docs(args) => docs::run(args),
         CommandRoot::Mcp(args) => mcp::run(args, data_root.clone()),
-        CommandRoot::Upgrade(args) => upgrade::run(args, data_root.clone(), config.clone()),
-        CommandRoot::Doctor(args) => run_doctor(args, data_root.clone(), &mut analytics_properties),
-    };
-    if sends_analytics {
-        analytics::send_cli_event(
-            &data_root,
-            &config,
-            AnalyticsEvent {
-                action,
-                json_output,
-                success: result.is_ok(),
-                duration: started.elapsed(),
-                properties: analytics_properties,
-            },
-        );
+        CommandRoot::Doctor(args) => run_doctor(args, data_root.clone()),
     }
-    if result.is_ok() && allow_background_upgrade {
-        upgrade::maybe_spawn_auto_upgrade(&data_root, &config, json_output);
-    }
-    result
-}
-
-fn command_analytics_properties(command: &CommandRoot) -> AnalyticsProperties {
-    let mut properties = analytics::empty_properties();
-    match command {
-        CommandRoot::Setup(args) => {
-            analytics::insert_bool(&mut properties, "catalog_only", args.catalog_only);
-            analytics::insert_str(
-                &mut properties,
-                "progress_mode",
-                progress_mode_name(args.progress),
-            );
-        }
-        CommandRoot::Status(_)
-        | CommandRoot::Sources(_)
-        | CommandRoot::Sql(_)
-        | CommandRoot::Doctor(_) => {}
-        CommandRoot::Import(args) => {
-            analytics::insert_bool(&mut properties, "resume", args.resume);
-            analytics::insert_bool(&mut properties, "all_sources", args.all);
-            analytics::insert_str(
-                &mut properties,
-                "source_mode",
-                if args.format.is_some() {
-                    "explicit_format"
-                } else if args.history_source.is_some() {
-                    "history_source_plugin"
-                } else if args.path.is_some() {
-                    "explicit_path"
-                } else if args.all {
-                    "all_discovered"
-                } else if args.provider.is_some() {
-                    "discovered_provider"
-                } else {
-                    "auto_discovered"
-                },
-            );
-            if let Some(provider) = args.provider {
-                analytics::insert_str(
-                    &mut properties,
-                    "provider_filter",
-                    provider.capture_provider().as_str(),
-                );
-            }
-            analytics::insert_bool(&mut properties, "reset_cursor", args.reset_cursor);
-            analytics::insert_str(
-                &mut properties,
-                "progress_mode",
-                progress_mode_name(args.progress),
-            );
-        }
-        CommandRoot::Show(args) => match &args.target {
-            ShowTarget::Session(args) => {
-                analytics::insert_str(&mut properties, "target_kind", "session");
-                analytics::insert_str(&mut properties, "transcript_mode", args.mode.as_str());
-                analytics::insert_str(&mut properties, "output_format", args.format.as_str());
-                analytics::insert_bool(&mut properties, "writes_out_file", args.out.is_some());
-                analytics::insert_bool(
-                    &mut properties,
-                    "provider_lookup",
-                    args.provider.is_some() || args.provider_session.is_some(),
-                );
-            }
-            ShowTarget::Event(args) => {
-                analytics::insert_str(&mut properties, "target_kind", "event");
-                analytics::insert_str(&mut properties, "output_format", args.format.as_str());
-                analytics::insert_count_bucket(
-                    &mut properties,
-                    "window_bucket",
-                    args.window.unwrap_or(args.before.max(args.after)) as u64,
-                );
-            }
-        },
-        CommandRoot::Locate(args) => match &args.target {
-            LocateTarget::Session(args) => {
-                analytics::insert_str(&mut properties, "target_kind", "session");
-                analytics::insert_str(&mut properties, "output_format", args.format.as_str());
-                analytics::insert_bool(
-                    &mut properties,
-                    "provider_lookup",
-                    args.provider.is_some() || args.provider_session.is_some(),
-                );
-            }
-            LocateTarget::Event(args) => {
-                analytics::insert_str(&mut properties, "target_kind", "event");
-                analytics::insert_str(&mut properties, "output_format", args.format.as_str());
-            }
-        },
-        CommandRoot::Search(args) => {
-            analytics::insert_bool(&mut properties, "has_query", args.query.is_some());
-            analytics::insert_bool(
-                &mut properties,
-                "has_provider_filter",
-                args.provider.is_some(),
-            );
-            analytics::insert_bool(
-                &mut properties,
-                "has_workspace_filter",
-                args.workspace.is_some(),
-            );
-            analytics::insert_bool(&mut properties, "has_since_filter", args.since.is_some());
-            analytics::insert_bool(
-                &mut properties,
-                "has_event_type_filter",
-                args.event_type.is_some(),
-            );
-            analytics::insert_bool(&mut properties, "has_file_filter", args.file.is_some());
-            analytics::insert_bool(
-                &mut properties,
-                "has_session_filter",
-                args.session.is_some(),
-            );
-            analytics::insert_bool(
-                &mut properties,
-                "event_results",
-                args.events || args.session.is_some(),
-            );
-            analytics::insert_bool(&mut properties, "primary_only", args.primary_only);
-            analytics::insert_bool(&mut properties, "include_subagents", args.include_subagents);
-            analytics::insert_bool(
-                &mut properties,
-                "include_current_session",
-                args.include_current_session,
-            );
-            analytics::insert_count_bucket(&mut properties, "limit_bucket", args.limit as u64);
-            if let Some(provider) = args.provider {
-                analytics::insert_str(
-                    &mut properties,
-                    "provider_filter",
-                    provider.capture_provider().as_str(),
-                );
-            }
-        }
-        CommandRoot::Mcp(_) => {}
-        CommandRoot::Docs(_) => {}
-        CommandRoot::Upgrade(args) => {
-            analytics::insert_bool(&mut properties, "dry_run", args.dry_run);
-            analytics::insert_bool(&mut properties, "background", args.background());
-        }
-    }
-    properties
 }
 
 fn progress_mode_name(progress: ProgressArg) -> &'static str {
@@ -1575,11 +1318,7 @@ fn progress_mode_name(progress: ProgressArg) -> &'static str {
     }
 }
 
-fn run_setup(
-    args: SetupArgs,
-    data_root: PathBuf,
-    analytics_properties: &mut AnalyticsProperties,
-) -> Result<()> {
+fn run_setup(args: SetupArgs, data_root: PathBuf) -> Result<()> {
     fs::create_dir_all(&data_root)?;
     let db_path = database_path(data_root.clone());
     let store = Store::open(&db_path)?;
@@ -1592,27 +1331,6 @@ fn run_setup(
     progress.done(
         "cataloging",
         format!("cataloged {} Codex sessions", catalog.cataloged_sessions),
-        catalog.source_bytes,
-    );
-    let catalog_counts = store.catalog_session_counts()?;
-    analytics::insert_count_bucket(
-        analytics_properties,
-        "providers_detected_bucket",
-        sources.len() as u64,
-    );
-    analytics::insert_count_bucket(
-        analytics_properties,
-        "cataloged_sessions_bucket",
-        catalog.cataloged_sessions as u64,
-    );
-    analytics::insert_count_bucket(
-        analytics_properties,
-        "pending_sessions_bucket",
-        catalog_counts.pending as u64,
-    );
-    analytics::insert_bytes_bucket(
-        analytics_properties,
-        "catalog_source_bytes_bucket",
         catalog.source_bytes,
     );
     let import_report = if args.catalog_only {
@@ -1634,7 +1352,6 @@ fn run_setup(
         Some(run_import_internal(
             &import_args,
             data_root.clone(),
-            analytics_properties,
             ImportRunOptions {
                 progress: args.progress,
                 json: args.json,
@@ -1774,45 +1491,11 @@ fn indexed_history_item_count(store: &Store) -> Result<usize> {
     Ok(store.indexed_history_item_count()?)
 }
 
-fn insert_store_analytics_counts(
-    analytics_properties: &mut AnalyticsProperties,
-    store: &Store,
-) -> Result<()> {
-    let counts = store.indexed_history_counts()?;
-    analytics::insert_count_bucket(
-        analytics_properties,
-        "indexed_sessions_bucket",
-        counts.sessions as u64,
-    );
-    analytics::insert_count_bucket(
-        analytics_properties,
-        "indexed_events_bucket",
-        counts.events as u64,
-    );
-    analytics::insert_count_bucket(
-        analytics_properties,
-        "indexed_items_bucket",
-        counts.items() as u64,
-    );
-    Ok(())
-}
-
-fn insert_db_size_bucket(analytics_properties: &mut AnalyticsProperties, db_path: &Path) {
-    let bytes = fs::metadata(db_path)
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
-    analytics::insert_bytes_bucket(analytics_properties, "db_size_bucket", bytes);
-}
-
 fn setup_has_failed_sources(report: Option<&ImportReport>) -> bool {
     report.is_some_and(|report| report.totals.failed_sources > 0)
 }
 
-fn run_status(
-    args: JsonArgs,
-    data_root: PathBuf,
-    analytics_properties: &mut AnalyticsProperties,
-) -> Result<()> {
+fn run_status(args: JsonArgs, data_root: PathBuf) -> Result<()> {
     let db_path = database_path(data_root.clone());
     let initialized = db_path.exists();
     let config_path = data_root.join(CONFIG_FILE);
@@ -1829,25 +1512,6 @@ fn run_status(
     } else {
         (0, 0, 0, 0, Default::default())
     };
-    analytics::insert_bool(analytics_properties, "initialized", initialized);
-    analytics::insert_count_bucket(analytics_properties, "indexed_items_bucket", records as u64);
-    analytics::insert_count_bucket(
-        analytics_properties,
-        "indexed_sessions_bucket",
-        sessions as u64,
-    );
-    analytics::insert_count_bucket(analytics_properties, "indexed_events_bucket", events as u64);
-    analytics::insert_count_bucket(
-        analytics_properties,
-        "indexed_sources_bucket",
-        sources as u64,
-    );
-    analytics::insert_count_bucket(
-        analytics_properties,
-        "cataloged_sessions_bucket",
-        catalog_counts.total as u64,
-    );
-    insert_db_size_bucket(analytics_properties, &db_path);
 
     if args.json {
         print_json(json!({
@@ -1884,42 +1548,11 @@ fn run_status(
     Ok(())
 }
 
-fn run_sources(
-    args: JsonArgs,
-    data_root: PathBuf,
-    analytics_properties: &mut AnalyticsProperties,
-) -> Result<()> {
+fn run_sources(args: JsonArgs, data_root: PathBuf) -> Result<()> {
     let sources = discovered_sources();
     let plugin_discovery = discover_history_source_plugins_with_diagnostics(&data_root, &[])?;
     let plugin_sources = plugin_discovery.sources;
     let plugin_failures = plugin_discovery.failures;
-    let existing = sources.iter().filter(|source| source.exists).count();
-    let importable = sources
-        .iter()
-        .filter(|source| {
-            source.exists
-                && source.import_support.is_importable()
-                && source.status == ProviderSourceStatus::Available
-        })
-        .count();
-    analytics::insert_count_bucket(
-        analytics_properties,
-        "providers_detected_bucket",
-        sources
-            .len()
-            .saturating_add(plugin_sources.len())
-            .saturating_add(plugin_failures.len()) as u64,
-    );
-    analytics::insert_count_bucket(
-        analytics_properties,
-        "providers_existing_bucket",
-        existing as u64,
-    );
-    analytics::insert_count_bucket(
-        analytics_properties,
-        "providers_importable_bucket",
-        importable as u64,
-    );
     if args.json {
         let mut source_values = sources_json(&sources);
         source_values.extend(plugin_sources_json(&plugin_sources));
@@ -2004,17 +1637,12 @@ fn catalog_available_sources(
     Ok((totals, catalog_sources))
 }
 
-fn run_import(
-    args: ImportArgs,
-    data_root: PathBuf,
-    analytics_properties: &mut AnalyticsProperties,
-) -> Result<()> {
+fn run_import(args: ImportArgs, data_root: PathBuf) -> Result<()> {
     let json = args.json;
     let progress = args.progress;
     let report = run_import_internal(
         &args,
         data_root,
-        analytics_properties,
         ImportRunOptions {
             progress,
             json,
@@ -2030,7 +1658,6 @@ fn run_import(
 fn run_import_internal(
     args: &ImportArgs,
     data_root: PathBuf,
-    analytics_properties: &mut AnalyticsProperties,
     options: ImportRunOptions,
 ) -> Result<ImportReport> {
     validate_import_args(args)?;
@@ -2042,14 +1669,7 @@ fn run_import_internal(
     let mut imported_sources = Vec::new();
 
     if let Some(format) = args.format {
-        return run_explicit_format_import(
-            args,
-            format,
-            db_path,
-            store,
-            analytics_properties,
-            options,
-        );
+        return run_explicit_format_import(args, format, db_path, store, options);
     }
 
     let requests = import_requests(args)?;
@@ -2075,16 +1695,6 @@ fn run_import_internal(
         planned_total_bytes = planned_total_bytes.saturating_add(stats.bytes);
         planned_sources.push((source, stats));
     }
-    analytics::insert_count_bucket(
-        analytics_properties,
-        "sources_seen_bucket",
-        planned_sources.len().saturating_add(plugin_requests.len()) as u64,
-    );
-    analytics::insert_bytes_bucket(
-        analytics_properties,
-        "source_bytes_bucket",
-        planned_total_bytes,
-    );
 
     let progress = ProgressReporter::new(
         options.progress,
@@ -2409,37 +2019,6 @@ fn run_import_internal(
         format!("indexed {} source file(s)", totals.source_files),
         totals.source_bytes,
     );
-    analytics::insert_count_bucket(
-        analytics_properties,
-        "source_files_bucket",
-        totals.source_files as u64,
-    );
-    analytics::insert_count_bucket(
-        analytics_properties,
-        "failed_sources_bucket",
-        totals.failed_sources as u64,
-    );
-    analytics::insert_count_bucket(
-        analytics_properties,
-        "sessions_imported_bucket",
-        totals.imported_sessions as u64,
-    );
-    analytics::insert_count_bucket(
-        analytics_properties,
-        "events_imported_bucket",
-        totals.imported_events as u64,
-    );
-    analytics::insert_count_bucket(
-        analytics_properties,
-        "edges_imported_bucket",
-        totals.imported_edges as u64,
-    );
-    analytics::insert_count_bucket(
-        analytics_properties,
-        "skipped_bucket",
-        totals.skipped as u64,
-    );
-    analytics::insert_count_bucket(analytics_properties, "failed_bucket", totals.failed as u64);
     if totals.imported_sources == 0 && totals.failed_sources > 0 {
         let detail = imported_sources
             .iter()
@@ -2460,7 +2039,6 @@ fn run_explicit_format_import(
     format: ImportFormatArg,
     db_path: PathBuf,
     mut store: Store,
-    analytics_properties: &mut AnalyticsProperties,
     options: ImportRunOptions,
 ) -> Result<ImportReport> {
     let path = args
@@ -2469,8 +2047,6 @@ fn run_explicit_format_import(
         .context("--format requires an explicit --path")?;
     let stats =
         source_stats(path).with_context(|| format!("scan import source {}", path.display()))?;
-    analytics::insert_count_bucket(analytics_properties, "sources_seen_bucket", 1);
-    analytics::insert_bytes_bucket(analytics_properties, "source_bytes_bucket", stats.bytes);
 
     let progress = ProgressReporter::new(
         options.progress,
@@ -2547,33 +2123,6 @@ fn run_explicit_format_import(
         format!("indexed 1 {} source file", format.as_str()),
         stats.bytes,
     );
-    analytics::insert_count_bucket(
-        analytics_properties,
-        "source_files_bucket",
-        stats.files as u64,
-    );
-    analytics::insert_count_bucket(analytics_properties, "failed_sources_bucket", 0);
-    analytics::insert_count_bucket(
-        analytics_properties,
-        "sessions_imported_bucket",
-        totals.imported_sessions as u64,
-    );
-    analytics::insert_count_bucket(
-        analytics_properties,
-        "events_imported_bucket",
-        totals.imported_events as u64,
-    );
-    analytics::insert_count_bucket(
-        analytics_properties,
-        "edges_imported_bucket",
-        totals.imported_edges as u64,
-    );
-    analytics::insert_count_bucket(
-        analytics_properties,
-        "skipped_bucket",
-        totals.skipped as u64,
-    );
-    analytics::insert_count_bucket(analytics_properties, "failed_bucket", totals.failed as u64);
     Ok(ImportReport {
         resume: args.resume,
         totals,
@@ -2954,11 +2503,7 @@ fn available_space_bytes(_path: &Path) -> Option<u64> {
     None
 }
 
-fn run_show(
-    args: ShowArgs,
-    data_root: PathBuf,
-    analytics_properties: &mut AnalyticsProperties,
-) -> Result<()> {
+fn run_show(args: ShowArgs, data_root: PathBuf) -> Result<()> {
     let store = Store::open(database_path(data_root))?;
     match args.target {
         ShowTarget::Session(args) => {
@@ -2969,22 +2514,12 @@ fn run_show(
                 args.provider_session.as_deref(),
             )?;
             let events = store.events_for_session(session.id)?;
-            analytics::insert_count_bucket(
-                analytics_properties,
-                "events_returned_bucket",
-                events.len() as u64,
-            );
             let format = effective_format(args.format, args.json);
             write_rendered_session(&store, &session, &events, args.mode, format, args.out)?;
         }
         ShowTarget::Event(args) => {
             let event = resolve_event(&store, &args.id)?;
             let events = event_window(&store, &event, args.before, args.after, args.window)?;
-            analytics::insert_count_bucket(
-                analytics_properties,
-                "events_returned_bucket",
-                events.len() as u64,
-            );
             let format = effective_format(args.format, args.json);
             write_rendered_events(&store, &event, &events, format, None)?;
         }
@@ -3001,11 +2536,7 @@ fn event_preview(event: &Event) -> String {
     }
 }
 
-fn run_locate(
-    args: LocateArgs,
-    data_root: PathBuf,
-    _analytics_properties: &mut AnalyticsProperties,
-) -> Result<()> {
+fn run_locate(args: LocateArgs, data_root: PathBuf) -> Result<()> {
     let store = Store::open(database_path(data_root))?;
     match args.target {
         LocateTarget::Session(args) => {
@@ -4320,11 +3851,7 @@ fn csv_escape(value: &str) -> String {
     }
 }
 
-fn run_search(
-    args: SearchArgs,
-    data_root: PathBuf,
-    analytics_properties: &mut AnalyticsProperties,
-) -> Result<()> {
+fn run_search(args: SearchArgs, data_root: PathBuf) -> Result<()> {
     if !search_has_intent(SearchIntentInput {
         query: args.query.as_deref(),
         terms: &args.term,
@@ -4335,29 +3862,7 @@ fn run_search(
 
     let db_path = database_path(data_root.clone());
     let had_existing_store = db_path.exists();
-    let refresh_started = Instant::now();
     let refresh = refresh_before_search(&args, &data_root)?;
-    analytics::insert_duration(
-        analytics_properties,
-        "refresh_duration",
-        refresh_started.elapsed(),
-    );
-    analytics::insert_str(
-        analytics_properties,
-        "search_refresh_mode",
-        refresh.mode.as_str(),
-    );
-    analytics::insert_str(
-        analytics_properties,
-        "search_refresh_status",
-        refresh.status,
-    );
-    analytics::insert_count_bucket(
-        analytics_properties,
-        "search_refresh_source_count_bucket",
-        refresh.source_count as u64,
-    );
-    insert_db_size_bucket(analytics_properties, &db_path);
     if refresh.status == "failed" && args.refresh == RefreshArg::Auto && !had_existing_store {
         return Err(anyhow!(
             "search refresh failed and no existing ctx index is available; run `ctx import` first or retry with `--refresh strict`: {}",
@@ -4373,29 +3878,8 @@ fn run_search(
     } else {
         Store::open(&db_path)?
     };
-    insert_store_analytics_counts(analytics_properties, &store)?;
     let source_identity = SourceIdentityFilterArgs::from(&args);
     let query = args.query.unwrap_or_default();
-    let query_term_count = query
-        .split_whitespace()
-        .filter(|term| !term.trim().is_empty())
-        .count()
-        .saturating_add(
-            args.term
-                .iter()
-                .filter(|term| !term.trim().is_empty())
-                .count(),
-        );
-    analytics::insert_text_length_bucket(
-        analytics_properties,
-        "query_length_bucket",
-        query.chars().count(),
-    );
-    analytics::insert_count_bucket(
-        analytics_properties,
-        "query_term_count_bucket",
-        query_term_count as u64,
-    );
     let event_results = args.events || args.session.is_some();
     let options = ctx_history_search::PacketOptions {
         limit: args.limit,
@@ -4422,35 +3906,11 @@ fn run_search(
         ..ctx_history_search::PacketOptions::default()
     };
     let uses_composed_terms = args.term.iter().any(|term| !term.trim().is_empty());
-    let query_started = Instant::now();
     let packet = if uses_composed_terms {
         ctx_history_search::search_packet_terms(&store, &query, &args.term, &options)?
     } else {
         ctx_history_search::search_packet(&store, &query, &options)?
     };
-    analytics::insert_duration(
-        analytics_properties,
-        "query_duration",
-        query_started.elapsed(),
-    );
-    let result_count = packet.results.len();
-    let citation_count = packet
-        .results
-        .iter()
-        .map(|result| result.citations.len())
-        .sum::<usize>();
-    analytics::insert_count_bucket(
-        analytics_properties,
-        "result_count_bucket",
-        result_count as u64,
-    );
-    analytics::insert_count_bucket(
-        analytics_properties,
-        "citation_count_bucket",
-        citation_count as u64,
-    );
-    analytics::insert_bool(analytics_properties, "zero_result", result_count == 0);
-    let render_started = Instant::now();
     if args.json {
         let suggested_next_query = (!uses_composed_terms).then_some(query.as_str());
         print_share_safe_value(SearchDto::packet(
@@ -4505,11 +3965,6 @@ fn run_search(
             }
         }
     }
-    analytics::insert_duration(
-        analytics_properties,
-        "render_duration",
-        render_started.elapsed(),
-    );
     Ok(())
 }
 
@@ -4848,11 +4303,7 @@ fn refresh_sources_for_search(
     Ok(totals)
 }
 
-fn run_doctor(
-    args: DoctorArgs,
-    data_root: PathBuf,
-    analytics_properties: &mut AnalyticsProperties,
-) -> Result<()> {
+fn run_doctor(args: DoctorArgs, data_root: PathBuf) -> Result<()> {
     let progress = ProgressReporter::new(args.progress, args.json, "doctor", 0);
     progress.message("opening", "opening ctx store");
     let db_path = database_path(data_root.clone());
@@ -4873,11 +4324,6 @@ fn run_doctor(
         );
         findings.extend(store.validate()?);
     }
-    analytics::insert_count_bucket(
-        analytics_properties,
-        "finding_count_bucket",
-        findings.len() as u64,
-    );
     progress.done(
         "done",
         if findings.is_empty() {

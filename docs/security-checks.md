@@ -13,19 +13,15 @@ the local retrieval product.
   configured ctx data root before querying.
 - `ctx show` and `ctx locate` write nothing in local-only security mode, except
   `ctx show session --out` writes only the explicit path when one is provided.
-- `ctx sql` opens only the existing SQLite index, rejects write statements and
-  multiple statements, and does not run background upgrade checks.
+- `ctx sql` opens only the existing SQLite index and rejects write statements
+  and multiple statements.
 - In local-only security mode, setup/import/search do not use network access or
   API keys.
 - `ctx docs` reads embedded documentation and writes only an explicit topic
   output path for `ctx docs show --out` or an explicit man-page output
   directory when `ctx docs man --out` is used.
-- `ctx upgrade` uses signed release metadata with explicit self-upgrade policy
-  and applies only to official installer-managed binaries with a matching
-  install sidecar.
-- Background auto-upgrade is managed-install-only, skipped for JSON/MCP/docs/sql/
-  upgrade commands, requires explicit signed auto-upgrade policy, and must not
-  collect provider history or pollute command stdout/stderr.
+- The binary makes no network calls; there is no telemetry and no self-update.
+  Updates come from Nix / SourceHut release tags.
 - Provider files are read as sources and not modified.
 - Provider transcript imports reject symlinked JSONL files by default.
 - JSON output is private by default and must not be described as share-safe.

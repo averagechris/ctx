@@ -1,14 +1,8 @@
 use assert_cmd::Command;
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use predicates::prelude::*;
-use ring::{
-    rand::SystemRandom,
-    signature::{RsaKeyPair, RSA_PKCS1_SHA256},
-};
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeSet,
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -24,7 +18,6 @@ fn ctx(temp: &TempDir) -> Command {
     let mut command = Command::cargo_bin("ctx").unwrap();
     command.env("CTX_DATA_ROOT", temp.path());
     command.env("HOME", temp.path());
-    command.env("CTX_ANALYTICS_OFF", "1");
     command
 }
 
@@ -329,33 +322,6 @@ fn copy_dir_all(from: &Path, to: &Path) {
     }
 }
 
-fn file_url(path: &Path) -> String {
-    format!("file://{}", path.display())
-}
-
-fn read_analytics_events(path: &Path) -> Vec<Value> {
-    fs::read_to_string(path)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect()
-}
-
-fn analytics_event_properties(event: &Value) -> &serde_json::Map<String, Value> {
-    event["events"][0]["properties"].as_object().unwrap()
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(bytes);
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(&mut out, "{byte:02x}");
-    }
-    out
-}
-
 fn json_output(command: &mut Command) -> Value {
     let output = command.assert().success().get_output().stdout.clone();
     serde_json::from_slice(&output).unwrap()
@@ -364,63 +330,6 @@ fn json_output(command: &mut Command) -> Value {
 fn failure_stderr(command: &mut Command) -> String {
     let stderr = command.assert().failure().get_output().stderr.clone();
     String::from_utf8(stderr).unwrap()
-}
-
-const TEST_RELEASE_PRIVATE_KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
-MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC4czAqM5XMipjl
-QxTatkq8VmeS13e2aEpqT1v/XGL17o43i624H80xEbvB5tV/YzpO5N8sb4wEUj9h
-yNzB5/U4S6SM/QadcA9fk/V7KeBOcz15PvZaU0UNp/dKVvzEFtxv/rjQCfA80C2N
-30lTwti8pts4IulxVeB7BkIvqs3XADV5zBVwRACHWt5MKcMrXfBcmKRy8TLdNeml
-lPgU3V2pj4c54KQ0aoy3/970+ry3P+eT8BlatU4k8R+pS0Oy4s3Ezczj9UrPCREd
-1m2tAqaw8B0wRoei+nHEPWqbbzgx8fepv38U9LXmzYpCjSWSZ+zcZ4YBsXlyab3a
-2PjyZ42HAgMBAAECggEAHQvis1qhRe8zibMJJzIazdLrh5fP3dVJlrk9mxag7Oqu
-0bd42WyEoywQPcZMq71kEsV/EZ/VVF7hZVQ803pkRwO+e4djEcryWNJTj5w2GxSR
-wzSzleDUGITxb+8H6hdRin95+iT+hI0iB1v4z6x49ihukEYLLhJgge8n4BrNRISa
-P+SInTo/UzO5NIzh8HdQBJqkammS4c/Eij0jVw9onMpOFWKAxcs0hmk1SSy6KouD
-yDBqp6m6ILlAuggZutkn+7X4QUzvgBQePYy6BNX57dmFpBWt/8DVc5m4Ciwd+s1L
-CLRL86X6YLtc5wTQvdX/xHbW9m/FUXk5EvK2eQ+IyQKBgQD7B4aFQFwHiRjO323d
-I7FUcSgsBEz/pYiucEF5c+GQUpSq/ORgFg7sYLAv3312nbu/TdIw2O0KxhhfUX6j
-iRGe5NzSogUpRHk3Rq/tbQKULezDi9Lc7ROUuMYRpsHSjiVLB+zYdRDZULBqAdSo
-3A0c0/xfCKB0efIJt4SfTVtcvwKBgQC8Git0ry8csFgmwmuxHL1nBmxXBLyZ04Ko
-PQ+WyLPgL8cVP3Bf19zXDtmeoPSD8bZODys4UKit3zpZDEKN9S8JeN2E1h5MTgKN
-wmOxdimAo0xKHJ/EnvxzfR5UzbrGiuajCFvIDPjItl3gSJ2av1cwQ8ljZBtOoqdX
-KiTNCw7ZOQKBgQCTEuSom32P2K4VPmiC4M+blrSfnWFzgoujEBf8TX2BbjC2QXaY
-KTRTH476bWl3npCKU9DrV50B6/AJoJievcb6HkKWkeCOPhT64speQ7j4EjQemYRQ
-dgI750n8u4PhlfCZlioY4/WcLR8+7JWo3Uw9cKHzF/3SYEQDl2b3Yn49xwKBgFda
-g+HNVUCqeFWPpnl60k6dAgUrUvbQ7fV5Xdr1W+t55KdubZ5k3c8Vu2RadRMtVi9M
-BhNCCgOtDii6c9H/EhgBBEajNTDUbYUtyCRqrn1p2Iz2XA/wkWaErWhOnjWD3fXK
-dO0jcQms/02gC2kJANGOOWEp5TCQgswM60g5oWypAoGADlZTP+97w9NcOJoQdZVi
-+I5NLRKHUjAvax4BALtH5uuVIwj6cSwheRkBzd7rU1aQ65yuUYwIznDsC2rir26x
-ehIUvhTehZf04otZbIo7UUvFhohRmX5k4/Idf/njMa/dA5afBMM1xE7IkoeHQyLc
-3I9zapKTmyq90XvKHvA9eyA=
------END PRIVATE KEY-----"#;
-
-const TEST_RELEASE_PUBLIC_KEY_PEM: &str = r#"-----BEGIN RSA PUBLIC KEY-----
-MIIBCgKCAQEAuHMwKjOVzIqY5UMU2rZKvFZnktd3tmhKak9b/1xi9e6ON4utuB/N
-MRG7webVf2M6TuTfLG+MBFI/Ycjcwef1OEukjP0GnXAPX5P1eyngTnM9eT72WlNF
-Daf3Slb8xBbcb/640AnwPNAtjd9JU8LYvKbbOCLpcVXgewZCL6rN1wA1ecwVcEQA
-h1reTCnDK13wXJikcvEy3TXppZT4FN1dqY+HOeCkNGqMt//e9Pq8tz/nk/AZWrVO
-JPEfqUtDsuLNxM3M4/VKzwkRHdZtrQKmsPAdMEaHovpxxD1qm284MfH3qb9/FPS1
-5s2KQo0lkmfs3GeGAbF5cmm92tj48meNhwIDAQAB
------END RSA PUBLIC KEY-----"#;
-
-fn pem_der(pem: &str) -> Vec<u8> {
-    let body: String = pem
-        .lines()
-        .filter(|line| !line.starts_with("-----"))
-        .map(str::trim)
-        .collect();
-    BASE64.decode(body).unwrap()
-}
-
-fn sign_test_release_metadata(bytes: &[u8]) -> String {
-    let key_pair = RsaKeyPair::from_pkcs8(&pem_der(TEST_RELEASE_PRIVATE_KEY_PEM)).unwrap();
-    let rng = SystemRandom::new();
-    let mut signature = vec![0; key_pair.public().modulus_len()];
-    key_pair
-        .sign(&RSA_PKCS1_SHA256, &rng, bytes, &mut signature)
-        .unwrap();
-    BASE64.encode(signature)
 }
 
 fn mcp_roundtrip(temp: &TempDir, messages: &[Value]) -> Vec<Value> {
@@ -716,7 +625,7 @@ fn help_exposes_session_retrieval_commands() {
 
     for expected in [
         "setup", "status", "sources", "import", "show", "search", "docs", "locate", "mcp", "sql",
-        "upgrade", "doctor",
+        "doctor",
     ] {
         assert!(
             commands.contains(expected),
@@ -747,6 +656,8 @@ fn help_exposes_session_retrieval_commands() {
         "context",
         "update",
         "uninstall",
+        "upgrade",
+        "analytics",
     ] {
         assert!(
             !commands.contains(&format!("  {forbidden}")),
@@ -788,6 +699,8 @@ fn removed_commands_are_rejected() {
         "context",
         "update",
         "uninstall",
+        "upgrade",
+        "analytics",
     ] {
         ctx(&temp)
             .arg(command)
@@ -823,11 +736,11 @@ fn setup_writes_day_one_config_contract_without_overwriting_existing_config() {
 
     ctx(&temp).arg("setup").assert().success();
     let default_config = fs::read_to_string(&config_path).unwrap();
-    assert!(default_config.contains("[upgrade]"));
-    assert!(default_config.contains("auto = \"apply\""));
-    assert!(default_config.contains("channel = \"stable\""));
+    assert!(default_config.contains("# ctx configuration"));
+    assert!(!default_config.contains("[upgrade]"));
+    assert!(!default_config.contains("[analytics]"));
 
-    let user_config = "# user managed ctx config\n[analytics]\nenabled = false\n";
+    let user_config = "# user managed ctx config\n";
     fs::write(&config_path, user_config).unwrap();
 
     ctx(&temp).arg("setup").assert().success();
@@ -835,47 +748,6 @@ fn setup_writes_day_one_config_contract_without_overwriting_existing_config() {
         fs::read_to_string(&config_path).unwrap(),
         user_config,
         "setup must not overwrite an existing user config"
-    );
-}
-
-#[test]
-fn malformed_present_config_fails_before_setup_and_analytics_side_effects() {
-    let temp = tempdir();
-    let state = temp.path().join("state");
-    let events_path = temp.path().join("analytics.jsonl");
-    fs::write(
-        temp.path().join("config.toml"),
-        "[analytics]\nenabled = flase\n",
-    )
-    .unwrap();
-
-    ctx(&temp)
-        .arg("setup")
-        .env("XDG_STATE_HOME", &state)
-        .env("LOCALAPPDATA", &state)
-        .env_remove("CTX_ANALYTICS_OFF")
-        .env("CTX_ANALYTICS_ENDPOINT", file_url(&events_path))
-        .assert()
-        .failure()
-        .stderr(
-            predicate::str::contains("analytics.enabled").and(predicate::str::contains("boolean")),
-        );
-
-    assert!(
-        !temp.path().join("work.sqlite").exists(),
-        "setup must not create the store after config load fails"
-    );
-    assert!(
-        !events_path.exists(),
-        "analytics endpoint should not be touched after config load fails"
-    );
-    assert!(
-        !temp.path().join("install.json").exists(),
-        "analytics install identity should not be created after config load fails"
-    );
-    assert!(
-        !expected_device_path(temp.path(), &state).exists(),
-        "analytics device identity should not be created after config load fails"
     );
 }
 
@@ -2014,17 +1886,6 @@ fn public_subcommand_help_is_golden_enough_for_session_retrieval() {
             ],
         ),
         (
-            "upgrade",
-            vec![
-                "Usage: ctx upgrade",
-                "check",
-                "status",
-                "enable",
-                "disable",
-                "Check or apply signed ctx CLI upgrades",
-            ],
-        ),
-        (
             "search",
             vec![
                 "Usage: ctx search",
@@ -2165,17 +2026,25 @@ fn docs_commands_expose_embedded_docs_and_man_pages() {
         .unwrap()
         .iter()
         .any(|topic| topic["id"] == "cli-reference"));
-    for topic_id in ["docs", "mcp", "sql", "upgrade"] {
+    for topic_id in ["docs", "mcp", "sql", "storage"] {
         assert!(list["topics"]
             .as_array()
             .unwrap()
             .iter()
             .any(|topic| topic["id"] == topic_id));
     }
+    assert!(
+        !list["topics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|topic| topic["id"] == "upgrade"),
+        "removed upgrade docs topic still listed"
+    );
 
-    let search = json_output(ctx(&temp).args(["docs", "search", "upgrade", "--json"]));
+    let search = json_output(ctx(&temp).args(["docs", "search", "storage", "--json"]));
     assert_eq!(search["schema_version"], 1);
-    assert_eq!(search["query"], "upgrade");
+    assert_eq!(search["query"], "storage");
     assert!(!search["results"].as_array().unwrap().is_empty());
 
     let sql_search = json_output(ctx(&temp).args(["docs", "search", "sql", "--json"]));
@@ -2183,9 +2052,6 @@ fn docs_commands_expose_embedded_docs_and_man_pages() {
 
     let mcp_search = json_output(ctx(&temp).args(["docs", "search", "mcp", "--json"]));
     assert_eq!(mcp_search["results"][0]["id"], "mcp");
-
-    let upgrade_search = json_output(ctx(&temp).args(["docs", "search", "upgrade", "--json"]));
-    assert_eq!(upgrade_search["results"][0]["id"], "upgrade");
 
     let weak_search = json_output(ctx(&temp).args(["docs", "search", "a", "--json"]));
     assert!(weak_search["results"].as_array().unwrap().is_empty());
@@ -2203,12 +2069,6 @@ fn docs_commands_expose_embedded_docs_and_man_pages() {
     let mcp = json_output(ctx(&temp).args(["docs", "show", "mcp", "--format", "json"]));
     assert!(mcp["body"].as_str().unwrap().contains("ctx mcp serve"));
 
-    let upgrade = json_output(ctx(&temp).args(["docs", "show", "upgrade", "--format", "json"]));
-    assert!(upgrade["body"]
-        .as_str()
-        .unwrap()
-        .contains("ctx upgrade status"));
-
     let missing_topic = failure_stderr(ctx(&temp).args(["docs", "show", "cli"]));
     assert!(missing_topic.contains("unknown ctx docs topic: cli"));
     assert!(missing_topic.contains("nearest topics:"));
@@ -2225,552 +2085,6 @@ fn docs_commands_expose_embedded_docs_and_man_pages() {
     let man = String::from_utf8(man).unwrap();
     assert!(man.contains(".TH ctx"));
     assert!(man.contains("Search local agent history"));
-}
-
-#[cfg(unix)]
-#[derive(Debug)]
-struct FakeRelease {
-    target: PathBuf,
-    metadata: PathBuf,
-    signature: PathBuf,
-    artifact_sha: String,
-}
-
-#[cfg(unix)]
-fn write_fake_ctx_binary(path: &Path, version: &str) -> Vec<u8> {
-    let bytes = format!("#!/bin/sh\nprintf 'ctx {version}\\n'\n").into_bytes();
-    fs::write(path, &bytes).unwrap();
-    make_file_executable(path);
-    bytes
-}
-
-#[cfg(unix)]
-fn write_hanging_ctx_binary(path: &Path) {
-    fs::write(
-        path,
-        "#!/bin/sh\n\
-if [ -n \"${CTX_SHADOW_MARKER:-}\" ]; then\n\
-  touch \"$CTX_SHADOW_MARKER\"\n\
-fi\n\
-sleep 5\n\
-printf 'ctx 0.1.0\\n'\n",
-    )
-    .unwrap();
-    make_file_executable(path);
-}
-
-#[cfg(unix)]
-fn make_file_executable(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let mut permissions = fs::metadata(path).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).unwrap();
-}
-
-#[cfg(unix)]
-fn test_platform_key() -> &'static str {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("linux", "x86_64") => "linux_x64",
-        ("macos", "aarch64") => "macos_arm64",
-        ("macos", "x86_64") => "macos_x64",
-        ("windows", "x86_64") => "windows_x64",
-        ("freebsd", "x86_64") => "freebsd_x64",
-        (os, arch) => panic!("unsupported test platform {os}-{arch}"),
-    }
-}
-
-#[cfg(unix)]
-fn install_marker_path(target: &Path) -> PathBuf {
-    let file_name = target.file_name().unwrap().to_str().unwrap();
-    target.with_file_name(format!("{file_name}.install.json"))
-}
-
-#[cfg(unix)]
-fn fake_release(temp: &TempDir, latest_version: &str) -> FakeRelease {
-    let bin_dir = temp.path().join("bin");
-    let release_dir = temp.path().join("release");
-    fs::create_dir_all(&bin_dir).unwrap();
-    fs::create_dir_all(&release_dir).unwrap();
-
-    let target = bin_dir.join("ctx");
-    let current_bytes = write_fake_ctx_binary(&target, env!("CARGO_PKG_VERSION"));
-    let current_sha = sha256_hex(&current_bytes);
-
-    let marker = json!({
-        "schema_version": 1,
-        "manager": "ctx-hosted-installer",
-        "install_path": target,
-        "platform": test_platform_key().replace('_', "-"),
-        "channel": "stable",
-        "version": env!("CARGO_PKG_VERSION"),
-        "sha256": current_sha,
-        "metadata_url": null,
-        "artifact_url": null,
-    });
-    fs::write(
-        install_marker_path(&target),
-        serde_json::to_vec_pretty(&marker).unwrap(),
-    )
-    .unwrap();
-
-    let artifact = release_dir.join("ctx");
-    let artifact_bytes = write_fake_ctx_binary(&artifact, latest_version);
-    let artifact_sha = sha256_hex(&artifact_bytes);
-    let platform = test_platform_key();
-    let metadata = release_dir.join("ctx-release-metadata.env");
-    let metadata_body = format!(
-        "CTX_RELEASE_SCHEMA_VERSION=1\n\
-CTX_RELEASE_CHANNEL=stable\n\
-CTX_RELEASE_VERSION={latest_version}\n\
-CTX_RELEASE_BASE_URL={}\n\
-CTX_RELEASE_ARTIFACT_{platform}=ctx\n\
-CTX_RELEASE_SHA256_{platform}={artifact_sha}\n\
-CTX_RELEASE_SELF_UPGRADE_ALLOWED=true\n\
-CTX_RELEASE_AUTO_UPGRADE_ALLOWED=true\n",
-        file_url(&release_dir)
-    );
-    fs::write(&metadata, &metadata_body).unwrap();
-    let signature = release_dir.join("ctx-release-metadata.env.sig");
-    fs::write(
-        &signature,
-        format!("{}\n", sign_test_release_metadata(metadata_body.as_bytes())),
-    )
-    .unwrap();
-
-    FakeRelease {
-        target,
-        metadata,
-        signature,
-        artifact_sha,
-    }
-}
-
-#[cfg(unix)]
-fn rewrite_fake_release_metadata(release: &FakeRelease, rewrite: impl FnOnce(String) -> String) {
-    let next = rewrite(fs::read_to_string(&release.metadata).unwrap());
-    fs::write(&release.metadata, &next).unwrap();
-    fs::write(
-        &release.signature,
-        format!("{}\n", sign_test_release_metadata(next.as_bytes())),
-    )
-    .unwrap();
-}
-
-#[cfg(unix)]
-fn fake_release_env<'a>(command: &'a mut Command, release: &FakeRelease) -> &'a mut Command {
-    command
-        .env("CTX_UPGRADE_TARGET", &release.target)
-        .env("CTX_RELEASE_METADATA_URL", file_url(&release.metadata))
-        .env(
-            "CTX_RELEASE_METADATA_SIGNATURE_URL",
-            file_url(&release.signature),
-        )
-        .env(
-            "CTX_RELEASE_METADATA_PUBLIC_KEY_PEM",
-            TEST_RELEASE_PUBLIC_KEY_PEM,
-        )
-}
-
-#[cfg(unix)]
-#[test]
-fn upgrade_status_check_and_apply_support_managed_installs() {
-    let temp = tempdir();
-    let release = fake_release(&temp, "9.9.9");
-
-    let status = json_output(fake_release_env(
-        ctx(&temp).args(["upgrade", "status", "--json"]),
-        &release,
-    ));
-    assert_eq!(status["schema_version"], 1);
-    assert_eq!(status["install"]["managed"], true);
-
-    let check = json_output(fake_release_env(
-        ctx(&temp).args(["upgrade", "check", "--json"]),
-        &release,
-    ));
-    assert_eq!(check["status"], "available");
-    assert_eq!(check["latest_version"], "9.9.9");
-    assert_eq!(check["managed"], true);
-
-    let dry_run = json_output(fake_release_env(
-        ctx(&temp).args(["upgrade", "--dry-run", "--json"]),
-        &release,
-    ));
-    assert_eq!(dry_run["status"], "dry_run");
-    assert_eq!(dry_run["applied"], false);
-
-    let applied = json_output(fake_release_env(
-        ctx(&temp).args(["upgrade", "--json"]),
-        &release,
-    ));
-    assert_eq!(applied["status"], "applied");
-    assert_eq!(applied["applied"], true);
-    assert_eq!(
-        fs::read_to_string(&release.target).unwrap(),
-        "#!/bin/sh\nprintf 'ctx 9.9.9\\n'\n"
-    );
-    let marker: Value =
-        serde_json::from_slice(&fs::read(install_marker_path(&release.target)).unwrap()).unwrap();
-    assert_eq!(marker["version"], "9.9.9");
-    assert_eq!(marker["sha256"], release.artifact_sha);
-}
-
-#[cfg(unix)]
-#[test]
-fn upgrade_status_reports_path_shadowing() {
-    let temp = tempdir();
-    let release = fake_release(&temp, "9.9.9");
-    let shadow_dir = temp.path().join("shadow-bin");
-    fs::create_dir_all(&shadow_dir).unwrap();
-    let shadow_ctx = shadow_dir.join("ctx");
-    write_fake_ctx_binary(&shadow_ctx, "0.9.0");
-    let managed_dir = release.target.parent().unwrap();
-    let path = std::env::join_paths([shadow_dir.as_path(), managed_dir]).unwrap();
-
-    let mut command = ctx(&temp);
-    command
-        .args(["upgrade", "status", "--json"])
-        .env("PATH", path);
-    let status = json_output(fake_release_env(&mut command, &release));
-
-    assert_eq!(status["current_version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(
-        status["path"]["entries"][0]["path"],
-        shadow_ctx.display().to_string()
-    );
-    assert!(status["path"]["entries"][0]["version"].is_null());
-    assert!(status["warnings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|warning| { warning.as_str().unwrap().contains("PATH resolves ctx to") }));
-}
-
-#[cfg(unix)]
-#[test]
-fn upgrade_commands_do_not_execute_hanging_shadow_path_ctx() {
-    for args in [
-        ["upgrade", "status", "--json"].as_slice(),
-        ["upgrade", "check", "--json"].as_slice(),
-        ["upgrade", "--json"].as_slice(),
-    ] {
-        let temp = tempdir();
-        let release = fake_release(&temp, "9.9.9");
-        let shadow_dir = temp.path().join("shadow-bin");
-        fs::create_dir_all(&shadow_dir).unwrap();
-        let shadow_ctx = shadow_dir.join("ctx");
-        write_hanging_ctx_binary(&shadow_ctx);
-        let marker = temp.path().join("shadow-ran");
-        let managed_dir = release.target.parent().unwrap();
-        let path = std::env::join_paths([shadow_dir.as_path(), managed_dir]).unwrap();
-
-        let started = Instant::now();
-        let mut command = ctx(&temp);
-        command
-            .args(args)
-            .env("PATH", &path)
-            .env("CTX_SHADOW_MARKER", &marker);
-        let output = json_output(fake_release_env(&mut command, &release));
-        let elapsed = started.elapsed();
-
-        assert!(
-            elapsed < Duration::from_secs(2),
-            "ctx {args:?} should not wait for shadow PATH binaries; elapsed {elapsed:?}"
-        );
-        assert_eq!(
-            output["path"]["entries"][0]["path"],
-            shadow_ctx.display().to_string()
-        );
-        assert!(
-            output["path"]["entries"][0]["version"].is_null(),
-            "shadow ctx versions should not be probed"
-        );
-        assert!(
-            !marker.exists(),
-            "PATH shadow ctx should not have been executed"
-        );
-    }
-}
-
-#[cfg(unix)]
-#[test]
-fn upgrade_recovers_stale_lock_for_dead_pid() {
-    let temp = tempdir();
-    let release = fake_release(&temp, "9.9.9");
-    let mut child = std::process::Command::new("sh")
-        .arg("-c")
-        .arg("exit 0")
-        .spawn()
-        .unwrap();
-    let stale_pid = child.id();
-    child.wait().unwrap();
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    fs::write(
-        temp.path().join("upgrade.lock"),
-        format!("{stale_pid} {}\n", now.saturating_sub(60)),
-    )
-    .unwrap();
-
-    let dry_run = json_output(fake_release_env(
-        ctx(&temp).args(["upgrade", "--dry-run", "--json"]),
-        &release,
-    ));
-
-    assert_eq!(dry_run["status"], "dry_run");
-    assert!(!temp.path().join("upgrade.lock").exists());
-}
-
-#[cfg(unix)]
-#[test]
-fn upgrade_lock_still_rejects_active_pid() {
-    let temp = tempdir();
-    let release = fake_release(&temp, "9.9.9");
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    fs::write(
-        temp.path().join("upgrade.lock"),
-        format!("{} {now}\n", std::process::id()),
-    )
-    .unwrap();
-
-    let stderr = failure_stderr(fake_release_env(
-        ctx(&temp).args(["upgrade", "--dry-run"]),
-        &release,
-    ));
-
-    assert!(stderr.contains("ctx upgrade lock is held"), "{stderr}");
-    assert!(temp.path().join("upgrade.lock").exists());
-}
-
-#[cfg(unix)]
-#[test]
-fn upgrade_rejects_unmanaged_install_before_network() {
-    let temp = tempdir();
-    let stderr = failure_stderr(
-        ctx(&temp)
-            .args(["upgrade", "--dry-run"])
-            .env(
-                "CTX_RELEASE_METADATA_URL",
-                "file:///definitely/not/a/real/ctx-release-metadata.env",
-            )
-            .env(
-                "CTX_RELEASE_METADATA_SIGNATURE_URL",
-                "file:///definitely/not/a/real/ctx-release-metadata.env.sig",
-            ),
-    );
-    assert!(
-        stderr.contains("ctx is not installed by the hosted installer"),
-        "{stderr}"
-    );
-    assert!(
-        !stderr.contains("download release metadata"),
-        "unmanaged installs should fail before metadata fetch: {stderr}"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn upgrade_verifies_signed_metadata_and_fails_closed() {
-    let tampered = tempdir();
-    let release = fake_release(&tampered, "9.9.9");
-    fs::write(
-        &release.metadata,
-        format!(
-            "{}# tampered after signing\n",
-            fs::read_to_string(&release.metadata).unwrap()
-        ),
-    )
-    .unwrap();
-    let stderr = failure_stderr(fake_release_env(
-        ctx(&tampered).args(["upgrade", "check"]),
-        &release,
-    ));
-    assert!(
-        stderr.contains("metadata signature verification failed"),
-        "{stderr}"
-    );
-
-    let wrong_key = tempdir();
-    let release = fake_release(&wrong_key, "9.9.9");
-    let stderr = failure_stderr(
-        ctx(&wrong_key)
-            .args(["upgrade", "check"])
-            .env("CTX_UPGRADE_TARGET", &release.target)
-            .env("CTX_RELEASE_METADATA_URL", file_url(&release.metadata))
-            .env(
-                "CTX_RELEASE_METADATA_SIGNATURE_URL",
-                file_url(&release.signature),
-            ),
-    );
-    assert!(
-        stderr.contains("metadata signature verification failed"),
-        "{stderr}"
-    );
-
-    let bad_signature = tempdir();
-    let release = fake_release(&bad_signature, "9.9.9");
-    fs::write(&release.signature, "not-base64").unwrap();
-    let stderr = failure_stderr(fake_release_env(
-        ctx(&bad_signature).args(["upgrade", "check"]),
-        &release,
-    ));
-    assert!(
-        stderr.contains("metadata signature is not base64"),
-        "{stderr}"
-    );
-
-    let missing_signature = tempdir();
-    let release = fake_release(&missing_signature, "9.9.9");
-    fs::remove_file(&release.signature).unwrap();
-    let stderr = failure_stderr(fake_release_env(
-        ctx(&missing_signature).args(["upgrade", "check"]),
-        &release,
-    ));
-    assert!(
-        stderr.contains("download release metadata signature"),
-        "{stderr}"
-    );
-
-    let default_signature_path = tempdir();
-    let release = fake_release(&default_signature_path, "9.9.9");
-    let check = json_output(
-        ctx(&default_signature_path)
-            .args(["upgrade", "check", "--json"])
-            .env("CTX_UPGRADE_TARGET", &release.target)
-            .env("CTX_RELEASE_METADATA_URL", file_url(&release.metadata))
-            .env(
-                "CTX_RELEASE_METADATA_PUBLIC_KEY_PEM",
-                TEST_RELEASE_PUBLIC_KEY_PEM,
-            ),
-    );
-    assert_eq!(check["status"], "available");
-}
-
-#[cfg(unix)]
-#[test]
-fn upgrade_rejects_unsafe_metadata_and_bad_artifacts() {
-    let duplicate_key = tempdir();
-    let release = fake_release(&duplicate_key, "9.9.9");
-    rewrite_fake_release_metadata(&release, |metadata| {
-        format!("{metadata}CTX_RELEASE_VERSION=8.8.8\n")
-    });
-    let stderr = failure_stderr(fake_release_env(
-        ctx(&duplicate_key).args(["upgrade", "check"]),
-        &release,
-    ));
-    assert!(
-        stderr.contains("metadata contains duplicate key CTX_RELEASE_VERSION"),
-        "{stderr}"
-    );
-
-    let malformed_bool = tempdir();
-    let release = fake_release(&malformed_bool, "9.9.9");
-    rewrite_fake_release_metadata(&release, |metadata| {
-        metadata.replace(
-            "CTX_RELEASE_SELF_UPGRADE_ALLOWED=true\n",
-            "CTX_RELEASE_SELF_UPGRADE_ALLOWED=definitely\n",
-        )
-    });
-    let stderr = failure_stderr(fake_release_env(
-        ctx(&malformed_bool).args(["upgrade", "check"]),
-        &release,
-    ));
-    assert!(
-        stderr.contains("metadata CTX_RELEASE_SELF_UPGRADE_ALLOWED must be a boolean"),
-        "{stderr}"
-    );
-
-    let missing_policy = tempdir();
-    let release = fake_release(&missing_policy, "9.9.9");
-    rewrite_fake_release_metadata(&release, |metadata| {
-        metadata
-            .replace("CTX_RELEASE_SELF_UPGRADE_ALLOWED=true\n", "")
-            .replace("CTX_RELEASE_AUTO_UPGRADE_ALLOWED=true\n", "")
-    });
-    let stderr = failure_stderr(fake_release_env(
-        ctx(&missing_policy).args(["upgrade", "--dry-run"]),
-        &release,
-    ));
-    assert!(stderr.contains("does not allow self-upgrade"), "{stderr}");
-
-    let unsafe_artifact = tempdir();
-    let release = fake_release(&unsafe_artifact, "9.9.9");
-    rewrite_fake_release_metadata(&release, |metadata| {
-        metadata.replace(
-            &format!("CTX_RELEASE_ARTIFACT_{}=ctx\n", test_platform_key()),
-            &format!("CTX_RELEASE_ARTIFACT_{}=../ctx\n", test_platform_key()),
-        )
-    });
-    let stderr = failure_stderr(fake_release_env(
-        ctx(&unsafe_artifact).args(["upgrade", "check"]),
-        &release,
-    ));
-    assert!(stderr.contains("unsafe artifact name"), "{stderr}");
-
-    let unsafe_base = tempdir();
-    let release = fake_release(&unsafe_base, "9.9.9");
-    rewrite_fake_release_metadata(&release, |metadata| {
-        metadata.replace(
-            "CTX_RELEASE_BASE_URL=file://",
-            "CTX_RELEASE_BASE_URL=http://",
-        )
-    });
-    let stderr = failure_stderr(fake_release_env(
-        ctx(&unsafe_base).args(["upgrade", "check"]),
-        &release,
-    ));
-    assert!(
-        stderr.contains("metadata base URL must be HTTPS"),
-        "{stderr}"
-    );
-
-    let bad_checksum = tempdir();
-    let release = fake_release(&bad_checksum, "9.9.9");
-    rewrite_fake_release_metadata(&release, |metadata| {
-        metadata.replace(
-            &format!(
-                "CTX_RELEASE_SHA256_{}={}\n",
-                test_platform_key(),
-                release.artifact_sha
-            ),
-            &format!(
-                "CTX_RELEASE_SHA256_{}={}\n",
-                test_platform_key(),
-                "f".repeat(64)
-            ),
-        )
-    });
-    let stderr = failure_stderr(fake_release_env(
-        ctx(&bad_checksum).args(["upgrade", "--json"]),
-        &release,
-    ));
-    assert!(stderr.contains("artifact checksum mismatch"), "{stderr}");
-}
-
-#[cfg(unix)]
-#[test]
-fn json_commands_do_not_spawn_background_upgrade() {
-    let temp = tempdir();
-    let release = fake_release(&temp, "9.9.9");
-
-    let status = json_output(fake_release_env(
-        ctx(&temp).args(["status", "--json"]),
-        &release,
-    ));
-    assert_eq!(status["schema_version"], 1);
-    assert_eq!(
-        fs::read_to_string(&release.target).unwrap(),
-        format!("#!/bin/sh\nprintf 'ctx {}\\n'\n", env!("CARGO_PKG_VERSION"))
-    );
-    assert!(
-        !temp.path().join("upgrade-state.json").exists(),
-        "JSON status must not start a background upgrade"
-    );
 }
 
 #[test]
@@ -2824,476 +2138,6 @@ fn provider_session_lookup_requires_explicit_provider_flags_in_help() {
                 );
             }
         }
-    }
-}
-
-#[test]
-fn analytics_sends_coarse_cli_metadata_when_enabled() {
-    let temp = tempdir();
-    let events_path = temp.path().join("analytics.jsonl");
-    let home = temp.path().join("home");
-    let state = temp.path().join("state");
-    let data_root = temp.path().join("data");
-    fs::create_dir_all(&home).unwrap();
-
-    ctx(&temp)
-        .arg("status")
-        .env("CTX_DATA_ROOT", &data_root)
-        .env("HOME", &home)
-        .env("XDG_STATE_HOME", &state)
-        .env("LOCALAPPDATA", &state)
-        .env_remove("CTX_ANALYTICS_OFF")
-        .env("CTX_ANALYTICS_ENDPOINT", file_url(&events_path))
-        .assert()
-        .success();
-
-    let event = read_analytics_events(&events_path).remove(0);
-    assert_eq!(event["broker_runtime"], "cli");
-    assert!(uuid::Uuid::parse_str(event["broker_install_id"].as_str().unwrap()).is_ok());
-    assert!(uuid::Uuid::parse_str(event["broker_device_id"].as_str().unwrap()).is_ok());
-    assert_eq!(event["events"][0]["event_name"], "cli_invocation");
-    assert_eq!(event["events"][0]["origin_runtime"], "cli");
-    assert_eq!(event["events"][0]["surface"], "cli");
-    assert_eq!(
-        event["events"][0]["origin_install_id"],
-        event["broker_install_id"]
-    );
-    assert_eq!(
-        event["events"][0]["origin_device_id"],
-        event["broker_device_id"]
-    );
-    assert_eq!(event["events"][0]["properties"]["action"], "status");
-    assert_eq!(
-        event["events"][0]["properties"]["analytics_client"],
-        "ctx-cli"
-    );
-    assert_eq!(event["events"][0]["properties"]["initialized"], false);
-    assert_eq!(
-        event["events"][0]["properties"]["indexed_items_bucket"],
-        "0"
-    );
-    assert_eq!(
-        event["events"][0]["properties"]["cataloged_sessions_bucket"],
-        "0"
-    );
-    assert_eq!(
-        event["events"][0]["properties"]["indexed_sessions_bucket"],
-        "0"
-    );
-    assert_eq!(
-        event["events"][0]["properties"]["indexed_events_bucket"],
-        "0"
-    );
-    assert_eq!(event["events"][0]["properties"]["db_size_bucket"], "0");
-    assert_analytics_properties_are_allowlisted(analytics_event_properties(&event));
-    for forbidden in [
-        "command",
-        "query",
-        "query_text",
-        "path",
-        "file_path",
-        "repo",
-        "repo_name",
-        "branch",
-        "error",
-        "error_message",
-        "session_id",
-        "item_id",
-    ] {
-        assert!(
-            event["events"][0]["properties"].get(forbidden).is_none(),
-            "analytics leaked forbidden property {forbidden}: {event:#}"
-        );
-    }
-}
-
-#[test]
-fn analytics_device_id_persists_across_data_roots() {
-    let temp = tempdir();
-    let home = temp.path().join("home");
-    let state = temp.path().join("state");
-    let data_root_a = temp.path().join("data-a");
-    let data_root_b = temp.path().join("data-b");
-    let events_path = temp.path().join("analytics.jsonl");
-    fs::create_dir_all(&home).unwrap();
-
-    for data_root in [&data_root_a, &data_root_b] {
-        ctx(&temp)
-            .arg("status")
-            .env("CTX_DATA_ROOT", data_root)
-            .env("HOME", &home)
-            .env("XDG_STATE_HOME", &state)
-            .env("LOCALAPPDATA", &state)
-            .env_remove("CTX_ANALYTICS_OFF")
-            .env("CTX_ANALYTICS_ENDPOINT", file_url(&events_path))
-            .assert()
-            .success();
-    }
-
-    let events = read_analytics_events(&events_path);
-    assert_eq!(events.len(), 2);
-    let install_a = events[0]["broker_install_id"].as_str().unwrap();
-    let install_b = events[1]["broker_install_id"].as_str().unwrap();
-    let device_a = events[0]["broker_device_id"].as_str().unwrap();
-    let device_b = events[1]["broker_device_id"].as_str().unwrap();
-    assert_ne!(install_a, install_b);
-    assert_eq!(device_a, device_b);
-    assert!(uuid::Uuid::parse_str(install_a).is_ok());
-    assert!(uuid::Uuid::parse_str(install_b).is_ok());
-    assert!(uuid::Uuid::parse_str(device_a).is_ok());
-
-    assert!(data_root_a.join("install.json").exists());
-    assert!(data_root_b.join("install.json").exists());
-    let device_path = expected_device_path(&home, &state);
-    assert!(device_path.exists());
-    assert!(!device_path.starts_with(&data_root_a));
-    assert!(!device_path.starts_with(&data_root_b));
-    let device_json: Value = serde_json::from_slice(&fs::read(&device_path).unwrap()).unwrap();
-    assert_eq!(device_json["schema_version"], 1);
-    assert_eq!(device_json["device_id"], device_a);
-    let device_body = serde_json::to_string(&device_json).unwrap();
-    assert!(!device_body.contains(home.to_str().unwrap()));
-    assert!(!device_body.contains(data_root_a.to_str().unwrap()));
-    assert!(!device_body.contains(data_root_b.to_str().unwrap()));
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        let mode = fs::metadata(device_path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
-    }
-}
-
-#[test]
-fn analytics_payloads_omit_sensitive_command_data() {
-    let temp = tempdir();
-    let home = temp.path().join("alice-secret-home");
-    let state = temp.path().join("state");
-    let data_root = temp.path().join("ctx-data");
-    let events_path = temp.path().join("analytics.jsonl");
-    fs::create_dir_all(&home).unwrap();
-    let private_query =
-        "prompt text /home/alice/private/acme-secret repo@example.com host.internal 192.0.2.44";
-
-    ctx(&temp)
-        .args([
-            "search",
-            private_query,
-            "--workspace",
-            "acme-secret-repo",
-            "--refresh",
-            "off",
-        ])
-        .env("CTX_DATA_ROOT", &data_root)
-        .env("HOME", &home)
-        .env("XDG_STATE_HOME", &state)
-        .env("LOCALAPPDATA", &state)
-        .env_remove("CTX_ANALYTICS_OFF")
-        .env("CTX_ANALYTICS_ENDPOINT", file_url(&events_path))
-        .assert()
-        .success();
-
-    ctx(&temp)
-        .args(["docs", "search", "private prompt text", "--limit", "1"])
-        .env("CTX_DATA_ROOT", &data_root)
-        .env("HOME", &home)
-        .env("XDG_STATE_HOME", &state)
-        .env("LOCALAPPDATA", &state)
-        .env_remove("CTX_ANALYTICS_OFF")
-        .env("CTX_ANALYTICS_ENDPOINT", file_url(&events_path))
-        .assert()
-        .success();
-
-    ctx(&temp)
-        .args(["upgrade", "status"])
-        .env("CTX_DATA_ROOT", &data_root)
-        .env("HOME", &home)
-        .env("XDG_STATE_HOME", &state)
-        .env("LOCALAPPDATA", &state)
-        .env_remove("CTX_ANALYTICS_OFF")
-        .env("CTX_ANALYTICS_ENDPOINT", file_url(&events_path))
-        .assert()
-        .success();
-
-    ctx(&temp)
-        .args(["show", "session", "not-a-uuid-secret"])
-        .env("CTX_DATA_ROOT", &data_root)
-        .env("HOME", &home)
-        .env("XDG_STATE_HOME", &state)
-        .env("LOCALAPPDATA", &state)
-        .env_remove("CTX_ANALYTICS_OFF")
-        .env("CTX_ANALYTICS_ENDPOINT", file_url(&events_path))
-        .assert()
-        .failure();
-
-    let events = read_analytics_events(&events_path);
-    assert_eq!(events.len(), 4);
-    let actions = events
-        .iter()
-        .map(|event| {
-            event["events"][0]["properties"]["action"]
-                .as_str()
-                .unwrap()
-                .to_owned()
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(actions, ["search", "docs", "upgrade", "show"]);
-
-    let search_properties = analytics_event_properties(&events[0]);
-    assert_eq!(search_properties["query_length_bucket"], "21-100");
-    assert_eq!(search_properties["query_term_count_bucket"], "6-20");
-    assert_eq!(search_properties["search_refresh_mode"], "off");
-    assert_eq!(search_properties["search_refresh_status"], "skipped");
-    assert_eq!(search_properties["zero_result"], true);
-    assert!(search_properties.get("query_duration_bucket").is_some());
-    assert!(search_properties.get("render_duration_bucket").is_some());
-    assert_eq!(events[3]["events"][0]["success"], false);
-    assert_eq!(
-        events[3]["events"][0]["properties"]["failure_kind"],
-        "command_error"
-    );
-
-    for event in &events {
-        assert_analytics_properties_are_allowlisted(analytics_event_properties(event));
-        assert_no_json_string_contains(
-            event,
-            &[
-                private_query,
-                "private prompt text",
-                "not-a-uuid-secret",
-                "acme-secret-repo",
-                "/home/alice/private",
-                "repo@example.com",
-                "host.internal",
-                "192.0.2.44",
-                home.to_str().unwrap(),
-            ],
-        );
-        let properties = analytics_event_properties(event);
-        for forbidden_key in [
-            "install_id",
-            "origin_install_id",
-            "broker_install_id",
-            "device_id",
-            "origin_device_id",
-            "broker_device_id",
-            "hostname",
-            "username",
-            "repo_name",
-            "file_path",
-            "prompt",
-            "transcript",
-        ] {
-            assert!(
-                properties.get(forbidden_key).is_none(),
-                "analytics leaked forbidden property {forbidden_key}: {event:#}"
-            );
-        }
-    }
-}
-
-#[test]
-fn analytics_config_opt_out_suppresses_delivery() {
-    let temp = tempdir();
-    let state = temp.path().join("state");
-    fs::write(
-        temp.path().join("config.toml"),
-        "[analytics]\nenabled = false\n",
-    )
-    .unwrap();
-    let events_path = temp.path().join("analytics.jsonl");
-
-    ctx(&temp)
-        .arg("status")
-        .env("XDG_STATE_HOME", &state)
-        .env("LOCALAPPDATA", &state)
-        .env_remove("CTX_ANALYTICS_OFF")
-        .env("CTX_ANALYTICS_ENDPOINT", file_url(&events_path))
-        .assert()
-        .success();
-
-    assert!(
-        !events_path.exists(),
-        "analytics endpoint should not be touched"
-    );
-    assert!(
-        !temp.path().join("install.json").exists(),
-        "disabled analytics should not create an install identity"
-    );
-    assert!(
-        !expected_device_path(temp.path(), &state).exists(),
-        "disabled analytics should not create a device identity"
-    );
-}
-
-#[test]
-fn analytics_env_opt_out_wins_over_enable_flag() {
-    let temp = tempdir();
-    let state = temp.path().join("state");
-    let events_path = temp.path().join("analytics.jsonl");
-
-    ctx(&temp)
-        .arg("status")
-        .env("XDG_STATE_HOME", &state)
-        .env("LOCALAPPDATA", &state)
-        .env("CTX_ANALYTICS_OFF", "1")
-        .env("CTX_ANALYTICS_ENABLED", "true")
-        .env("CTX_ANALYTICS_ENDPOINT", file_url(&events_path))
-        .assert()
-        .success();
-
-    assert!(
-        !events_path.exists(),
-        "CTX_ANALYTICS_OFF should be a hard process opt-out"
-    );
-    assert!(
-        !expected_device_path(temp.path(), &state).exists(),
-        "hard opt-out should not create a device identity"
-    );
-}
-
-#[test]
-fn analytics_refuses_device_identity_under_data_root() {
-    let temp = tempdir();
-    let data_root = temp.path().join("ctx-data");
-    let state = data_root.join("state");
-    let events_path = temp.path().join("analytics.jsonl");
-
-    ctx(&temp)
-        .arg("status")
-        .env("CTX_DATA_ROOT", &data_root)
-        .env("XDG_STATE_HOME", &state)
-        .env("LOCALAPPDATA", &state)
-        .env_remove("CTX_ANALYTICS_OFF")
-        .env("CTX_ANALYTICS_ENDPOINT", file_url(&events_path))
-        .assert()
-        .success();
-
-    assert!(
-        !events_path.exists(),
-        "device identity under data root should fail closed before delivery"
-    );
-    assert!(
-        !state.join("ctx").join("device.json").exists(),
-        "device identity must not be created under CTX_DATA_ROOT"
-    );
-}
-
-fn expected_device_path(_home: &Path, state: &Path) -> PathBuf {
-    #[cfg(target_os = "windows")]
-    {
-        state.join("ctx").join("device.json")
-    }
-    #[cfg(target_os = "macos")]
-    {
-        _home
-            .join("Library")
-            .join("Application Support")
-            .join("ctx")
-            .join("device.json")
-    }
-    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
-    {
-        state.join("ctx").join("device.json")
-    }
-}
-
-fn assert_no_json_string_contains(value: &Value, forbidden: &[&str]) {
-    match value {
-        Value::String(text) => {
-            for needle in forbidden {
-                assert!(
-                    !text.contains(needle),
-                    "analytics leaked forbidden string {needle:?} in {text:?}"
-                );
-            }
-        }
-        Value::Array(values) => {
-            for value in values {
-                assert_no_json_string_contains(value, forbidden);
-            }
-        }
-        Value::Object(values) => {
-            for value in values.values() {
-                assert_no_json_string_contains(value, forbidden);
-            }
-        }
-        Value::Null | Value::Bool(_) | Value::Number(_) => {}
-    }
-}
-
-fn assert_analytics_properties_are_allowlisted(properties: &serde_json::Map<String, Value>) {
-    let allowed = [
-        "action",
-        "all_sources",
-        "analytics_client",
-        "available_sources_bucket",
-        "background",
-        "catalog_only",
-        "catalog_source_bytes_bucket",
-        "cataloged_sessions_bucket",
-        "citation_count_bucket",
-        "db_size_bucket",
-        "dry_run",
-        "edges_imported_bucket",
-        "event_results",
-        "failed_bucket",
-        "failed_sources_bucket",
-        "failure_kind",
-        "finding_count_bucket",
-        "has_event_type_filter",
-        "has_file_filter",
-        "has_provider_filter",
-        "has_query",
-        "has_session_filter",
-        "has_since_filter",
-        "has_workspace_filter",
-        "include_current_session",
-        "include_subagents",
-        "indexed_events_bucket",
-        "indexed_items_bucket",
-        "indexed_sessions_bucket",
-        "indexed_sources_bucket",
-        "initialized",
-        "json_output",
-        "limit_bucket",
-        "native_sources_bucket",
-        "output_format",
-        "pending_sessions_bucket",
-        "primary_only",
-        "progress_mode",
-        "provider_filter",
-        "provider_lookup",
-        "providers_detected_bucket",
-        "query_duration_bucket",
-        "query_length_bucket",
-        "query_term_count_bucket",
-        "refresh_duration_bucket",
-        "render_duration_bucket",
-        "result_count_bucket",
-        "resume",
-        "search_refresh_mode",
-        "search_refresh_source_count_bucket",
-        "search_refresh_status",
-        "sessions_imported_bucket",
-        "skipped_bucket",
-        "source_files_bucket",
-        "source_mode",
-        "target_kind",
-        "transcript_mode",
-        "window_bucket",
-        "writes_out_file",
-        "zero_result",
-    ]
-    .into_iter()
-    .collect::<BTreeSet<_>>();
-
-    for key in properties.keys() {
-        assert!(
-            allowed.contains(key.as_str()),
-            "unexpected analytics property {key}: {properties:#?}"
-        );
     }
 }
 

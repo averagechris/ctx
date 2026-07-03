@@ -9,7 +9,7 @@ ctx docs
 ctx docs list
 ctx docs list --json
 ctx docs search "file path"
-ctx docs search "upgrade" --limit 5 --json
+ctx docs search "storage" --limit 5 --json
 ctx docs show cli-reference
 ctx docs show search --format text
 ctx docs show json-contracts --format json
@@ -34,5 +34,4 @@ Useful starting points:
 - `ctx docs show search` for search filters and output behavior;
 - `ctx docs show sql` for stable read-only SQL views;
 - `ctx docs show mcp` for read-only MCP tools;
-- `ctx docs show upgrade` for managed upgrade and auto-upgrade behavior;
 - `ctx docs show json-contracts` for structured output contracts.

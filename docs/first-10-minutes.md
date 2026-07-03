@@ -106,17 +106,16 @@ Use citations from `ctx search` or `ctx show` when the retrieved material
 affects an answer or implementation. Add `--json` only when a script or `jq`
 needs exact fields.
 
-## 6. Local Help And Upgrade Status
+## 6. Local Help
 
 ```bash
-ctx docs search "upgrade"
+ctx docs search "storage"
 ctx docs show search
-ctx upgrade status
 ```
 
-`ctx docs` is embedded in the binary for humans and agents. `ctx upgrade status`
-shows whether the current binary is managed by the official installer, eligible
-for signed self-upgrades, and shadowed by another `ctx` binary on `PATH`.
+`ctx docs` is embedded in the binary for humans and agents. This fork makes no
+network calls; there is no telemetry and no self-update. Update via Nix /
+SourceHut release tags.
 
 ## Failure Paths
 
@@ -129,6 +128,3 @@ for signed self-upgrades, and shadowed by another `ctx` binary on `PATH`.
   widen the query or remove filters.
 - Citation source missing: ctx can still return indexed text, but the raw
   provider file is unavailable at the stored path.
-- Upgrade says unmanaged install: reinstall with the official installer if you
-  want signed self-upgrades, or keep managing the binary with your package
-  manager/source checkout.

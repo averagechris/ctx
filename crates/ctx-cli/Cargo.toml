@@ -17,15 +17,12 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-base64.workspace = true
 chrono.workspace = true
 clap.workspace = true
 clap_mangen.workspace = true
-ring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-ureq = { version = "2.10", default-features = true }
 uuid.workspace = true
 ctx-history-capture = { path = "../ctx-history-capture" }
 ctx-history-core = { path = "../ctx-history-core" }

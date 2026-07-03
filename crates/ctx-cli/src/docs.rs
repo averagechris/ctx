@@ -65,17 +65,6 @@ pub struct DocsManArgs {
     pub print: Option<String>,
 }
 
-impl DocsArgs {
-    pub fn json_output(&self) -> bool {
-        match &self.command {
-            Some(DocsCommand::List(args)) => args.json,
-            Some(DocsCommand::Search(args)) => args.json,
-            Some(DocsCommand::Show(args)) => args.json || args.format == DocsFormat::Json,
-            Some(DocsCommand::Man(_)) | None => false,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 struct DocTopic {
     id: &'static str,
@@ -152,15 +141,6 @@ const TOPICS: &[DocTopic] = &[
         body: include_str!("../../../docs/mcp.md"),
     },
     DocTopic {
-        id: "upgrade",
-        title: "Upgrade",
-        audience: "human-agent",
-        summary: "Managed upgrades, background auto-upgrade behavior, and local state.",
-        tags: &["upgrade", "auto-upgrade", "install"],
-        source_path: "docs/upgrade.md",
-        body: include_str!("../../../docs/upgrade.md"),
-    },
-    DocTopic {
         id: "agent-usage",
         title: "Agent Usage",
         audience: "agent",
@@ -200,8 +180,8 @@ const TOPICS: &[DocTopic] = &[
         id: "storage",
         title: "Storage And Privacy",
         audience: "human-agent",
-        summary: "Local storage layout, command read/write behavior, privacy, and upgrades.",
-        tags: &["storage", "privacy", "upgrade"],
+        summary: "Local storage layout, command read/write behavior, and privacy.",
+        tags: &["storage", "privacy"],
         source_path: "docs/storage.md",
         body: include_str!("../../../docs/storage.md"),
     },

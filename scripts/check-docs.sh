@@ -53,13 +53,6 @@ public_docs=(
   plugins/ctx-agent-history-search/commands/ctx-history.md
 )
 
-analytics_scope=()
-for path in "${public_docs[@]}"; do
-  if [[ "${path}" != "docs/storage.md" ]]; then
-    analytics_scope+=("${path}")
-  fi
-done
-
 scan_docs() {
   local pattern="$1"
   shift
@@ -81,11 +74,6 @@ fi
 
 if scan_docs "${private_path_pattern}" "${public_docs[@]}"; then
   printf 'public docs contain private host/workspace paths\n' >&2
-  exit 1
-fi
-
-if scan_docs 'analytics|telemetry' "${analytics_scope[@]}"; then
-  printf 'public analytics copy must stay limited to docs/storage.md\n' >&2
   exit 1
 fi
 
@@ -112,6 +100,12 @@ if ! grep -F -q 'ctx-agent-history-search' plugins/ctx-agent-history-search/comm
 fi
 
 if scan_docs 'ctx search "[^"]*" --json[[:space:]]*$' docs/agent-usage.md docs/getting-started.md docs/first-10-minutes.md skills/ctx-agent-history-search/SKILL.md plugins/ctx-agent-history-search/skills/ctx-agent-history-search/SKILL.md plugins/ctx-agent-history-search/commands/ctx-history.md; then
+  printf 'agent-facing docs should not recommend ctx search --json for normal reading\n' >&2
+  exit 1
+fi
+
+printf 'public docs ok\n'
+/ctx-history.md; then
   printf 'agent-facing docs should not recommend ctx search --json for normal reading\n' >&2
   exit 1
 fi

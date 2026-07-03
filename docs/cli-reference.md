@@ -41,9 +41,8 @@ ctx doctor --json
 Setup and health checks do not change shell startup files, install repository
 integrations, write into source repositories, call model APIs, or require API
 keys. Core storage checks use the configured data root, and JSON stdout remains
-structured. Installer-managed binaries can run a signed background upgrade
-check after successful non-JSON commands; that check is separate from provider
-history indexing.
+structured. This fork makes no network calls; there is no telemetry and no
+self-update. Update via Nix / SourceHut release tags.
 
 ## Sources
 
@@ -290,8 +289,7 @@ ctx sql "SELECT ctx_session_id FROM ctx_sessions LIMIT 5" --format raw
 
 `sql` runs one read-only SQL statement against the existing local ctx SQLite
 index. It does not create or migrate the store, refresh provider history, import
-sources, run background upgrade checks, or write provider files or source
-repositories. If the store is missing or uses an old schema, run `ctx setup`,
+sources, or write provider files or source repositories. If the store is missing or uses an old schema, run `ctx setup`,
 `ctx import`, or `ctx status` first.
 
 Prefer stable read-only `ctx_*` views for scripts:
@@ -327,7 +325,7 @@ can fail before result truncation. `--timeout` accepts values such as `250ms`,
 ctx docs
 ctx docs list
 ctx docs list --json
-ctx docs search "upgrade"
+ctx docs search "storage"
 ctx docs search "file path" --limit 5 --json
 ctx docs show cli-reference
 ctx docs show search --format text
@@ -370,44 +368,6 @@ tool when the active session tree itself is the target.
 The MCP server is optional. The CLI remains the primary interface, and MCP is
 intended for agents or hosts that prefer tool discovery over shell commands.
 
-## Upgrade
-
-```bash
-ctx upgrade status
-ctx upgrade status --json
-ctx upgrade check
-ctx upgrade check --json
-ctx upgrade --dry-run
-ctx upgrade
-ctx upgrade disable
-ctx upgrade enable
-```
-
-`upgrade` checks and applies signed ctx CLI releases for binaries installed by
-the official hosted installer. The installer writes a sidecar marker next to the
-binary, such as `~/.local/bin/ctx.install.json`, recording the managed install
-path, platform, version, channel, binary SHA-256, metadata URL, and artifact
-URL. Source builds, `cargo install`, package-manager installs, copied binaries,
-and mismatched sidecars are treated as unmanaged and will not self-upgrade.
-`ctx upgrade status --json` also reports the current executable and every `ctx`
-binary found on `PATH`, with warnings when an older binary shadows the managed
-install or multiple `ctx` binaries are present.
-
-Official installer-managed installs default to background auto-upgrade after
-successful normal commands when signed release metadata explicitly allows
-auto-upgrade. Background checks never run for `--json` commands, MCP, `ctx
-docs`, `ctx upgrade`, CI, or unmanaged installs. They write state and logs under
-the ctx data root and do not write to stdout or stderr. Use `CTX_UPGRADE_OFF=1`
-or `CTX_DISABLE_AUTO_UPGRADE=1` for process-level opt-out, or `ctx upgrade
-disable` to write `upgrade.auto = "off"` in `config.toml`.
-
-Manual `ctx upgrade` can print progress and errors. It verifies signed release
-metadata, explicit self-upgrade policy, artifact SHA-256, the current managed
-install marker, and the staged binary's `ctx --version` output before replacing
-the installed binary. On Windows, replacement may be scheduled by a helper that
-finishes after the running `ctx.exe` exits; JSON reports `status: "scheduled"`
-and `applied: false` until replacement completes.
-
 ## Progress Output
 
 `setup` and `import` accept `--progress auto|plain|json|none`. `auto` writes
@@ -442,9 +402,6 @@ ctx sql "SELECT COUNT(*) FROM ctx_sessions" --json
 ctx docs list --json
 ctx docs search <query> --json
 ctx docs show <topic> --format json
-ctx upgrade --json
-ctx upgrade check --json
-ctx upgrade status --json
 ctx doctor --json
 ```
 

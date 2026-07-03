@@ -27,7 +27,6 @@ required_paths=(
   docs/provider-adapter-api.md
   docs/redaction-corpus.md
   docs/agent-skill-install.md
-  docs/sdks.md
   skills/ctx-agent-history-search/SKILL.md
   plugins/ctx-agent-history-search/skills/ctx-agent-history-search/SKILL.md
   plugins/ctx-agent-history-search/commands/ctx-history.md
@@ -100,12 +99,6 @@ if ! grep -F -q 'ctx-agent-history-search' plugins/ctx-agent-history-search/comm
 fi
 
 if scan_docs 'ctx search "[^"]*" --json[[:space:]]*$' docs/agent-usage.md docs/getting-started.md docs/first-10-minutes.md skills/ctx-agent-history-search/SKILL.md plugins/ctx-agent-history-search/skills/ctx-agent-history-search/SKILL.md plugins/ctx-agent-history-search/commands/ctx-history.md; then
-  printf 'agent-facing docs should not recommend ctx search --json for normal reading\n' >&2
-  exit 1
-fi
-
-printf 'public docs ok\n'
-/ctx-history.md; then
   printf 'agent-facing docs should not recommend ctx search --json for normal reading\n' >&2
   exit 1
 fi

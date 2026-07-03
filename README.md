@@ -13,8 +13,11 @@ ctx indexes those logs into SQLite on your machine, then gives current and futur
 
 ## Install and set up ctx
 
+Install from source (a Nix flake is coming in a later phase of the fork plan):
+
 ```bash
-curl -fsSL https://ctx.rs/install | sh
+cargo build --release
+# binary at target/release/ctx
 ```
 
 Optional but recommended for agent sessions:
@@ -80,8 +83,6 @@ ctx docs man --print ctx
 
 This fork makes no network calls; there is no telemetry and no self-update. Update via Nix / SourceHut release tags.
 
-For the full pipeline, see [How ctx works](https://ctx.rs/concepts/how-it-works). For a quick first run, see [Quickstart](https://ctx.rs/first-search).
-
 ## Supported agent histories
 
 Support means ctx can discover or read that harness's persisted local history and import it into the local search index. Use `ctx sources --json` on your machine to see which sources are currently `importable`.
@@ -103,19 +104,15 @@ Agent memory tools usually save compact facts, summaries, vectors, or graph node
 
 Graphify-style tools answer a different question. They map the current repository: files, symbols, imports, folders, and relationships. ctx searches the prior agent sessions that explain what happened while people and agents changed that repository.
 
-ctx keeps retrieval tied to sessions and events, so another agent can inspect the source before using it. Read more about [agent memory](https://ctx.rs/comparisons/agent-memory), [Graphify-style codebase graphs](https://ctx.rs/comparisons/codebase-graphs), and [grep or log search](https://ctx.rs/comparisons/grep-log-search).
+ctx keeps retrieval tied to sessions and events, so another agent can inspect the source before using it.
 
 ## Explore the docs
 
 | Page | What it covers |
 | --- | --- |
-| [Install](https://ctx.rs/getting-started/install) | Install ctx, initialize local storage, and index discovered local history. |
-| [Quickstart](https://ctx.rs/first-search) | Search local history, inspect an event, open the session, and use JSON output. |
-| [Install the ctx skill](https://ctx.rs/skill) | Install the agent-history search skill with the open skills installer. |
+| [Getting started](docs/getting-started.md) | Install ctx, initialize local storage, and index discovered local history. |
+| [First 10 minutes](docs/first-10-minutes.md) | Search local history, inspect an event, open the session, and use JSON output. |
 | [Agent plugin installs](docs/agent-skill-install.md) | Install the ctx skill through Codex, Claude Code, Cursor, or a raw skill folder. |
-| [SDKs](docs/sdks.md) | Use ctx agent history search from TypeScript, Python, Rust, Go, JVM, Swift, or .NET code. |
 | [Custom history plugins](docs/history-source-plugins.md) | Build an advanced local adapter for agent formats ctx does not support natively. |
-| [Cursor](https://ctx.rs/agents/cursor) | Import Cursor agent transcripts and ask Cursor to cite retrieved local history before editing. |
-| [How it works](https://ctx.rs/concepts/how-it-works) | Understand discovery, import, SQLite storage, search refresh, and cited retrieval. |
-| [Supported agents](https://ctx.rs/concepts/supported-agents) | See which agent histories ctx can discover, import, and search today. |
-| [CLI reference](https://ctx.rs/reference/cli) | Review setup, status, sources, import, show, locate, search, SQL, MCP, and doctor. |
+| [Providers](docs/providers.md) | See which agent histories ctx can discover, import, and search today. |
+| [CLI reference](docs/cli-reference.md) | Review setup, status, sources, import, show, locate, search, SQL, MCP, and doctor. |

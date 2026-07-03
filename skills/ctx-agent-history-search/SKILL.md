@@ -18,12 +18,9 @@ Use this skill in two modes:
 
 ## Prerequisites
 
-- Require the `ctx` CLI to be installed and set up. If it is missing and
-  installing tools is appropriate for the task, install it with:
-
-  ```bash
-  curl -fsSL https://ctx.rs/install | sh
-  ```
+- Require the `ctx` CLI to be installed and set up. If it is missing, ask the
+  user to install it (for example via the Nix flake or `cargo build --release`
+  from the ctx repository).
 
 - First setup can take time while ctx indexes past sessions. If needed, keep it
   running in the background or in tmux, or wait for it to finish.

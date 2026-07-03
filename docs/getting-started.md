@@ -5,19 +5,15 @@ it repeats work.
 
 ## 1. Install The CLI
 
+Build from source (a Nix flake is planned for this fork):
+
 ```bash
-curl -fsSL https://ctx.rs/install | sh
+cargo build --release
+# or
+cargo install --path crates/ctx-cli
 ```
 
-The Unix installer requires `curl` and OpenSSL to verify signed release
-metadata. On Windows, use `irm https://ctx.rs/install.ps1 | iex`.
-
-The install script installs `ctx` and runs `ctx setup` so discovered local
-history is indexed before it exits. Use `sh -s -- --no-setup` on Unix, or set
-`CTX_INSTALL_NO_SETUP=1` on Windows, for install-only CI or packaging flows.
-
-When working from source, use `cargo build -p ctx` or
-`cargo install --path crates/ctx-cli`.
+After installing, run `ctx setup` so discovered local history is indexed.
 
 ## 2. Set Up And Index
 

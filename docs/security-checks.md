@@ -48,29 +48,21 @@ Validate the provider matrix JSON:
 jq empty docs/provider-support-matrix.json
 ```
 
-When Bazel owns the docs gate, run:
+## Transcript Preservation Checks
 
-```bash
-bazel test //:docs_check --config=ci
-```
-
-## Bazel Security Gates
-
-Run the public local transcript oracle through Bazel:
-
-```bash
-bazel test //:local_transcript_oracle --config=ci
-```
-
-`//:local_transcript_oracle` imports a synthetic provider history with fake
+The workspace test suite imports synthetic provider histories with fake
 secret-shaped values, then checks `search`, `show`, and SQLite search
-projections preserve local transcript text and do not claim to be share-safe.
+projections preserve local transcript text and do not claim to be share-safe:
+
+```bash
+cargo test --workspace
+```
 
 ## Mode Placement
 
-Security-sensitive product changes should run at least `presubmit`; changes to
-setup/import/search behavior should also run `smoke` as described in
-[`docs/testing-taxonomy.md`](testing-taxonomy.md).
+Security-sensitive product changes should run the full check set described in
+[`docs/testing-taxonomy.md`](testing-taxonomy.md) (fmt, clippy, workspace
+tests, and the docs check).
 
 The default retrieval boundary remains local provider-history search. Security
 docs and tests should continue to reject claims that setup, import, search, or
@@ -90,4 +82,4 @@ repository mutation, or API keys.
 - Security docs do not promise default local sanitization. Share-safe or
   shared-service redaction requires an explicit future mode.
 - Public docs do not make strict no-network claims except when describing
-  local-only security mode.
+  local-only security mode or this fork's no-telemetry, no-self-update binary.

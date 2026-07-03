@@ -58,7 +58,7 @@ executing provider CLIs, reading real user history, requiring API keys, or
 making network calls:
 
 ```bash
-bazel test //:provider_fixture_e2e --config=ci
+cargo test -p ctx --test cli
 ```
 
 ## Required Evidence For Promotion

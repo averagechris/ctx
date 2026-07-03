@@ -9,14 +9,12 @@ search result.
 ctx status
 ```
 
-If ctx is not installed:
+If ctx is not installed, build it from source (a Nix flake is planned for this
+fork):
 
 ```bash
-curl -fsSL https://ctx.rs/install | sh
+cargo install --path crates/ctx-cli
 ```
-
-The Unix installer requires `curl` and OpenSSL to verify signed release
-metadata. On Windows, use `irm https://ctx.rs/install.ps1 | iex`.
 
 ## 2. Set Up And Index
 

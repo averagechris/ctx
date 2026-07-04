@@ -396,6 +396,118 @@
               <h3 class="previous-heading">Previous releases</h3>
               {previous_downloads}""" if previous_downloads else ""
 
+            STYLE = """\
+              /* Rosé Pine Dawn */
+              :root, :root[data-theme="dawn"] {
+                --base: #faf4ed;
+                --surface: #fffaf3;
+                --overlay: #f2e9e1;
+                --hl-med: #dfdad9;
+                --muted: #9893a5;
+                --subtle: #797593;
+                --text: #575279;
+                --love: #b4637a;
+                --rose: #d7827e;
+                --pine: #286983;
+                --foam: #56949f;
+              }
+              /* Rosé Pine Moon */
+              :root[data-theme="moon"] {
+                --base: #232136;
+                --surface: #2a273f;
+                --overlay: #393552;
+                --hl-med: #44415a;
+                --muted: #6e6a86;
+                --subtle: #908caa;
+                --text: #e0def4;
+                --love: #eb6f92;
+                --rose: #ea9a97;
+                --pine: #3e8fb0;
+                --foam: #9ccfd8;
+              }
+              * { box-sizing: border-box; }
+              body {
+                background: var(--base);
+                color: var(--text);
+                font-family: Charter, Georgia, "Iowan Old Style", serif;
+                line-height: 1.65;
+                max-width: 920px;
+                margin: 0 auto;
+                padding: 3rem 1.25rem 4rem;
+                transition: background 0.25s ease, color 0.25s ease;
+              }
+              a { color: var(--pine); text-decoration-color: color-mix(in srgb, var(--pine) 40%, transparent); }
+              a:hover { color: var(--rose); }
+              .masthead { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; }
+              h1 { font-size: 2rem; margin: 0; font-weight: 700; letter-spacing: -0.01em; }
+              .home-link { color: var(--subtle); font-style: italic; margin: 0.25rem 0 0; font-size: 0.95rem; }
+              .theme-toggle {
+                background: var(--surface); border: 1px solid var(--hl-med); color: var(--subtle);
+                border-radius: 999px; padding: 0.3rem 0.8rem; cursor: pointer;
+                font-family: inherit; font-size: 0.85rem; font-style: italic;
+                transition: border-color 0.15s ease;
+                flex-shrink: 0; margin-top: 0.5rem;
+              }
+              .theme-toggle:hover { border-color: var(--rose); color: var(--text); }
+              h2 { font-size: 1.5rem; margin: 2.25rem 0 1rem; font-weight: 700; }
+              h3 { font-size: 1.15rem; }
+              code, pre {
+                font-family: ui-monospace, Menlo, monospace;
+                background: var(--overlay); border-radius: 4px; padding: 0.15rem 0.3rem;
+              }
+              pre { padding: 1rem; overflow-x: auto; }
+              pre code { background: none; padding: 0; }
+              .release {
+                background: var(--surface); border: 1px solid var(--hl-med); border-radius: 4px;
+                padding: 1.25rem 1.4rem; margin: 1rem 0 1.5rem;
+                box-shadow: 2px 2px 0 var(--hl-med);
+              }
+              .release.latest { border-color: var(--foam); }
+              .release-heading { display: flex; justify-content: space-between; gap: 1rem; align-items: flex-start; margin-bottom: 1rem; }
+              .release-heading h3 { margin: 0.1rem 0 0; font-family: ui-monospace, Menlo, monospace; }
+              .eyebrow { color: var(--muted); font-size: 0.8rem; font-weight: 700; letter-spacing: 0.06em; margin: 0; text-transform: uppercase; }
+              .badge, .build-count {
+                border-radius: 999px; display: inline-block; font-size: 0.78rem; font-weight: 700;
+                padding: 0.15rem 0.55rem; white-space: nowrap;
+                font-family: ui-monospace, Menlo, monospace;
+              }
+              .badge { background: var(--foam); color: var(--base); margin-left: 0.35rem; vertical-align: middle; }
+              .build-count { background: var(--overlay); color: var(--subtle); }
+              .build-grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+              .build { background: var(--base); border: 1px solid var(--hl-med); border-radius: 4px; padding: 1rem; }
+              .build h4 { margin: 0 0 0.5rem; font-size: 0.95rem; }
+              .filename { margin: 0 0 0.75rem; overflow-wrap: anywhere; font-size: 0.9rem; }
+              .download-links { display: flex; flex-wrap: wrap; gap: 0.75rem; margin: 0.75rem 0; font-family: ui-monospace, Menlo, monospace; font-size: 0.9rem; }
+              .primary-link { font-weight: 700; }
+              details summary { cursor: pointer; color: var(--subtle); }
+              details pre { margin-bottom: 0; }
+              .previous-heading { margin-top: 2rem; }
+              footer, .footer { color: var(--muted); font-size: 0.88rem; margin-top: 3.5rem; font-style: italic; text-align: center; }
+            """
+
+            # Runs before first paint to avoid a theme flash.
+            HEAD_SCRIPT = """\
+              (function () {
+                var stored = null;
+                try { stored = localStorage.getItem("theme"); } catch (e) {}
+                var system = matchMedia("(prefers-color-scheme: dark)").matches ? "moon" : "dawn";
+                document.documentElement.dataset.theme = stored || system;
+              })();
+            """
+
+            BODY_SCRIPT = """\
+              document.getElementById("theme-toggle").addEventListener("click", function () {
+                var next = document.documentElement.dataset.theme === "moon" ? "dawn" : "moon";
+                document.documentElement.dataset.theme = next;
+                try { localStorage.setItem("theme", next); } catch (e) {}
+              });
+              matchMedia("(prefers-color-scheme: dark)").addEventListener("change", function (event) {
+                var stored = null;
+                try { stored = localStorage.getItem("theme"); } catch (e) {}
+                if (!stored) document.documentElement.dataset.theme = event.matches ? "moon" : "dawn";
+              });
+            """
+
             (site_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
             (site_dir / "index.html").write_text(f"""<!doctype html>
             <html lang="en">
@@ -403,30 +515,19 @@
               <meta charset="utf-8">
               <meta name="viewport" content="width=device-width, initial-scale=1">
               <title>ctx downloads</title>
+              <script>
+            {HEAD_SCRIPT}  </script>
               <style>
-                body {{ font-family: system-ui, sans-serif; max-width: 920px; margin: 3rem auto; padding: 0 1rem; line-height: 1.5; }}
-                code, pre {{ background: #f4f4f4; padding: 0.15rem 0.3rem; border-radius: 4px; }}
-                pre {{ padding: 1rem; overflow-x: auto; }}
-                .release {{ margin: 1rem 0 1.5rem; padding: 1rem; border: 1px solid #ddd; border-radius: 12px; }}
-                .release.latest {{ background: #f7fbff; border-color: #9bc7f5; box-shadow: 0 1px 8px rgba(32, 105, 180, 0.12); }}
-                .release-heading {{ display: flex; justify-content: space-between; gap: 1rem; align-items: flex-start; margin-bottom: 1rem; }}
-                .release-heading h3 {{ margin: 0.1rem 0 0; }}
-                .eyebrow {{ color: #555; font-size: 0.85rem; font-weight: 700; letter-spacing: 0.04em; margin: 0; text-transform: uppercase; }}
-                .badge, .build-count {{ border-radius: 999px; display: inline-block; font-size: 0.8rem; font-weight: 700; padding: 0.15rem 0.5rem; white-space: nowrap; }}
-                .badge {{ background: #0b66c3; color: white; margin-left: 0.35rem; vertical-align: middle; }}
-                .build-count {{ background: #eee; color: #333; }}
-                .build-grid {{ display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }}
-                .build {{ background: white; border: 1px solid #e5e5e5; border-radius: 10px; padding: 1rem; }}
-                .build h4 {{ margin: 0 0 0.5rem; }}
-                .filename {{ margin: 0 0 0.75rem; overflow-wrap: anywhere; }}
-                .download-links {{ display: flex; flex-wrap: wrap; gap: 0.75rem; margin: 0.75rem 0; }}
-                .primary-link {{ font-weight: 700; }}
-                details pre {{ margin-bottom: 0; }}
-                .previous-heading {{ margin-top: 2rem; }}
-              </style>
+            {STYLE}  </style>
             </head>
             <body>
-              <h1>ctx downloads</h1>
+              <div class="masthead">
+                <div>
+                  <h1>ctx downloads</h1>
+                  <p class="home-link"><a href="https://averagechris.srht.site/">~averagechris</a> / ctx</p>
+                </div>
+                <button class="theme-toggle" id="theme-toggle" aria-label="toggle color theme">dawn &frasl; moon</button>
+              </div>
               <p>Local-first CLI for indexing and searching your coding-agent history. Hard fork of ctxrs/ctx &mdash; no telemetry, no network calls.</p>
               <p><a href="https://git.sr.ht/~averagechris/ctx">Source repository</a></p>
 
@@ -448,6 +549,8 @@
               <h2>Nix install</h2>
               <pre><code>nix run sourcehut:~averagechris/ctx
             nix run 'git+https://git.sr.ht/~averagechris/ctx?ref=refs/tags/{html.escape(tag)}'</code></pre>
+              <script>
+            {BODY_SCRIPT}  </script>
             </body>
             </html>
             """)

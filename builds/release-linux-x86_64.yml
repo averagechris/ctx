@@ -2,7 +2,10 @@ image: nixos/unstable
 arch: x86_64
 oauth: pages.sr.ht/PAGES:RW
 environment:
-  NIX_CONFIG: "experimental-features = nix-command flakes"
+  NIX_CONFIG: |
+    experimental-features = nix-command flakes
+    extra-substituters = https://averagechris-dotfiles.cachix.org
+    extra-trusted-public-keys = averagechris-dotfiles.cachix.org-1:VwJkl5dG1+xGDY5x884mH/kVwwpgwBAdBKIF3BZiia4=
 sources:
   - https://git.sr.ht/~averagechris/ctx
 tasks:

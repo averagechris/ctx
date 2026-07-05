@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ctx overview</title>
+  <script>(function(){var stored=null;try{stored=localStorage.getItem("theme")}catch(e){}var system=matchMedia("(prefers-color-scheme: dark)").matches?"moon":"dawn";document.documentElement.dataset.theme=stored||system})();</script>
+  <style>
+    :root,:root[data-theme="dawn"]{--base:#faf4ed;--surface:#fffaf3;--overlay:#f2e9e1;--hl-med:#dfdad9;--muted:#9893a5;--subtle:#797593;--text:#575279;--love:#b4637a;--rose:#d7827e;--pine:#286983;--foam:#56949f}
+    :root[data-theme="moon"]{--base:#232136;--surface:#2a273f;--overlay:#393552;--hl-med:#44415a;--muted:#6e6a86;--subtle:#908caa;--text:#e0def4;--love:#eb6f92;--rose:#ea9a97;--pine:#3e8fb0;--foam:#9ccfd8}
+    *{box-sizing:border-box}body{background:radial-gradient(circle at top left,color-mix(in srgb,var(--rose) 18%,transparent),transparent 30rem),radial-gradient(circle at 90% 10%,color-mix(in srgb,var(--foam) 16%,transparent),transparent 24rem),var(--base);color:var(--text);font-family:Charter,Georgia,"Iowan Old Style",serif;line-height:1.65;max-width:1080px;margin:0 auto;padding:3rem 1.25rem 4rem;transition:background .25s ease,color .25s ease}
+    a{color:var(--pine);text-decoration-color:color-mix(in srgb,var(--pine) 40%,transparent)}a:hover{color:var(--rose)}.masthead{display:flex;justify-content:space-between;align-items:flex-start;gap:1rem}.home-link{color:var(--subtle);font-style:italic;margin:.25rem 0 0;font-size:.95rem}.theme-toggle{background:var(--surface);border:1px solid var(--hl-med);color:var(--subtle);border-radius:999px;padding:.3rem .8rem;cursor:pointer;font-family:inherit;font-size:.85rem;font-style:italic;flex-shrink:0;margin-top:.5rem}.theme-toggle:hover{border-color:var(--rose);color:var(--text)}
+    .hero{padding:4rem 0 2rem}.eyebrow{color:var(--muted);font-size:.8rem;font-weight:700;letter-spacing:.08em;margin:0 0 .75rem;text-transform:uppercase}h1{font-size:clamp(2.5rem,8vw,5.5rem);line-height:.95;letter-spacing:-.06em;margin:0}.lede{font-size:clamp(1.15rem,3vw,1.55rem);max-width:780px;color:var(--subtle);margin:1.25rem 0 1.5rem}h2{font-size:clamp(1.6rem,4vw,2.35rem);margin:3rem 0 1rem;letter-spacing:-.02em}h3{font-size:1.1rem;margin:0 0 .45rem}.actions{display:flex;flex-wrap:wrap;gap:.75rem}
+    .button,.pill{border:1px solid var(--hl-med);border-radius:999px;background:var(--surface);padding:.55rem .9rem;font-family:ui-monospace,Menlo,monospace;font-size:.92rem;box-shadow:2px 2px 0 var(--hl-med)}.button.primary{background:var(--pine);border-color:var(--pine);color:var(--base);font-weight:700;text-decoration:none}.grid{display:grid;gap:1rem;grid-template-columns:repeat(auto-fit,minmax(250px,1fr))}.card,.flow,.sample-card{background:color-mix(in srgb,var(--surface) 92%,transparent);border:1px solid var(--hl-med);border-radius:12px;padding:1.1rem;box-shadow:2px 2px 0 var(--hl-med)}.card p,.flow p{margin:0;color:var(--subtle)}.badge{display:inline-block;border-radius:999px;background:var(--overlay);color:var(--subtle);padding:.08rem .45rem;margin-right:.25rem;font-family:ui-monospace,Menlo,monospace;font-size:.78rem}.num{color:var(--rose);font-family:ui-monospace,Menlo,monospace;font-weight:700}pre{background:var(--overlay);border:1px solid var(--hl-med);border-radius:10px;padding:1rem;overflow-x:auto;margin:.85rem 0 0}code{font-family:ui-monospace,Menlo,monospace;font-size:.9rem}.sample-card{display:flex;align-items:center;justify-content:space-between;gap:1rem;margin-top:1.25rem}footer{color:var(--muted);font-size:.88rem;margin-top:3.5rem;font-style:italic;text-align:center}@media(max-width:720px){body{padding-top:1.5rem}.masthead,.sample-card{flex-direction:column}}
+  </style>
+</head>
+<body>
+  <div class="masthead"><p class="home-link"><a href="https://averagechris.srht.site/">~averagechris</a> / <a href="index.html">ctx</a> / overview</p><button class="theme-toggle" id="theme-toggle" aria-label="toggle color theme">dawn &frasl; moon</button></div>
+  <header class="hero"><p class="eyebrow">Project overview</p><h1>ctx searches the coding-agent history already on your machine.</h1><p class="lede">It imports local transcripts from tools such as OpenCode, Claude Code, Codex, Cursor, Gemini, Copilot CLI, and other supported sources into a local SQLite index, then exposes search, transcript lookup, read-only SQL, docs, and MCP tools.</p><div class="actions"><a class="button primary" href="index.html">Install / download</a><a class="button" href="example.html">Read an example</a><a class="button" href="https://git.sr.ht/~averagechris/ctx">Source repository</a></div></header>
+  <section><h2>Core concepts</h2><div class="grid">
+    <article class="card"><h3>Local-first index</h3><p><code>ctx setup</code> creates local storage and indexes discovered history. <code>ctx import</code> can refresh all sources, one provider, one path, or a custom <code>ctx-history-jsonl-v1</code> file.</p></article>
+    <article class="card"><h3>No hosted service</h3><p>This fork removed telemetry, self-update, hosted endpoints, analytics, and network calls. Release updates come from SourceHut tags and Nix/download artifacts.</p></article>
+    <article class="card"><h3>Sessions and events</h3><p>Search results point at ctx-owned session and event IDs. Use <code>ctx show session</code> or <code>ctx show event</code> to recover the original transcript context.</p></article>
+    <article class="card"><h3>Provider adapters</h3><p>Built-in adapters read local files/databases for Codex, Pi, Claude Code, OpenCode, OpenClaw, Hermes, NanoClaw, AstrBot, Antigravity, Gemini CLI, Cursor CLI, Copilot CLI, and Factory AI Droid where those histories exist.</p></article>
+  </div></section>
+  <section><h2>Main workflows</h2><div class="grid">
+    <article class="flow"><h3><span class="num">01</span> Discover and index</h3><p>Start with setup, then inspect what ctx found.</p><pre><code>ctx setup
+ctx status
+ctx sources</code></pre></article>
+    <article class="flow"><h3><span class="num">02</span> Search past work</h3><p>Search defaults to diverse session-level results and can be scoped by provider, workspace, event type, file, time window, or session.</p><pre><code>ctx search "failed migration"
+ctx search "token budget" --limit 5
+ctx search "review findings" --include-subagents</code></pre></article>
+    <article class="flow"><h3><span class="num">03</span> Recover context</h3><p>Open a whole transcript or one event window from a search result.</p><pre><code>ctx show session &lt;ctx-session-id&gt;
+ctx show event &lt;ctx-event-id&gt; --window 10</code></pre></article>
+    <article class="flow"><h3><span class="num">04</span> Give agents memory</h3><p>Serve the same read-only local index to compatible agents over MCP, or query it directly with read-only SQL.</p><pre><code>ctx mcp
+ctx sql "SELECT provider, COUNT(*) FROM ctx_sessions GROUP BY provider"</code></pre></article>
+  </div><a class="sample-card" href="example.html"><span><strong>See ctx output in context</strong><br>Open an annotated search-and-show transcript using real command shapes.</span><span class="button primary">example.html</span></a></section>
+  <footer>ctx stores transcripts verbatim in local SQLite. Treat copied output as private unless you have reviewed it.</footer>
+  <script>document.getElementById("theme-toggle").addEventListener("click",function(){var next=document.documentElement.dataset.theme==="moon"?"dawn":"moon";document.documentElement.dataset.theme=next;try{localStorage.setItem("theme",next)}catch(e){}});matchMedia("(prefers-color-scheme: dark)").addEventListener("change",function(event){var stored=null;try{stored=localStorage.getItem("theme")}catch(e){}if(!stored)document.documentElement.dataset.theme=event.matches?"moon":"dawn"});</script>
+</body>
+</html>

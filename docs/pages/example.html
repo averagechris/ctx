@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ctx search example</title>
+  <script>(function(){var stored=null;try{stored=localStorage.getItem("theme")}catch(e){}var system=matchMedia("(prefers-color-scheme: dark)").matches?"moon":"dawn";document.documentElement.dataset.theme=stored||system})();</script>
+  <style>
+    :root,:root[data-theme="dawn"]{--base:#faf4ed;--surface:#fffaf3;--overlay:#f2e9e1;--hl-med:#dfdad9;--muted:#9893a5;--subtle:#797593;--text:#575279;--love:#b4637a;--rose:#d7827e;--pine:#286983;--foam:#56949f}
+    :root[data-theme="moon"]{--base:#232136;--surface:#2a273f;--overlay:#393552;--hl-med:#44415a;--muted:#6e6a86;--subtle:#908caa;--text:#e0def4;--love:#eb6f92;--rose:#ea9a97;--pine:#3e8fb0;--foam:#9ccfd8}
+    *{box-sizing:border-box}body{background:radial-gradient(circle at top left,color-mix(in srgb,var(--rose) 18%,transparent),transparent 30rem),radial-gradient(circle at 90% 10%,color-mix(in srgb,var(--foam) 16%,transparent),transparent 24rem),var(--base);color:var(--text);font-family:Charter,Georgia,"Iowan Old Style",serif;line-height:1.65;max-width:1080px;margin:0 auto;padding:3rem 1.25rem 4rem;transition:background .25s ease,color .25s ease}
+    a{color:var(--pine);text-decoration-color:color-mix(in srgb,var(--pine) 40%,transparent)}a:hover{color:var(--rose)}.masthead{display:flex;justify-content:space-between;align-items:flex-start;gap:1rem}.home-link{color:var(--subtle);font-style:italic;margin:.25rem 0 0;font-size:.95rem}.theme-toggle{background:var(--surface);border:1px solid var(--hl-med);color:var(--subtle);border-radius:999px;padding:.3rem .8rem;cursor:pointer;font-family:inherit;font-size:.85rem;font-style:italic;flex-shrink:0;margin-top:.5rem}.theme-toggle:hover{border-color:var(--rose);color:var(--text)}
+    .hero{padding:4rem 0 2rem}.eyebrow{color:var(--muted);font-size:.8rem;font-weight:700;letter-spacing:.08em;margin:0 0 .75rem;text-transform:uppercase}h1{font-size:clamp(2.5rem,8vw,5.5rem);line-height:.95;letter-spacing:-.06em;margin:0}.lede{font-size:clamp(1.15rem,3vw,1.55rem);max-width:760px;color:var(--subtle);margin:1.25rem 0 1.5rem}h2{font-size:clamp(1.6rem,4vw,2.35rem);margin:3rem 0 1rem;letter-spacing:-.02em}h3{font-size:1.1rem;margin:0 0 .45rem}.actions{display:flex;flex-wrap:wrap;gap:.75rem}
+    .button,.pill{border:1px solid var(--hl-med);border-radius:999px;background:var(--surface);padding:.55rem .9rem;font-family:ui-monospace,Menlo,monospace;font-size:.92rem;box-shadow:2px 2px 0 var(--hl-med)}.button.primary{background:var(--pine);border-color:var(--pine);color:var(--base);font-weight:700;text-decoration:none}.grid{display:grid;gap:1rem;grid-template-columns:repeat(auto-fit,minmax(250px,1fr))}.card,.step,.sample-card{background:color-mix(in srgb,var(--surface) 92%,transparent);border:1px solid var(--hl-med);border-radius:12px;padding:1.1rem;box-shadow:2px 2px 0 var(--hl-med)}.card p,.step p{margin:0;color:var(--subtle)}.num{color:var(--rose);font-family:ui-monospace,Menlo,monospace;font-weight:700}pre{background:var(--overlay);border:1px solid var(--hl-med);border-radius:10px;padding:1rem;overflow-x:auto;margin:.85rem 0 0}code{font-family:ui-monospace,Menlo,monospace;font-size:.9rem}.note{color:var(--subtle)}.sample-card{display:flex;align-items:center;justify-content:space-between;gap:1rem;margin-top:1.25rem}footer{color:var(--muted);font-size:.88rem;margin-top:3.5rem;font-style:italic;text-align:center}@media(max-width:720px){body{padding-top:1.5rem}.masthead,.sample-card{flex-direction:column}}
+  </style>
+</head>
+<body>
+  <div class="masthead"><p class="home-link"><a href="https://averagechris.srht.site/">~averagechris</a> / <a href="index.html">ctx</a> / example</p><button class="theme-toggle" id="theme-toggle" aria-label="toggle color theme">dawn &frasl; moon</button></div>
+  <header class="hero"><p class="eyebrow">Annotated transcript</p><h1>A search result becomes a recoverable agent-session transcript.</h1><p class="lede">The transcript below follows real ctx commands and output shapes. The content is sanitized from a local search for <code>flake</code>, but IDs, fields, ranking, next-command hints, and transcript layout mirror actual CLI output.</p><div class="actions"><a class="button primary" href="index.html">Install / download</a><a class="button" href="overview.html">Read the overview</a><a class="button" href="https://git.sr.ht/~averagechris/ctx">Source repository</a></div></header>
+  <section><h2>1. Search local history</h2><article class="step"><p><code>--refresh off</code> asks ctx to use the current local index without doing a best-effort provider refresh first. <code>--limit 1 --verbose</code> prints full ctx IDs and copyable next commands.</p><pre><code>$ ctx search flake --refresh off --limit 1 --verbose
+opencode tool call - ses_0d0ac8b4fffe6JoiJHNBUsCtw7
+  ctx_event_id: ffd00d29-6b15-750a-824a-bd9666fa8959
+  ctx_session_id: dde78c21-2fa4-7d04-9b5e-06c434bca647
+  provider_session_id: ses_0d0ac8b4fffe6JoiJHNBUsCtw7
+  source_format: opencode_sqlite
+  tool call: bash
+input: {"command":"jj diff --no-pager -r @ flake.lock | rg '^\\+' ...","timeout":120000,"workdir":"/Users/chris/dotfiles"}
+  rank: 1.00
+  session_importance: 1.00
+  next: ctx show session dde78c21-2fa4-7d04-9b5e-06c434bca647
+  next: ctx show event ffd00d29-6b15-750a-824a-bd9666fa8959 --window 10
+  next: ctx search flake --session dde78c21-2fa4-7d04-9b5e-06c434bca647
+  citation: event ffd00d29-6b15-750a-824a-bd9666fa8959
+  citation: session dde78c21-2fa4-7d04-9b5e-06c434bca647</code></pre></article></section>
+  <section><h2>2. Inspect the session</h2><article class="step"><p>The <code>next:</code> hint opens the full transcript. The header tells you which provider produced it, where it came from, and the provider-owned session ID for cross-checking.</p><pre><code>$ ctx show session dde78c21-2fa4-7d04-9b5e-06c434bca647
+ctx_session_id: dde78c21-2fa4-7d04-9b5e-06c434bca647
+provider: opencode
+provider_session_id: ses_0d0ac8b4fffe6JoiJHNBUsCtw7
+mode: lite
+format: text
+source_path: /Users/chris/.local/share/opencode/opencode.db
+
+[2026-07-04 22:50:26.384 UTC] user message 6be43372-f461-78ab-a0c4-a46127c8bf5c
+I just had a disk almost full notification again. I've been working on a lot of Rust projects; is sccache working?
+
+[2026-07-04 23:05:14.763 UTC] assistant message 445eb85d-613f-7eb7-b2e0-a7760368e4d8
+Crisis over — you're back to healthy free space. The local ctx index is about 1.1 GB for roughly 120k indexed items, and the OpenCode database contains legitimate history rather than obvious freelist waste.
+
+[2026-07-04 23:15:15.964 UTC] assistant message 59dd9271-a54d-753b-b2a0-c40a07c985cc
+The cleanup job now runs Nix garbage collection, cargo-sweep for stale target artifacts, and Docker build-cache pruning.</code></pre></article></section>
+  <section><h2>3. Narrow within the same session</h2><article class="step"><p>Once a session looks relevant, a scoped search returns dense hits from that one transcript instead of diverse results across the whole index.</p><pre><code>$ ctx search flake --session dde78c21-2fa4-7d04-9b5e-06c434bca647
+1. opencode tool call - ses_0d0ac8b4fffe6JoiJHNBUsCtw7
+   opencode | importance 1.00 | session dde78c21 | event ffd00d29 | 2026-07-05T00:01:51.318+00:00
+   tool call: bash
+input: {"command":"jj diff --no-pager -r @ flake.lock ..."}
+   inspect: ctx show event ffd00d29-6b15-750a-824a-bd9666fa8959 --window 10</code></pre></article><a class="sample-card" href="overview.html"><span><strong>Back to the workflow map</strong><br>Read how setup, import, search, show, SQL, and MCP fit together.</span><span class="button primary">overview.html</span></a></section>
+  <footer>Search output can include private transcript text. Review before copying results out of your machine.</footer>
+  <script>document.getElementById("theme-toggle").addEventListener("click",function(){var next=document.documentElement.dataset.theme==="moon"?"dawn":"moon";document.documentElement.dataset.theme=next;try{localStorage.setItem("theme",next)}catch(e){}});matchMedia("(prefers-color-scheme: dark)").addEventListener("change",function(event){var stored=null;try{stored=localStorage.getItem("theme")}catch(e){}if(!stored)document.documentElement.dataset.theme=event.matches?"moon":"dawn"});</script>
+</body>
+</html>

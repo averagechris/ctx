@@ -27,6 +27,9 @@
           versionMode = "package";
           versionFile = "crates/ctx-cli/Cargo.toml";
           lockPackages = ["ctx"];
+          # CLI tests spawn python3 history-source plugin helpers; the nixos
+          # CI image has no system python3.
+          ciExtraInputs = [pkgs.python3];
         };
 
         ctx = pkgs.rustPlatform.buildRustPackage {

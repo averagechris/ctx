@@ -1,7 +1,10 @@
 image: nixos/unstable
 arch: x86_64
-oauth: pages.sr.ht/PAGES:RW
+oauth: git.sr.ht/OBJECTS:RW git.sr.ht/REPOSITORIES:RO git.sr.ht/PROFILE:RO builds.sr.ht/JOBS:RW builds.sr.ht/SECRETS:RO meta.sr.ht/PROFILE:RO
 environment:
+  GIT_CONFIG_COUNT: "1"
+  GIT_CONFIG_KEY_0: http.userAgent
+  GIT_CONFIG_VALUE_0: "averagechris-fleet-pages (+https://averagechris.srht.site)"
   NIX_CONFIG: |
     experimental-features = nix-command flakes
     extra-substituters = https://averagechris-dotfiles.cachix.org
@@ -9,17 +12,51 @@ environment:
 sources:
   - https://git.sr.ht/~averagechris/ctx
 tasks:
-  - build: |
+  - release-artifact: |
+      set -eu
       cd ctx
       nix build .#release-artifact --out-link result-release-artifact
       mkdir -p ~/artifacts
       cp -p result-release-artifact/* ~/artifacts/
-      mkdir -p dist/downloads
-      cp -p result-release-artifact/* dist/downloads/
-  - publish: |
+  - upload-and-refresh: |
+      set -eu
       cd ctx
-      nix run .#build-pages -- --include-existing-downloads
-      nix run .#publish-pages
+      hut() { nix shell --inputs-from . nixpkgs#hut --command hut "$@"; }
+      version="$(awk '/^\[package\]/{s=1} s && /^version = /{gsub(/"/,"",$3); print $3; exit}' crates/ctx-cli/Cargo.toml)"
+      tag="v${version#v}"
+      commit="$(git rev-parse HEAD)"
+
+      set -- result-release-artifact/*.tar.gz
+      [ -e "$1" ] || { printf '%s\n' 'no release artifacts found' >&2; exit 1; }
+      for artifact do
+        hut git artifact upload -r ctx --rev "$tag" "$artifact" "$artifact.sha256"
+      done
+
+      manifest="$(mktemp)"
+      cat > "$manifest" <<EOF
+      image: nixos/unstable
+      arch: x86_64
+      oauth: pages.sr.ht/PAGES:RW
+      environment:
+        GIT_CONFIG_COUNT: "1"
+        GIT_CONFIG_KEY_0: http.userAgent
+        GIT_CONFIG_VALUE_0: "averagechris-fleet-pages (+https://averagechris.srht.site)"
+        NIX_CONFIG: |
+          experimental-features = nix-command flakes
+          extra-substituters = https://averagechris-dotfiles.cachix.org
+          extra-trusted-public-keys = averagechris-dotfiles.cachix.org-1:VwJkl5dG1+xGDY5x884mH/kVwwpgwBAdBKIF3BZiia4=
+        TRIGGER_SOURCE: release
+        TRIGGER_PROJECT: ctx
+        TRIGGER_TAG: $tag
+        TRIGGER_SHA: $commit
+      sources:
+        - https://git.sr.ht/~averagechris/averagechris.srht.site
+      tasks:
+        - refresh: |
+            cd averagechris.srht.site
+            nix run .#refresh-pages
+      EOF
+      hut builds submit "$manifest" --note "site refresh: ctx $tag" --visibility unlisted
 artifacts:
   - artifacts/ctx-v1.0.1-x86_64-linux.tar.gz
   - artifacts/ctx-v1.0.1-x86_64-linux.tar.gz.sha256

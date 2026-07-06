@@ -549,24 +549,26 @@
           '';
         };
       in {
-        packages =
-          {
-            default = ctx;
-            inherit ctx ci-docs fetch-upstream;
-            inherit build-pages publish-pages;
-            release-artifact = fleetApps.releaseArtifact system;
-          };
+        packages = {
+          default = ctx;
+          inherit ctx ci-docs fetch-upstream;
+          inherit build-pages publish-pages;
+          release-artifact = fleetApps.releaseArtifact system;
+        };
 
-        apps = {
-          default = flake-utils.lib.mkApp {
-            drv = ctx;
-            exePath = "/bin/ctx";
-          };
-          ci-docs = flake-utils.lib.mkApp {drv = ci-docs;};
-          fetch-upstream = flake-utils.lib.mkApp {drv = fetch-upstream;};
-          build-pages = flake-utils.lib.mkApp {drv = build-pages;};
-          publish-pages = flake-utils.lib.mkApp {drv = publish-pages;};
-        } // fleetApps.apps;
+        apps =
+          {
+            default = flake-utils.lib.mkApp {
+              drv = ctx;
+              exePath = "/bin/ctx";
+            };
+            ci-docs = flake-utils.lib.mkApp {drv = ci-docs;};
+            fetch-upstream = flake-utils.lib.mkApp {drv = fetch-upstream;};
+            build-pages = flake-utils.lib.mkApp {drv = build-pages;};
+            publish-pages = flake-utils.lib.mkApp {drv = publish-pages;};
+            inherit (fleetApps.apps) static-checks;
+          }
+          // fleetApps.apps;
 
         checks = {
           build = ctx;

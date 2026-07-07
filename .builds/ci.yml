@@ -4,6 +4,8 @@ environment:
   NIX_CONFIG: "experimental-features = nix-command flakes"
 sources:
   - https://git.sr.ht/~averagechris/ctx
+secrets:
+  - 731f7e55-4497-4228-8fa4-1657da7d3625 # cachix averagechris-dotfiles -> ~/.ci_secrets/cachix_token
 tasks:
   - fmt: |
       cd ctx
@@ -17,3 +19,15 @@ tasks:
   - docs: |
       cd ctx
       nix run .#ci-docs
+  - build: |
+      cd ctx
+      nix build .#ctx --print-build-logs
+  - closure-size: |
+      cd ctx
+      nix path-info -S ./result
+      nix path-info -rS ./result | sort -k2 -n | tail -n 5
+  - cache-warm: |
+      cd ctx
+      if [ ! -f ~/.ci_secrets/cachix_token ]; then echo "no cachix token available; skipping cache warm"; exit 0; fi
+      CACHIX_AUTH_TOKEN="$(cat ~/.ci_secrets/cachix_token)"; export CACHIX_AUTH_TOKEN
+      nix run --inputs-from . nixpkgs#cachix -- push averagechris-dotfiles ./result

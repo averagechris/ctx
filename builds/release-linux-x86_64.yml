@@ -11,6 +11,8 @@ environment:
     extra-trusted-public-keys = averagechris-dotfiles.cachix.org-1:VwJkl5dG1+xGDY5x884mH/kVwwpgwBAdBKIF3BZiia4=
 sources:
   - https://git.sr.ht/~averagechris/ctx
+secrets:
+  - 731f7e55-4497-4228-8fa4-1657da7d3625 # cachix averagechris-dotfiles -> ~/.ci_secrets/cachix_token
 tasks:
   - release-artifact: |
       set -eu
@@ -18,6 +20,13 @@ tasks:
       nix build .#release-artifact --out-link result-release-artifact
       mkdir -p ~/artifacts
       cp -p result-release-artifact/* ~/artifacts/
+  - cache-warm: |
+      set -eu
+      cd ctx
+      if [ ! -f ~/.ci_secrets/cachix_token ]; then echo "no cachix token available; skipping cache warm"; exit 0; fi
+      nix build .#ctx -o result-pkg
+      CACHIX_AUTH_TOKEN="$(cat ~/.ci_secrets/cachix_token)"; export CACHIX_AUTH_TOKEN
+      nix run --inputs-from . nixpkgs#cachix -- push averagechris-dotfiles result-release-artifact result-pkg
   - upload-and-refresh: |
       set -eu
       cd ctx

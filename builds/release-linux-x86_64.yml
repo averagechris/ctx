@@ -21,7 +21,7 @@ tasks:
   - upload-and-refresh: |
       set -eu
       cd ctx
-      export SRHT_TOKEN="${SRHT_TOKEN:-$(awk -F ' *= *' '$1 == "oauth-token" { gsub(/\"/, "", $2); print $2; exit }' ~/.config/hut/config)}"
+      export SRHT_TOKEN="${SRHT_TOKEN:-${OAUTH2_TOKEN:-$(awk '/access-token/ { gsub(/"/, "", $2); print $2; exit }' ~/.config/hut/config 2>/dev/null || true)}}"
       srht() { nix run 'git+https://git.sr.ht/~averagechris/srht' -- "$@"; }
       version="$(awk '/^\[package\]/{s=1} s && /^version = /{gsub(/"/,"",$3); print $3; exit}' crates/ctx-cli/Cargo.toml)"
       tag="v${version#v}"

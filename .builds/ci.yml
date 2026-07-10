@@ -5,7 +5,7 @@ environment:
 sources:
   - https://git.sr.ht/~averagechris/ctx
 secrets:
-  - 731f7e55-4497-4228-8fa4-1657da7d3625 # cachix averagechris-dotfiles -> ~/.ci_secrets/cachix_token
+  - 5ec60320-e0d8-4ebe-8b45-1d10cc4d2cb2 # cachix averagechris-dotfiles -> ~/.ci_secrets/cachix_token
 tasks:
   - fmt: |
       cd ctx
@@ -29,5 +29,8 @@ tasks:
   - cache-warm: |
       cd ctx
       if [ ! -f ~/.ci_secrets/cachix_token ]; then echo "no cachix token available; skipping cache warm"; exit 0; fi
-      CACHIX_AUTH_TOKEN="$(cat ~/.ci_secrets/cachix_token)"; export CACHIX_AUTH_TOKEN
+      set +x
+      CACHIX_AUTH_TOKEN="$(cat ~/.ci_secrets/cachix_token)"
+      export CACHIX_AUTH_TOKEN
+      set -x
       nix run --inputs-from . nixpkgs#cachix -- push averagechris-dotfiles ./result

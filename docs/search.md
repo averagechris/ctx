@@ -18,6 +18,8 @@ ctx search "tool output" --event-type tool_output
 ctx search --file crates/foo/src/lib.rs
 ctx search "token budget" --refresh off
 ctx search "signed metadata" --term checksum --term release
+ctx search "exact adjacent words" --match phrase
+ctx search "one of these words" --match any
 ctx search "token budget" --limit 5
 ctx search "token budget" --session <ctx-session-id>
 ctx search "review findings" --include-subagents
@@ -55,6 +57,39 @@ they are not positional lookup IDs. Provider-owned lookup must be explicit, for
 example `--provider codex --provider-session <provider-session-id>` on commands
 that support it.
 
+## Match modes
+
+`ctx search` treats the positional query and each repeated `--term` as separate
+query clauses. Clauses are combined with OR: a result may match the positional
+query, any `--term`, or several of them. Filters such as provider, source,
+workspace, time, event type, file, session, subagent/current-session flags, and
+result mode are combined with AND and never broaden a query. Result `--limit` is
+global after OR-clause merging.
+
+Inside one clause, `--match` controls how normalized words match one indexed
+event/search section:
+
+- `--match all` is the default. Every normalized token in the clause must appear
+  in the same indexed section; order and adjacency are not required.
+- `--match any` matches when at least one normalized token appears. Ranking
+  rewards sections that match more tokens, within existing result limits.
+- `--match phrase` requires the normalized tokens to appear ordered and adjacent
+  in the same indexed section.
+
+Tokenization uses ctx portable literal tokens: letters and numbers form
+tokens, diacritics are not folded, and punctuation such as `_`, `-`, `/`, `.`, quotes, `*`, and `:` separates
+tokens. Input is always literal text. Operator-looking words or syntax such as
+`OR`, `NOT`, `title:body`, or `star*` are normalized/quoted and are not accepted
+as raw SQLite FTS operators. For example, `write_to_file`, `write-to-file`, and
+`write to file` normalize to the same three tokens; `--match phrase` requires
+`write to file` adjacency after normalization.
+
+ctx never silently retries a broader mode. If a multiword text search has no
+results, human output may print a labeled `suggestion (not run)` command that
+broadens exactly one step (`phrase -> all`, `all -> any`; no suggestion for
+`any`) while preserving active filters, repeated `--term` clauses, result flags,
+refresh mode, verbosity, and `--limit`.
+
 ## Filters
 
 Search filters narrow both human output and JSON:
@@ -73,7 +108,8 @@ Search filters narrow both human output and JSON:
 - `--file <path>`, indexed touched-file path metadata, not the current
   filesystem;
 - `--session <ctx-session-id-or-prefix>`;
-- `--term <query-or-keyword>`, repeatable broadening terms merged with OR-style
+- `--match all|any|phrase`, controls matching within each positional query or `--term` clause;
+- `--term <query-or-keyword>`, repeatable broadening clauses merged with OR-style
   semantics, not required terms;
 - `--events`;
 - `--include-subagents`;
@@ -143,7 +179,7 @@ only retrieves indexed local evidence; it does not synthesize conclusions.
 Use default text output for agent reading. Use `ctx search <query> --json` or a
 term/file search with `--json` for scripts, `jq`, or exact field extraction.
 JSON results include the same result metadata and citations as the human output,
-plus a top-level `freshness` object
+plus top-level `query_plan`, optional no-result `broadened_search`, and `freshness` objects
 describing the pre-search refresh mode and outcome. A citation with
 `source_exists: false` means ctx can return indexed text, but the raw provider
 file was not available at the stored path when the result was built.
@@ -151,3 +187,6 @@ file was not available at the stored path when the result was built.
 Search output is local/private by default and is not redacted for sharing.
 Review and redact copied snippets, JSON, or transcripts before sending them
 outside the machine.
+
+
+Relevance note: `--match any` rewards results that match more normalized tokens, but ctx reranks only a bounded candidate pool (at least `max(limit*8, 50)` candidates on unfiltered fast/fallback paths, subject to existing scan caps), not the entire historical corpus.

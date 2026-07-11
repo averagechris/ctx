@@ -6,9 +6,9 @@ use std::{
 
 use chrono::Utc;
 use ctx_history_core::{
-    utc_now, Artifact, ContextCitation, ContextCitationType, ContextLinks, ContextPagination,
-    ContextTruncation, Event, EventType, FileTouched, HistoryRecord, RedactionState, Run, Session,
-    Summary, VcsChange, Visibility,
+    search_query_terms, utc_now, Artifact, ContextCitation, ContextCitationType, ContextLinks,
+    ContextPagination, ContextTruncation, Event, EventType, FileTouched, HistoryRecord,
+    RedactionState, Run, SearchMatchMode, SearchQueryPlan, Session, Summary, VcsChange, Visibility,
 };
 use ctx_history_store::{EventSearchHit, FileTouchScope, Store};
 use serde::Serialize;
@@ -37,6 +37,7 @@ pub struct PacketOptions {
     pub snippet_chars: usize,
     pub filters: SearchFilters,
     pub result_mode: SearchResultMode,
+    pub match_mode: SearchMatchMode,
 }
 
 impl Default for PacketOptions {
@@ -46,6 +47,7 @@ impl Default for PacketOptions {
             snippet_chars: DEFAULT_SNIPPET_CHARS,
             filters: SearchFilters::default(),
             result_mode: SearchResultMode::Sessions,
+            match_mode: SearchMatchMode::All,
         }
     }
 }
@@ -98,6 +100,8 @@ pub struct ProviderSessionFilter {
 pub struct SearchPacket {
     pub schema_version: u32,
     pub query: String,
+    #[serde(default)]
+    pub query_plan: SearchQueryPlan,
     pub filters: SearchFilters,
     pub generated_at: chrono::DateTime<Utc>,
     pub results: Vec<SearchPacketResult>,
@@ -235,27 +239,43 @@ struct CandidateSearch {
 }
 
 pub fn search_packet(store: &Store, query: &str, options: &PacketOptions) -> Result<SearchPacket> {
+    search_packet_plan(
+        store,
+        SearchQueryPlan::new(options.match_mode, [query]),
+        query,
+        options,
+    )
+}
+
+fn search_packet_plan(
+    store: &Store,
+    plan: SearchQueryPlan,
+    display_query: &str,
+    options: &PacketOptions,
+) -> Result<SearchPacket> {
     let options = normalized_options(options);
     if let Some(provider) = options.filters.provider {
         if !store.has_provider_data(provider)? {
-            return Ok(empty_search_packet(query, &options));
+            return Ok(empty_search_packet(display_query, plan, &options));
         }
     }
     let file_scope = file_filter_scope(store, &options.filters)?;
     if file_scope.as_ref().is_some_and(FileTouchScope::is_empty) {
-        return Ok(empty_search_packet(query, &options));
+        return Ok(empty_search_packet(display_query, plan, &options));
     }
-    if let Some(packet) = fast_event_search_packet(store, query, &options, file_scope.as_ref())? {
+    if let Some(packet) =
+        fast_event_search_packet(store, &plan, display_query, &options, file_scope.as_ref())?
+    {
         return Ok(packet);
     }
     let CandidateSearch {
         candidates,
         scan_budget_exhausted,
-    } = ranked_candidates(store, Some(query), &options, file_scope.as_ref())?;
+    } = ranked_candidates(store, Some(&plan), &options, file_scope.as_ref())?;
     let mut truncation = ContextTruncation::default();
     let mut results = Vec::new();
 
-    push_candidate_results(&mut results, &candidates, query, &options);
+    push_candidate_results(&mut results, &candidates, display_query, &options);
 
     let has_more = candidates.len() > results.len() || scan_budget_exhausted;
     if scan_budget_exhausted {
@@ -271,7 +291,8 @@ pub fn search_packet(store: &Store, query: &str, options: &PacketOptions) -> Res
     let cursor_offset = results.len();
     Ok(SearchPacket {
         schema_version: SEARCH_PACKET_SCHEMA_VERSION,
-        query: query.to_owned(),
+        query: display_query.to_owned(),
+        query_plan: plan,
         filters: options.filters,
         generated_at: utc_now(),
         results,
@@ -287,7 +308,10 @@ pub fn search_packet_terms(
     options: &PacketOptions,
 ) -> Result<SearchPacket> {
     let options = normalized_options(options);
-    let search_terms = composed_search_terms(query, terms);
+    let search_terms = composed_search_terms(query, terms)
+        .into_iter()
+        .filter(|term| !SearchQueryPlan::new(options.match_mode, [term.as_str()]).is_empty())
+        .collect::<Vec<_>>();
     if search_terms.len() <= 1 {
         return search_packet(
             store,
@@ -346,6 +370,10 @@ pub fn search_packet_terms(
     Ok(SearchPacket {
         schema_version: SEARCH_PACKET_SCHEMA_VERSION,
         query: search_terms.join(" OR "),
+        query_plan: SearchQueryPlan::new(
+            options.match_mode,
+            search_terms.iter().map(String::as_str),
+        ),
         filters: options.filters,
         generated_at: utc_now(),
         results: merged_results,
@@ -462,8 +490,9 @@ fn push_candidate_results(
     options: &PacketOptions,
 ) {
     let mut clustered_index = BTreeMap::<Uuid, usize>::new();
+    let plan = SearchQueryPlan::new(options.match_mode, [query]);
     for candidate in candidates {
-        let mut result = candidate_search_result(candidate, query, options);
+        let mut result = candidate_search_result(candidate, query, &plan, options);
         if options.result_mode == SearchResultMode::Sessions {
             let cluster_id = result.session_id.unwrap_or(result.record_id);
             if let Some(index) = clustered_index.get(&cluster_id).copied() {
@@ -490,6 +519,7 @@ fn push_candidate_results(
 fn candidate_search_result(
     candidate: &Candidate,
     query: &str,
+    plan: &SearchQueryPlan,
     options: &PacketOptions,
 ) -> SearchPacketResult {
     let display_hit = candidate_display_hit(candidate, &options.filters);
@@ -508,6 +538,7 @@ fn candidate_search_result(
             &candidate.record,
             &candidate.context,
             query,
+            plan,
             options.snippet_chars,
             &options.filters,
         ),
@@ -589,11 +620,12 @@ fn candidate_display_hit(candidate: &Candidate, filters: &SearchFilters) -> Opti
 
 fn fast_event_search_packet(
     store: &Store,
-    query: &str,
+    plan: &SearchQueryPlan,
+    display_query: &str,
     options: &PacketOptions,
     file_scope: Option<&FileTouchScope>,
 ) -> Result<Option<SearchPacket>> {
-    if query.trim().is_empty() {
+    if plan.is_empty() {
         return Ok(None);
     }
     if has_history_source_filter(&options.filters) {
@@ -602,16 +634,24 @@ fn fast_event_search_packet(
     if !store.has_at_least_events(LARGE_EVENT_CORPUS_THRESHOLD)? {
         return Ok(None);
     }
+    if !store.has_event_search_index()? {
+        return Ok(None);
+    }
 
     let target_results = options.limit.saturating_add(1);
     let filtered = has_filters(&options.filters);
+    let collection_target = if filtered {
+        target_results
+    } else {
+        options.limit.saturating_mul(8).max(50).max(target_results)
+    };
     let clustered = options.result_mode == SearchResultMode::Sessions;
     let page_size = if clustered {
-        FILTERED_SEARCH_PAGE_SIZE.max(target_results.saturating_mul(8).max(50))
+        FILTERED_SEARCH_PAGE_SIZE.max(collection_target)
     } else if filtered {
         FILTERED_SEARCH_PAGE_SIZE.max(target_results)
     } else {
-        target_results
+        collection_target
     };
     let mut results = Vec::new();
     let mut clustered_results = Vec::<SearchPacketResult>::new();
@@ -622,23 +662,36 @@ fn fast_event_search_packet(
 
     loop {
         pages_scanned = pages_scanned.saturating_add(1);
-        let hits = store.search_event_hits_page(query, page_size, offset)?;
+        let hits = store.search_event_hits_plan_page(plan, page_size, offset)?;
         let page_len = hits.len();
 
         for hit in hits {
+            if !plan.matches_text(&hit.preview) {
+                continue;
+            }
             if !event_hit_matches_filters(&hit, &options.filters, file_scope) {
                 continue;
             }
             if clustered {
                 let cluster_id = hit.session_id.unwrap_or(hit.event_id);
                 if let Some(index) = clustered_index.get(&cluster_id).copied() {
+                    let mut candidate =
+                        event_search_result(&hit, display_query, plan, options.snippet_chars);
+                    candidate.result_scope = if candidate.session_id.is_some() {
+                        SearchResultScope::Session
+                    } else {
+                        SearchResultScope::Event
+                    };
                     let existing = &mut clustered_results[index];
-                    existing.more_matches_in_session =
-                        existing.more_matches_in_session.saturating_add(1);
-                    existing.session_importance =
-                        session_importance(existing.rank, existing.more_matches_in_session);
+                    let more = existing.more_matches_in_session.saturating_add(1);
+                    if compare_search_results(&candidate, existing).is_lt() {
+                        *existing = candidate;
+                    }
+                    existing.more_matches_in_session = more;
+                    existing.session_importance = session_importance(existing.rank, more);
                 } else {
-                    let mut result = event_search_result(&hit, query, options.snippet_chars);
+                    let mut result =
+                        event_search_result(&hit, display_query, plan, options.snippet_chars);
                     result.result_scope = if result.session_id.is_some() {
                         SearchResultScope::Session
                     } else {
@@ -648,24 +701,18 @@ fn fast_event_search_packet(
                     clustered_index.insert(cluster_id, clustered_results.len());
                     clustered_results.push(result);
                 }
-                if clustered_results.len() >= target_results {
-                    break;
-                }
             } else {
-                let result = event_search_result(&hit, query, options.snippet_chars);
+                let result = event_search_result(&hit, display_query, plan, options.snippet_chars);
                 results.push(result);
-                if results.len() >= target_results {
-                    break;
-                }
             }
         }
 
         let enough_results = if clustered {
-            clustered_results.len() >= target_results
+            clustered_results.len() >= collection_target
         } else {
-            results.len() >= target_results
+            results.len() >= collection_target
         };
-        if (!filtered && !clustered) || enough_results || page_len < page_size {
+        if enough_results || page_len < page_size {
             break;
         }
         if pages_scanned >= FILTERED_SEARCH_MAX_PAGES {
@@ -681,6 +728,10 @@ fn fast_event_search_packet(
 
     if clustered {
         results = clustered_results;
+    }
+    results.sort_by(compare_search_results);
+    if results.is_empty() && !scan_budget_exhausted {
+        return Ok(None);
     }
     let has_more = results.len() > options.limit || scan_budget_exhausted;
     if results.len() > options.limit {
@@ -707,7 +758,8 @@ fn fast_event_search_packet(
     let cursor_offset = results.len();
     Ok(Some(SearchPacket {
         schema_version: SEARCH_PACKET_SCHEMA_VERSION,
-        query: query.to_owned(),
+        query: display_query.to_owned(),
+        query_plan: plan.clone(),
         filters: options.filters.clone(),
         generated_at: utc_now(),
         results,
@@ -716,10 +768,15 @@ fn fast_event_search_packet(
     }))
 }
 
-fn empty_search_packet(query: &str, options: &PacketOptions) -> SearchPacket {
+fn empty_search_packet(
+    query: &str,
+    plan: SearchQueryPlan,
+    options: &PacketOptions,
+) -> SearchPacket {
     SearchPacket {
         schema_version: SEARCH_PACKET_SCHEMA_VERSION,
         query: query.to_owned(),
+        query_plan: plan,
         filters: options.filters.clone(),
         generated_at: utc_now(),
         results: Vec::new(),
@@ -883,6 +940,7 @@ fn file_scope_matches_hit(scope: &FileTouchScope, hit: &EventSearchHit) -> bool 
 fn event_search_result(
     hit: &EventSearchHit,
     query: &str,
+    plan: &SearchQueryPlan,
     snippet_chars: usize,
 ) -> SearchPacketResult {
     let terms = query_terms(query);
@@ -923,8 +981,13 @@ fn event_search_result(
         event_id: Some(hit.event_id),
         event_seq: Some(hit.seq),
         title: event_result_title(hit),
-        snippet: matched_snippet(&hit.preview, &terms, snippet_chars),
-        rank: (-hit.score as f32).max(0.0),
+        snippet: matched_snippet(&hit.preview, plan, &terms, snippet_chars),
+        rank: (-hit.score as f32).max(0.0)
+            + if matches!(plan.mode, SearchMatchMode::Any) {
+                matched_token_count(&hit.preview, plan) as f32
+            } else {
+                0.0
+            },
         result_scope: SearchResultScope::Event,
         more_matches_in_session: 0,
         session_importance: 0.0,
@@ -1040,17 +1103,25 @@ fn normalized_options(options: &PacketOptions) -> PacketOptions {
         snippet_chars: options.snippet_chars.clamp(32, 2_000),
         filters: options.filters.clone(),
         result_mode: options.result_mode,
+        match_mode: options.match_mode,
     }
 }
 
 fn ranked_candidates(
     store: &Store,
-    query: Option<&str>,
+    plan: Option<&SearchQueryPlan>,
     options: &PacketOptions,
     file_scope: Option<&FileTouchScope>,
 ) -> Result<CandidateSearch> {
     let target_candidates = options.limit.saturating_add(1);
-    let terms = query_terms(query.unwrap_or_default());
+    let terms = plan
+        .map(|p| {
+            p.clauses
+                .iter()
+                .flat_map(|c| c.terms.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let mut candidates = Vec::new();
     let mut seen = BTreeSet::<Uuid>::new();
     let mut scan_budget_exhausted = false;
@@ -1075,7 +1146,7 @@ fn ranked_candidates(
             }
             let record = store.get_record(*record_id)?;
             if let Some(candidate) =
-                candidate_for_record(store, record, &terms, &options.filters, file_scope)?
+                candidate_for_record(store, record, plan, &terms, &options.filters, file_scope)?
             {
                 candidates.push(candidate);
             }
@@ -1098,9 +1169,9 @@ fn ranked_candidates(
         let mut pages_scanned = 0_usize;
         loop {
             pages_scanned = pages_scanned.saturating_add(1);
-            let records = match query {
-                Some(query) if !query.trim().is_empty() => {
-                    store.search_records_page(query, page_size, offset)?
+            let records = match plan {
+                Some(plan) if !plan.is_empty() => {
+                    store.search_records_plan_page(plan, page_size, offset)?
                 }
                 _ => Vec::new(),
             };
@@ -1118,7 +1189,7 @@ fn ranked_candidates(
                     }
                 }
                 if let Some(candidate) =
-                    candidate_for_record(store, record, &terms, &options.filters, file_scope)?
+                    candidate_for_record(store, record, plan, &terms, &options.filters, file_scope)?
                 {
                     candidates.push(candidate);
                 }
@@ -1138,9 +1209,13 @@ fn ranked_candidates(
             offset = next_offset;
         }
     } else {
-        let fetch_limit = target_candidates;
-        let records = match query {
-            Some(query) if !query.trim().is_empty() => store.search_records(query, fetch_limit)?,
+        let fetch_limit = options
+            .limit
+            .saturating_mul(8)
+            .max(50)
+            .max(target_candidates);
+        let records = match plan {
+            Some(plan) if !plan.is_empty() => store.search_records_plan(plan, fetch_limit)?,
             _ => Vec::new(),
         };
         for record in records {
@@ -1151,7 +1226,7 @@ fn ranked_candidates(
                 continue;
             }
             if let Some(candidate) =
-                candidate_for_record(store, record, &terms, &options.filters, file_scope)?
+                candidate_for_record(store, record, plan, &terms, &options.filters, file_scope)?
             {
                 candidates.push(candidate);
             }
@@ -1181,6 +1256,7 @@ fn compare_candidates(left: &Candidate, right: &Candidate) -> Ordering {
 fn candidate_for_record(
     store: &Store,
     record: HistoryRecord,
+    plan: Option<&SearchQueryPlan>,
     terms: &[String],
     filters: &SearchFilters,
     file_scope: Option<&FileTouchScope>,
@@ -1189,7 +1265,7 @@ fn candidate_for_record(
     if !record_matches_filters(&record, &context, filters, file_scope) {
         return Ok(None);
     }
-    let analysis = analyze_record(&record, &context, terms, filters);
+    let analysis = analyze_record(&record, &context, plan, terms, filters);
     if terms.is_empty() || analysis.score > 0.0 {
         Ok(Some(Candidate {
             record,
@@ -1286,6 +1362,7 @@ struct MatchAnalysis {
 fn analyze_record(
     record: &HistoryRecord,
     context: &RecordContext,
+    plan: Option<&SearchQueryPlan>,
     terms: &[String],
     filters: &SearchFilters,
 ) -> MatchAnalysis {
@@ -1357,8 +1434,16 @@ fn analyze_record(
         if hit_matches_excluded_provider_session(&section.hit, filters) {
             continue;
         }
-        if matches_terms(&section.text, terms) {
-            score += section.weight;
+        let matched = plan.map_or_else(
+            || matches_terms(&section.text, terms),
+            |p| p.matches_text(&section.text),
+        );
+        if matched {
+            score += section.weight
+                * plan.map_or(1.0, |p| match p.mode {
+                    SearchMatchMode::Any => matched_token_count(&section.text, p) as f32,
+                    _ => 1.0,
+                });
             if section.weight > primary_weight {
                 primary_weight = section.weight;
                 primary_hit = Some(section.hit.clone());
@@ -2291,17 +2376,23 @@ fn normalize_scores(candidates: &mut [Candidate]) {
 }
 
 fn query_terms(query: &str) -> Vec<String> {
-    query
-        .split(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '-')
-        .filter_map(|term| {
-            let term = term.trim().to_lowercase();
-            if term.is_empty() || !term.chars().any(char::is_alphanumeric) {
-                None
-            } else {
-                Some(term)
-            }
+    search_query_terms(query)
+}
+
+fn matched_token_count(value: &str, plan: &SearchQueryPlan) -> usize {
+    let hay = search_query_terms(value);
+    plan.clauses
+        .iter()
+        .map(|clause| {
+            clause
+                .terms
+                .iter()
+                .filter(|term| hay.contains(term))
+                .count()
         })
-        .collect()
+        .max()
+        .unwrap_or(1)
+        .max(1)
 }
 
 fn has_filters(filters: &SearchFilters) -> bool {
@@ -2524,14 +2615,14 @@ fn matches_terms(value: &str, terms: &[String]) -> bool {
     if terms.is_empty() {
         return false;
     }
-    let haystack = value.to_lowercase();
-    terms.iter().all(|term| haystack.contains(term))
+    SearchQueryPlan::new(SearchMatchMode::All, [terms.join(" ")]).matches_text(value)
 }
 
 fn search_snippet(
     record: &HistoryRecord,
     context: &RecordContext,
     query: &str,
+    plan: &SearchQueryPlan,
     max_chars: usize,
     filters: &SearchFilters,
 ) -> String {
@@ -2540,8 +2631,8 @@ fn search_snippet(
         if hit_matches_excluded_provider_session(&section.hit, filters) {
             continue;
         }
-        if matches_terms(&section.text, &terms) {
-            return matched_snippet(&section.text, &terms, max_chars);
+        if plan.matches_text(&section.text) {
+            return matched_snippet(&section.text, plan, &terms, max_chars);
         }
     }
     if !record.body.trim().is_empty()
@@ -2554,20 +2645,108 @@ fn search_snippet(
     String::new()
 }
 
-fn matched_snippet(input: &str, terms: &[String], max_chars: usize) -> String {
+fn matched_snippet(
+    input: &str,
+    plan: &SearchQueryPlan,
+    terms: &[String],
+    max_chars: usize,
+) -> String {
     let body = input.trim();
     if body.is_empty() {
         return String::new();
     }
-    let lower = body.to_lowercase();
-    let start = terms
-        .iter()
-        .filter_map(|term| lower.find(term))
-        .min()
-        .unwrap_or(0);
+    let spans = token_spans(body);
+    let start = snippet_anchor(&spans, plan).unwrap_or_else(|| {
+        spans
+            .iter()
+            .filter(|span| terms.iter().any(|term| term == &span.term))
+            .map(|span| span.start)
+            .min()
+            .unwrap_or(0)
+    });
     let start = start.saturating_sub(max_chars / 4);
     let snippet = take_chars_from(body, start, max_chars);
     local_snippet(&snippet, max_chars)
+}
+
+fn snippet_anchor(spans: &[TokenSpan], plan: &SearchQueryPlan) -> Option<usize> {
+    for clause in &plan.clauses {
+        if clause.terms.is_empty() {
+            continue;
+        }
+        match plan.mode {
+            SearchMatchMode::Phrase => {
+                for window in spans.windows(clause.terms.len()) {
+                    if window
+                        .iter()
+                        .map(|span| span.term.as_str())
+                        .eq(clause.terms.iter().map(String::as_str))
+                    {
+                        let _phrase_end = window.last().map(|span| span.end);
+                        return Some(window[0].start);
+                    }
+                }
+            }
+            SearchMatchMode::All => {
+                if clause
+                    .terms
+                    .iter()
+                    .all(|term| spans.iter().any(|span| &span.term == term))
+                {
+                    return spans
+                        .iter()
+                        .find(|span| clause.terms.iter().any(|term| term == &span.term))
+                        .map(|span| span.start);
+                }
+            }
+            SearchMatchMode::Any => {
+                if let Some(span) = spans
+                    .iter()
+                    .find(|span| clause.terms.iter().any(|term| term == &span.term))
+                {
+                    return Some(span.start);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[derive(Debug)]
+struct TokenSpan {
+    term: String,
+    start: usize,
+    end: usize,
+}
+
+fn token_spans(input: &str) -> Vec<TokenSpan> {
+    let mut spans = Vec::new();
+    let mut term = String::new();
+    let mut start = 0usize;
+    for (char_index, ch) in input.chars().enumerate() {
+        if ch.is_alphanumeric() {
+            if term.is_empty() {
+                start = char_index;
+            }
+            for lower in ch.to_lowercase() {
+                term.push(lower);
+            }
+        } else if !term.is_empty() {
+            spans.push(TokenSpan {
+                term: std::mem::take(&mut term),
+                start,
+                end: char_index,
+            });
+        }
+    }
+    if !term.is_empty() {
+        spans.push(TokenSpan {
+            term,
+            start,
+            end: input.chars().count(),
+        });
+    }
+    spans
 }
 
 fn local_snippet(input: &str, max_chars: usize) -> String {
@@ -2671,6 +2850,244 @@ mod tests {
         (temp, store)
     }
 
+    fn insert_match_mode_corpus(store: &Store, event_count: i64) -> Vec<Uuid> {
+        let base_session_id = Uuid::parse_str("018f45d0-0000-7000-8000-000000001001").unwrap();
+        let filler_record = HistoryRecord::new(
+            "match mode filler",
+            "fallback body",
+            Vec::new(),
+            "agent_history",
+            Some("/workspace/match".into()),
+        );
+        store.insert_record(&filler_record).unwrap();
+        let filler_session = Session {
+            id: base_session_id,
+            history_record_id: Some(filler_record.id),
+            parent_session_id: None,
+            root_session_id: None,
+            capture_source_id: None,
+            provider: CaptureProvider::Codex,
+            external_session_id: Some("match-mode".into()),
+            external_agent_id: None,
+            agent_type: AgentType::Primary,
+            role_hint: Some("primary".into()),
+            is_primary: true,
+            status: SessionStatus::Imported,
+            transcript_blob_id: None,
+            started_at: fixed_time(),
+            ended_at: None,
+            timestamps: timestamps(),
+            sync: sync_metadata(),
+        };
+        store.upsert_session(&filler_session).unwrap();
+        let targets = [
+            "Alpha beta write_to_file OR NOT title:body star*",
+            "beta alpha write to file or not title body star",
+            "alpha only",
+            "Café résumé Δοκιμή 東京",
+            "rank apple",
+            "rank apple banana cherry",
+        ];
+        let mut target_ids = Vec::new();
+        for index in 0..event_count.max(targets.len() as i64) as u64 {
+            let is_target = (index as usize) < targets.len();
+            let (record_id, session_id) = if is_target {
+                let mut record = HistoryRecord::new(
+                    format!("match target {index}"),
+                    "target body",
+                    Vec::new(),
+                    "agent_history",
+                    Some("/workspace/match".into()),
+                );
+                record.id =
+                    Uuid::parse_str(&format!("018f45d0-0000-7000-8000-00000001{index:04x}"))
+                        .unwrap();
+                store.insert_record(&record).unwrap();
+                let mut sid_bytes = *base_session_id.as_bytes();
+                sid_bytes[15] = 0x80 + index as u8;
+                let session_id = Uuid::from_bytes(sid_bytes);
+                let mut session = filler_session.clone();
+                session.id = session_id;
+                session.history_record_id = Some(record.id);
+                store.upsert_session(&session).unwrap();
+                (record.id, session_id)
+            } else {
+                (filler_record.id, filler_session.id)
+            };
+            let mut bytes = *base_session_id.as_bytes();
+            bytes[12] = ((index >> 24) & 0xff) as u8;
+            bytes[13] = ((index >> 16) & 0xff) as u8;
+            bytes[14] = ((index >> 8) & 0xff) as u8;
+            bytes[15] = (index & 0xff) as u8;
+            let event_id = Uuid::from_bytes(bytes);
+            let text = targets
+                .get(index as usize)
+                .copied()
+                .unwrap_or("filler event");
+            if is_target {
+                target_ids.push(event_id);
+            }
+            store
+                .upsert_event(&Event {
+                    id: event_id,
+                    seq: index,
+                    history_record_id: Some(record_id),
+                    session_id: Some(session_id),
+                    run_id: None,
+                    event_type: EventType::Message,
+                    role: Some(EventRole::Assistant),
+                    occurred_at: fixed_time() + chrono::Duration::milliseconds(index as i64),
+                    capture_source_id: None,
+                    payload: serde_json::json!({"body": {"text": text}}),
+                    payload_blob_id: None,
+                    dedupe_key: Some(format!("match-mode-{index}")),
+                    redaction_state: RedactionState::SafePreview,
+                    sync: sync_metadata(),
+                })
+                .unwrap();
+        }
+        store.refresh_search_index().unwrap();
+        target_ids
+    }
+
+    fn event_ids_for(store: &Store, query: &str, mode: SearchMatchMode) -> Vec<Uuid> {
+        search_packet(
+            store,
+            query,
+            &PacketOptions {
+                limit: 10,
+                result_mode: SearchResultMode::Events,
+                match_mode: mode,
+                ..PacketOptions::default()
+            },
+        )
+        .unwrap()
+        .results
+        .into_iter()
+        .filter_map(|result| result.event_id)
+        .collect()
+    }
+
+    #[test]
+    fn match_modes_are_semantically_identical_below_at_and_above_fast_threshold() {
+        let mut baselines: Option<Vec<(String, SearchMatchMode, Vec<Uuid>)>> = None;
+        for count in [
+            LARGE_EVENT_CORPUS_THRESHOLD - 1,
+            LARGE_EVENT_CORPUS_THRESHOLD,
+            LARGE_EVENT_CORPUS_THRESHOLD + 1,
+        ] {
+            let (_temp, store) = test_store();
+            let target_ids = insert_match_mode_corpus(&store, count);
+            let cases = vec![
+                (
+                    "alpha beta".to_owned(),
+                    SearchMatchMode::All,
+                    vec![target_ids[0], target_ids[1]],
+                ),
+                (
+                    "alpha beta".to_owned(),
+                    SearchMatchMode::Phrase,
+                    vec![target_ids[0]],
+                ),
+                (
+                    "beta alpha".to_owned(),
+                    SearchMatchMode::Phrase,
+                    vec![target_ids[1]],
+                ),
+                (
+                    "alpha gamma".to_owned(),
+                    SearchMatchMode::Any,
+                    vec![target_ids[2], target_ids[0], target_ids[1]],
+                ),
+                (
+                    "write_to_file".to_owned(),
+                    SearchMatchMode::Phrase,
+                    vec![target_ids[0], target_ids[1]],
+                ),
+                (
+                    "OR NOT star* title:body".to_owned(),
+                    SearchMatchMode::All,
+                    vec![target_ids[0], target_ids[1]],
+                ),
+                (
+                    "café résumé δοκιμή 東京".to_owned(),
+                    SearchMatchMode::All,
+                    vec![target_ids[3]],
+                ),
+            ];
+            let observed = cases
+                .into_iter()
+                .map(|(query, mode, expected)| {
+                    let ids = event_ids_for(&store, &query, mode);
+                    for id in expected {
+                        assert!(
+                            ids.contains(&id),
+                            "count {count} query {query:?} missing {id}; got {ids:?}"
+                        );
+                    }
+                    (query, mode, ids)
+                })
+                .collect::<Vec<_>>();
+            if let Some(baselines) = &baselines {
+                assert_eq!(
+                    observed, *baselines,
+                    "semantic drift at event count {count}"
+                );
+            } else {
+                baselines = Some(observed);
+            }
+            let ranked = event_ids_for(&store, "rank apple banana cherry", SearchMatchMode::Any);
+            assert!(
+                ranked.iter().position(|id| *id == target_ids[5]).unwrap()
+                    < ranked.iter().position(|id| *id == target_ids[4]).unwrap(),
+                "multi-token any hit should outrank one-token hit at count {count}: {ranked:?}"
+            );
+            assert!(event_ids_for(&store, "cafe resume", SearchMatchMode::All).is_empty());
+        }
+    }
+
+    #[test]
+    fn large_event_fast_path_zero_hits_falls_back_to_record_sections() {
+        let (_temp, store) = test_store();
+        let record = HistoryRecord::new(
+            "title only fallbackneedle",
+            "body only match",
+            Vec::new(),
+            "note",
+            Some("/workspace/match".into()),
+        );
+        store.insert_record(&record).unwrap();
+        for index in 0..=LARGE_EVENT_CORPUS_THRESHOLD as u64 {
+            let mut bytes = *record.id.as_bytes();
+            bytes[12] = ((index >> 24) & 0xff) as u8;
+            bytes[13] = ((index >> 16) & 0xff) as u8;
+            bytes[14] = ((index >> 8) & 0xff) as u8;
+            bytes[15] = (index & 0xff) as u8;
+            store
+                .upsert_event(&Event {
+                    id: Uuid::from_bytes(bytes),
+                    seq: index,
+                    history_record_id: Some(record.id),
+                    session_id: None,
+                    run_id: None,
+                    event_type: EventType::Message,
+                    role: Some(EventRole::Assistant),
+                    occurred_at: fixed_time(),
+                    capture_source_id: None,
+                    payload: serde_json::json!({"body": {"text": "ordinary event"}}),
+                    payload_blob_id: None,
+                    dedupe_key: Some(format!("fallback-title-{index}")),
+                    redaction_state: RedactionState::SafePreview,
+                    sync: sync_metadata(),
+                })
+                .unwrap();
+        }
+        store.refresh_search_index().unwrap();
+        let packet = search_packet(&store, "fallbackneedle", &PacketOptions::default()).unwrap();
+        assert_eq!(packet.results.len(), 1);
+        assert_eq!(packet.results[0].record_id, record.id);
+    }
+
     #[test]
     fn local_snippets_preserve_transcript_text() {
         let snippet = display_snippet(
@@ -2681,6 +3098,27 @@ mod tests {
         assert!(snippet.contains("token=ghp_1234567890abcdef1234567890abcdef"));
         assert!(snippet.contains("password=hunter2"));
         assert!(!snippet.contains("[REDACTED"));
+    }
+
+    #[test]
+    fn matched_snippet_anchors_mode_aware_token_spans_without_byte_offsets() {
+        let phrase = SearchQueryPlan::new(SearchMatchMode::Phrase, ["needle phrase"]);
+        let snippet = matched_snippet(
+            "éééé early needle decoy ... later needle-phrase match",
+            &phrase,
+            &query_terms("needle phrase"),
+            40,
+        );
+        assert!(snippet.contains("needle-phrase"), "{snippet}");
+
+        let any = SearchQueryPlan::new(SearchMatchMode::Any, ["İİ x"]);
+        let snippet = matched_snippet(
+            "prefix 測試 測試 İİ x suffix",
+            &any,
+            &query_terms("İİ x"),
+            30,
+        );
+        assert!(snippet.contains("İİ") || snippet.contains('x'), "{snippet}");
     }
 
     #[test]
@@ -4733,6 +5171,7 @@ mod tests {
             snippet_chars: 180,
             filters: SearchFilters::default(),
             result_mode: SearchResultMode::Sessions,
+            match_mode: SearchMatchMode::All,
         };
         let search_started = std::time::Instant::now();
         let search = search_packet(&store, "syntheticneedle", &options).unwrap();
@@ -4820,6 +5259,7 @@ mod tests {
             snippet_chars: 320,
             filters: SearchFilters::default(),
             result_mode: SearchResultMode::Sessions,
+            match_mode: SearchMatchMode::All,
         };
         let filtered_search_options = PacketOptions {
             limit: 24,
@@ -4832,6 +5272,7 @@ mod tests {
                 ..SearchFilters::default()
             },
             result_mode: SearchResultMode::Sessions,
+            match_mode: SearchMatchMode::All,
         };
 
         let search_warmup = search_packet(&store, "perfneedle", &search_options).unwrap();

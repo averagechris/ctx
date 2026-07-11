@@ -7,6 +7,157 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchMatchMode {
+    #[default]
+    All,
+    Any,
+    Phrase,
+}
+
+impl SearchMatchMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Any => "any",
+            Self::Phrase => "phrase",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchQueryClause {
+    pub original: String,
+    pub terms: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchQueryPlan {
+    pub schema_version: u32,
+    pub mode: SearchMatchMode,
+    pub clauses: Vec<SearchQueryClause>,
+    pub within_clause_operator: String,
+    pub between_clause_operator: String,
+    pub filters_operator: String,
+}
+
+impl SearchQueryPlan {
+    pub fn new(mode: SearchMatchMode, clauses: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
+        let clauses = clauses
+            .into_iter()
+            .filter_map(|clause| {
+                let original = clause.as_ref().trim().to_owned();
+                if original.is_empty() {
+                    return None;
+                }
+                let mut terms = search_query_terms(&original);
+                if !matches!(mode, SearchMatchMode::Phrase) {
+                    let mut seen = std::collections::BTreeSet::new();
+                    terms.retain(|term| seen.insert(term.clone()));
+                }
+                Some(SearchQueryClause { terms, original })
+            })
+            .collect();
+        Self {
+            schema_version: 1,
+            mode,
+            clauses,
+            within_clause_operator: match mode {
+                SearchMatchMode::All => "AND",
+                SearchMatchMode::Any => "OR",
+                SearchMatchMode::Phrase => "ADJACENT_ORDERED",
+            }
+            .to_owned(),
+            between_clause_operator: "OR".to_owned(),
+            filters_operator: "AND".to_owned(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.clauses.iter().all(|clause| clause.terms.is_empty())
+    }
+
+    pub fn fts_match_query(&self) -> Option<String> {
+        let parts = self
+            .clauses
+            .iter()
+            .filter(|clause| !clause.terms.is_empty())
+            .map(|clause| match self.mode {
+                SearchMatchMode::All => clause
+                    .terms
+                    .iter()
+                    .map(|t| quote_fts_term(t))
+                    .collect::<Vec<_>>()
+                    .join(" AND "),
+                SearchMatchMode::Any => clause
+                    .terms
+                    .iter()
+                    .map(|t| quote_fts_term(t))
+                    .collect::<Vec<_>>()
+                    .join(" OR "),
+                SearchMatchMode::Phrase => quote_fts_term(&clause.terms.join(" ")),
+            })
+            .collect::<Vec<_>>();
+        (!parts.is_empty()).then(|| {
+            parts
+                .into_iter()
+                .map(|p| format!("({p})"))
+                .collect::<Vec<_>>()
+                .join(" OR ")
+        })
+    }
+
+    pub fn matches_text(&self, value: &str) -> bool {
+        let hay = search_query_terms(value);
+        self.clauses.iter().any(|clause| match self.mode {
+            SearchMatchMode::All => {
+                !clause.terms.is_empty() && clause.terms.iter().all(|t| hay.contains(t))
+            }
+            SearchMatchMode::Any => clause.terms.iter().any(|t| hay.contains(t)),
+            SearchMatchMode::Phrase => {
+                !clause.terms.is_empty()
+                    && hay
+                        .windows(clause.terms.len())
+                        .any(|w| w == clause.terms.as_slice())
+            }
+        })
+    }
+}
+
+impl Default for SearchQueryPlan {
+    fn default() -> Self {
+        Self::new(SearchMatchMode::All, std::iter::empty::<&str>())
+    }
+}
+
+fn quote_fts_term(term: &str) -> String {
+    format!("\"{}\"", term.replace('"', "\"\""))
+}
+
+/// Normalize search input into ctx's portable literal tokens. Unicode letters
+/// and numbers are token characters; punctuation such as `_`, `-`, `/`, `.`,
+/// quotes, and operator-looking text is a separator or a literal token. Words
+/// are Unicode-lowercased but ctx does not promise diacritic folding or
+/// canonical equivalence. Terms are never interpreted as raw FTS syntax.
+pub fn search_query_terms(query: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for ch in query.chars() {
+        if ch.is_alphanumeric() {
+            for lower in ch.to_lowercase() {
+                cur.push(lower);
+            }
+        } else if !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 #[derive(Debug, Error)]
 pub enum CoreError {
     #[error("could not determine a home directory for the default ctx data root")]
@@ -1814,6 +1965,39 @@ mod tests {
                 case["id"].as_str().unwrap()
             );
         }
+    }
+
+    #[test]
+    fn search_query_plan_defines_literal_punctuation_and_modes() {
+        assert_eq!(
+            search_query_terms("Foo-bar/write_to.file NEAR baz\"qux col:name * NOT"),
+            vec!["foo", "bar", "write", "to", "file", "near", "baz", "qux", "col", "name", "not"]
+        );
+        assert_eq!(
+            search_query_terms("Café cafe\u{301} straße STRASSE Δοκιμή 東京"),
+            vec!["café", "cafe", "straße", "strasse", "δοκιμή", "東京"]
+        );
+        let all = SearchQueryPlan::new(SearchMatchMode::All, ["Foo-bar"]);
+        assert!(all.matches_text("bar, then foo"));
+        assert!(!all.matches_text("foo only"));
+        assert_eq!(all.fts_match_query().unwrap(), "(\"foo\" AND \"bar\")");
+        assert!(
+            SearchQueryPlan::new(SearchMatchMode::All, ["write_to_file"])
+                .matches_text("write to file")
+        );
+
+        let any = SearchQueryPlan::new(SearchMatchMode::Any, ["Foo-bar"]);
+        assert!(any.matches_text("foo only"));
+        assert_eq!(any.fts_match_query().unwrap(), "(\"foo\" OR \"bar\")");
+
+        let phrase = SearchQueryPlan::new(SearchMatchMode::Phrase, ["Foo-bar"]);
+        assert!(phrase.matches_text("foo bar"));
+        assert!(!phrase.matches_text("bar foo"));
+        assert_eq!(phrase.fts_match_query().unwrap(), "(\"foo bar\")");
+
+        let repeated = SearchQueryPlan::new(SearchMatchMode::Phrase, ["a b", "c d"]);
+        assert_eq!(repeated.between_clause_operator, "OR");
+        assert!(repeated.matches_text("prefix c d suffix"));
     }
 
     #[test]

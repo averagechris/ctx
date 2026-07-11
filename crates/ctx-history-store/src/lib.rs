@@ -17,8 +17,8 @@ use ctx_history_core::{
     new_id, utc_now, AgentType, Artifact, ArtifactKind, CaptureProvider, CaptureSource,
     CaptureSourceDescriptor, CtxIdPrefix, EntityTimestamps, Event, EventRole, EventType, Fidelity,
     FileTouched, HistoryRecord, HistoryRecordLink, RedactionState, Run, RunStatus, RunType,
-    Session, SessionEdge, SessionHistoryArchive, SessionStatus, Summary, SyncCursor, SyncMetadata,
-    SyncState, VcsChange, VcsWorkspace, Visibility,
+    SearchMatchMode, SearchQueryPlan, Session, SessionEdge, SessionHistoryArchive, SessionStatus,
+    Summary, SyncCursor, SyncMetadata, SyncState, VcsChange, VcsWorkspace, Visibility,
 };
 
 pub const SOURCE_IMPORT_ZERO_YIELD_ANOMALY_CODE: &str = "zero_yield_anomaly";
@@ -3679,16 +3679,76 @@ impl Store {
         self.search_records_page(query, limit, 0)
     }
 
+    pub fn search_records_plan(
+        &self,
+        plan: &SearchQueryPlan,
+        limit: usize,
+    ) -> Result<Vec<HistoryRecord>> {
+        self.search_records_plan_page(plan, limit, 0)
+    }
+
+    pub fn search_records_plan_page(
+        &self,
+        plan: &SearchQueryPlan,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<HistoryRecord>> {
+        if plan.fts_match_query().is_none() {
+            return Ok(Vec::new());
+        }
+        if let Some(records) = self.search_records_fts_plan(plan, limit, offset)? {
+            return Ok(records);
+        }
+        let like_terms = plan
+            .clauses
+            .iter()
+            .flat_map(|clause| clause.terms.iter())
+            .collect::<Vec<_>>();
+        if like_terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut records = Vec::new();
+        let mut source_offset = 0usize;
+        let mut matched_seen = 0usize;
+        let page_size = limit.saturating_mul(20).max(100);
+        loop {
+            let page = self.list_records_page(page_size, source_offset)?;
+            let page_len = page.len();
+            for record in page {
+                if record_sections_match_plan(plan, &record) {
+                    if matched_seen < offset {
+                        matched_seen += 1;
+                        continue;
+                    }
+                    records.push(record);
+                    if records.len() >= limit {
+                        return Ok(records);
+                    }
+                }
+            }
+            if page_len < page_size {
+                break;
+            }
+            source_offset = source_offset.saturating_add(page_size);
+        }
+        Ok(records)
+    }
+
+    pub fn has_event_search_index(&self) -> Result<bool> {
+        table_exists(&self.conn, "event_search")
+    }
+
     pub fn search_records_page(
         &self,
         query: &str,
         limit: usize,
         offset: usize,
     ) -> Result<Vec<HistoryRecord>> {
-        if fts_match_query(query).is_none() {
+        let plan = SearchQueryPlan::new(SearchMatchMode::All, [query]);
+        if plan.fts_match_query().is_none() {
             return Ok(Vec::new());
         }
-        if let Some(records) = self.search_records_fts(query, limit, offset)? {
+        if let Some(records) = self.search_records_fts_plan(&plan, limit, offset)? {
             return Ok(records);
         }
         let like = format!("%{}%", query);
@@ -3702,16 +3762,16 @@ impl Store {
         collect_rows(rows)
     }
 
-    fn search_records_fts(
+    fn search_records_fts_plan(
         &self,
-        query: &str,
+        plan: &SearchQueryPlan,
         limit: usize,
         offset: usize,
     ) -> Result<Option<Vec<HistoryRecord>>> {
         if !table_exists(&self.conn, "ctx_history_search")? {
             return Ok(None);
         }
-        let Some(match_query) = fts_match_query(query) else {
+        let Some(match_query) = plan.fts_match_query() else {
             return Ok(Some(Vec::new()));
         };
         let has_event_search = table_exists(&self.conn, "event_search")?;
@@ -3819,16 +3879,35 @@ impl Store {
         self.search_event_hits_page(query, limit, 0)
     }
 
+    pub fn search_event_hits_plan_page(
+        &self,
+        plan: &SearchQueryPlan,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<EventSearchHit>> {
+        self.search_event_hits_page_inner(plan, limit, offset)
+    }
+
     pub fn search_event_hits_page(
         &self,
         query: &str,
         limit: usize,
         offset: usize,
     ) -> Result<Vec<EventSearchHit>> {
+        let plan = SearchQueryPlan::new(SearchMatchMode::All, [query]);
+        self.search_event_hits_page_inner(&plan, limit, offset)
+    }
+
+    fn search_event_hits_page_inner(
+        &self,
+        plan: &SearchQueryPlan,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<EventSearchHit>> {
         if !table_exists(&self.conn, "event_search")? {
             return Ok(Vec::new());
         }
-        let Some(match_query) = fts_match_query(query) else {
+        let Some(match_query) = plan.fts_match_query() else {
             return Ok(Vec::new());
         };
         let mut stmt = self.conn.prepare(
@@ -5546,18 +5625,14 @@ fn parse_provider_event_dedupe_key(dedupe_key: &str) -> Option<(String, String, 
     }
 }
 
-fn fts_match_query(query: &str) -> Option<String> {
-    let terms = query
-        .split_whitespace()
-        .map(|term| term.trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '-'))
-        .filter(|term| term.chars().any(char::is_alphanumeric))
-        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
-        .collect::<Vec<_>>();
-    if terms.is_empty() {
-        None
-    } else {
-        Some(terms.join(" AND "))
-    }
+fn record_sections_match_plan(plan: &SearchQueryPlan, record: &HistoryRecord) -> bool {
+    plan.matches_text(&record.title)
+        || plan.matches_text(&record.body)
+        || record.tags.iter().any(|tag| plan.matches_text(tag))
+        || record
+            .workspace
+            .as_deref()
+            .is_some_and(|workspace| plan.matches_text(workspace))
 }
 
 fn backfill_legacy_tables(conn: &Connection) -> Result<()> {
@@ -7805,6 +7880,130 @@ mod search_order_tests {
             .map(|record| record.id)
             .collect::<Vec<_>>();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn search_query_plan_literals_modes_and_unicode61_punctuation_match_fts() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let one = local_preview_event(
+            1,
+            "Alpha beta write_to_file OR NOT title:body star*",
+            RedactionState::SafePreview,
+        );
+        let two = local_preview_event(
+            2,
+            "beta alpha write to file or not title body star",
+            RedactionState::SafePreview,
+        );
+        let three = local_preview_event(3, "alpha only", RedactionState::SafePreview);
+        for event in [&one, &two, &three] {
+            store.upsert_event(event).unwrap();
+        }
+        store.refresh_search_index().unwrap();
+
+        let all = SearchQueryPlan::new(SearchMatchMode::All, ["alpha beta"]);
+        let all_ids = store
+            .search_event_hits_plan_page(&all, 10, 0)
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.event_id)
+            .collect::<Vec<_>>();
+        assert!(all_ids.contains(&one.id));
+        assert!(all_ids.contains(&two.id));
+        assert!(!all_ids.contains(&three.id));
+
+        let phrase = SearchQueryPlan::new(SearchMatchMode::Phrase, ["write_to_file"]);
+        let phrase_ids = store
+            .search_event_hits_plan_page(&phrase, 10, 0)
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.event_id)
+            .collect::<Vec<_>>();
+        assert!(phrase_ids.contains(&one.id));
+        assert!(phrase_ids.contains(&two.id));
+
+        let any = SearchQueryPlan::new(SearchMatchMode::Any, ["gamma alpha"]);
+        let any_ids = store
+            .search_event_hits_plan_page(&any, 10, 0)
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.event_id)
+            .collect::<Vec<_>>();
+        assert!(any_ids.contains(&three.id));
+
+        let operators = SearchQueryPlan::new(SearchMatchMode::All, ["OR NOT title:body star*"]);
+        let operator_ids = store
+            .search_event_hits_plan_page(&operators, 10, 0)
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.event_id)
+            .collect::<Vec<_>>();
+        assert!(operator_ids.contains(&one.id));
+        assert!(operator_ids.contains(&two.id));
+    }
+
+    #[test]
+    fn search_records_plan_no_fts_scans_past_early_non_matches_and_offsets_matches() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        store
+            .conn
+            .execute("DROP TABLE ctx_history_search", [])
+            .unwrap();
+        for index in 0..430 {
+            let body = if index == 425 {
+                "deep fallback needle"
+            } else {
+                "ordinary"
+            };
+            let mut record =
+                HistoryRecord::new(format!("record {index}"), body, Vec::new(), "note", None);
+            record.id =
+                Uuid::parse_str(&format!("018f45d0-0000-7000-8000-00000003{index:04x}")).unwrap();
+            record.created_at = fixed_time() + chrono::Duration::seconds(index as i64);
+            record.updated_at = record.created_at;
+            store.insert_record(&record).unwrap();
+        }
+        let plan = SearchQueryPlan::new(SearchMatchMode::All, ["deep fallback needle"]);
+        let hits = store.search_records_plan_page(&plan, 1, 0).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].body.contains("deep fallback needle"));
+        assert!(store
+            .search_records_plan_page(&plan, 1, 1)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn search_records_plan_no_fts_does_not_match_across_record_sections() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        store
+            .conn
+            .execute("DROP TABLE ctx_history_search", [])
+            .unwrap();
+        for index in 0..25 {
+            let mut record = HistoryRecord::new(
+                format!("alpha decoy {index}"),
+                "beta decoy",
+                Vec::new(),
+                "note",
+                None,
+            );
+            record.created_at = fixed_time() + chrono::Duration::seconds(index);
+            record.updated_at = record.created_at;
+            store.insert_record(&record).unwrap();
+        }
+        let mut valid =
+            HistoryRecord::new("valid", "alpha beta same section", Vec::new(), "note", None);
+        valid.created_at = fixed_time() + chrono::Duration::seconds(100);
+        valid.updated_at = valid.created_at;
+        store.insert_record(&valid).unwrap();
+        let plan = SearchQueryPlan::new(SearchMatchMode::All, ["alpha beta"]);
+        let hits = store.search_records_plan_page(&plan, 1, 0).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, valid.id);
     }
 
     #[test]

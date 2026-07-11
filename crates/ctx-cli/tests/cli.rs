@@ -327,9 +327,26 @@ fn json_output(command: &mut Command) -> Value {
     serde_json::from_slice(&output).unwrap()
 }
 
+fn sorted_dir_entries(path: &Path) -> Vec<String> {
+    let mut entries = fs::read_dir(path)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    entries.sort();
+    entries
+}
+
 fn failure_stderr(command: &mut Command) -> String {
     let stderr = command.assert().failure().get_output().stderr.clone();
     String::from_utf8(stderr).unwrap()
+}
+
+fn failure_output(command: &mut Command) -> (String, String) {
+    let output = command.assert().failure().get_output().clone();
+    (
+        String::from_utf8(output.stdout).unwrap(),
+        String::from_utf8(output.stderr).unwrap(),
+    )
 }
 
 fn mcp_roundtrip(temp: &TempDir, messages: &[Value]) -> Vec<Value> {
@@ -2046,7 +2063,8 @@ fn read_only_commands_direct_old_schemas_to_a_writable_migration() {
         "{stderr}"
     );
     assert!(
-        stderr.contains("run a writable command such as `ctx status` once to migrate"),
+        stderr
+            .contains("run a writable command such as `ctx setup` or `ctx import` once to migrate"),
         "{stderr}"
     );
 }
@@ -2074,8 +2092,8 @@ fn read_only_commands_reject_foreign_schemas_without_impossible_migration_advice
             "foreign version {version} must not be advertised as migratable: {stderr}"
         );
 
-        // A writable command refuses the foreign database too, and the
-        // rejection happens before any persistent PRAGMA: the file bytes
+        // Status refuses the foreign database too, and the rejection happens
+        // before any persistent PRAGMA: the file bytes
         // (header, schema, journal mode) stay exactly as a foreign binary
         // left them.
         ctx(&temp).args(["status"]).assert().failure();
@@ -2127,6 +2145,88 @@ fn mcp_status_reports_version_guidance_for_foreign_schema() {
     );
     assert!(error.contains("upgrade ctx"), "{error}");
     assert!(!error.contains("once to migrate"), "{error}");
+}
+
+#[test]
+fn mcp_non_status_tools_report_version_guidance_without_mutating() {
+    for version in [15i64, 16, 1001] {
+        let temp = tempdir();
+        let db_path = write_bare_store_with_user_version(&temp, version);
+        let bytes_before = fs::read(&db_path).unwrap();
+        let entries_before = sorted_dir_entries(temp.path());
+        let id = "00000000-0000-0000-0000-000000000001";
+        let responses = mcp_roundtrip(
+            &temp,
+            &[
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": { "name": "ctx-test", "version": "0" }
+                    }
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized"
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": { "name": "search", "arguments": { "query": "needle" } }
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": { "name": "sql", "arguments": { "sql": "SELECT 1" } }
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "tools/call",
+                    "params": { "name": "show_session", "arguments": { "ctx_session_id": id } }
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "tools/call",
+                    "params": { "name": "show_event", "arguments": { "ctx_event_id": id } }
+                }),
+            ],
+        );
+
+        assert_eq!(responses.len(), 5);
+        for response in &responses[1..] {
+            let result = &response["result"];
+            assert_eq!(result["isError"], true, "{response:#}");
+            let error = result["structuredContent"]["error"].as_str().unwrap();
+            if version == 15 {
+                assert!(
+                    error.contains("schema version 15 is older than this ctx binary"),
+                    "{error}"
+                );
+                assert!(
+                    error.contains("`ctx setup` or `ctx import` once to migrate"),
+                    "{error}"
+                );
+            } else {
+                assert!(
+                    error.contains(&format!(
+                        "schema version {version} is newer than or incompatible with this ctx binary"
+                    )),
+                    "{error}"
+                );
+                assert!(error.contains("upgrade ctx"), "{error}");
+                assert!(!error.contains("once to migrate"), "{error}");
+            }
+        }
+        assert_eq!(fs::read(&db_path).unwrap(), bytes_before);
+        assert_eq!(sorted_dir_entries(temp.path()), entries_before);
+    }
 }
 
 #[test]
@@ -2630,6 +2730,300 @@ fn doctor_reports_missing_store_without_creating_it() {
     assert!(
         !temp.path().join("work.sqlite").exists(),
         "doctor should not create the ctx store"
+    );
+}
+
+#[test]
+fn status_json_reports_storage_for_uninitialized_store_without_creating_files() {
+    let temp = tempdir();
+    fs::write(temp.path().join("work.sqlite-wal"), b"wal").unwrap();
+    fs::write(temp.path().join("work.sqlite-shm"), b"shm!").unwrap();
+
+    let status = json_output(ctx(&temp).args(["status", "--json"]));
+
+    assert_eq!(status["initialized"], false);
+    assert_eq!(status["private"], true);
+    assert_eq!(status["share_safe"], false);
+    assert_eq!(status["read_only"], true);
+    assert_eq!(status["storage"]["main_db_bytes"], 0);
+    assert_eq!(status["storage"]["wal_bytes"], 3);
+    assert_eq!(status["storage"]["shm_bytes"], 4);
+    assert!(
+        status["storage"]["available_space_bytes"].is_number()
+            || status["storage"]["available_space_bytes"].is_null()
+    );
+    assert!(!temp.path().join("work.sqlite").exists());
+}
+
+#[test]
+fn status_json_reports_storage_for_initialized_store_and_mcp_matches_counts() {
+    let temp = tempdir();
+    ctx(&temp)
+        .args(["setup", "--catalog-only"])
+        .assert()
+        .success();
+    fs::create_dir_all(temp.path().join("objects")).unwrap();
+    fs::write(temp.path().join("objects").join("blob"), b"object").unwrap();
+
+    let status = json_output(ctx(&temp).args(["status", "--json"]));
+    assert_eq!(status["initialized"], true);
+    assert!(status["storage"]["main_db_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(status["storage"]["objects_bytes"], 6);
+    assert!(status["storage"].get("sqlite").is_none());
+    assert!(
+        status["storage"]["total_data_root_bytes"].as_u64().unwrap()
+            >= status["storage"]["main_db_bytes"].as_u64().unwrap()
+    );
+
+    let responses = mcp_roundtrip(
+        &temp,
+        &[
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ctx-test","version":"0"}}}),
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"status","arguments":{}}}),
+        ],
+    );
+    let mcp_status = &responses.last().unwrap()["result"]["structuredContent"];
+    for key in [
+        "initialized",
+        "indexed_items",
+        "indexed_sessions",
+        "indexed_events",
+        "indexed_sources",
+        "cataloged_sessions",
+        "read_only",
+        "private",
+        "share_safe",
+    ] {
+        assert_eq!(mcp_status[key], status[key], "MCP status drift for {key}");
+    }
+    for key in [
+        "main_db_bytes",
+        "objects_bytes",
+        "spool_bytes",
+        "low_space",
+        "measurement_complete",
+    ] {
+        assert_eq!(
+            mcp_status["storage"][key], status["storage"][key],
+            "MCP storage drift for {key}"
+        );
+    }
+    assert!(
+        mcp_status["storage"]["total_data_root_bytes"]
+            .as_u64()
+            .unwrap()
+            >= mcp_status["storage"]["main_db_bytes"].as_u64().unwrap()
+    );
+}
+
+#[test]
+fn status_read_only_does_not_change_existing_store_mtime_and_doctor_storage_is_stdout_json() {
+    let temp = tempdir();
+    ctx(&temp)
+        .args(["setup", "--catalog-only"])
+        .assert()
+        .success();
+    let db = temp.path().join("work.sqlite");
+    let sidecars = [
+        temp.path().join("work.sqlite-wal"),
+        temp.path().join("work.sqlite-shm"),
+    ];
+    json_output(ctx(&temp).args(["status", "--json"]));
+    let entries_before = sorted_dir_entries(temp.path());
+    let db_mtime_before = fs::metadata(&db).unwrap().modified().unwrap();
+    let wal_mtime_before = sidecars[0]
+        .exists()
+        .then(|| fs::metadata(&sidecars[0]).unwrap().modified().unwrap());
+    let shm_exists_before = sidecars[1].exists();
+    std::thread::sleep(Duration::from_millis(1100));
+
+    json_output(ctx(&temp).args(["status", "--json"]));
+    let entries_after = sorted_dir_entries(temp.path());
+    let db_mtime_after = fs::metadata(&db).unwrap().modified().unwrap();
+    let wal_mtime_after = sidecars[0]
+        .exists()
+        .then(|| fs::metadata(&sidecars[0]).unwrap().modified().unwrap());
+    let shm_exists_after = sidecars[1].exists();
+    assert_eq!(
+        entries_before, entries_after,
+        "status must not create files"
+    );
+    assert_eq!(
+        db_mtime_before, db_mtime_after,
+        "status must not write to current-schema stores"
+    );
+    assert_eq!(
+        wal_mtime_before, wal_mtime_after,
+        "status must not mutate WAL contents"
+    );
+    assert_eq!(
+        shm_exists_before, shm_exists_after,
+        "status must not create or remove SHM sidecars"
+    );
+
+    let output = ctx(&temp)
+        .args(["doctor", "--storage", "--json", "--progress", "json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr.clone()).unwrap();
+    assert!(
+        stdout["storage"]["sqlite"]["logical_bytes"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(stdout["storage"]["storage"].is_null());
+    assert_eq!(
+        stdout["storage"]["external_provider_sources"]["bytes"],
+        Value::Null
+    );
+    assert_eq!(
+        stdout["storage"]["external_provider_sources"]["measured"],
+        false
+    );
+    assert_eq!(
+        stdout["storage"]["external_provider_sources"]["reason"],
+        "external_provider_sources_not_measured_read_only"
+    );
+    assert!(stderr.contains(r#""operation":"doctor""#));
+
+    let human = ctx(&temp)
+        .args(["doctor", "--storage", "--progress", "none"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let human = String::from_utf8(human).unwrap();
+    assert!(human.contains("storage_total:"));
+    assert!(human.contains("sqlite: live"));
+    assert!(human.contains("free_space:"));
+    assert!(!human.contains("{\"files\""));
+}
+
+#[test]
+fn doctor_storage_reports_fts_bytes_for_searchable_history_when_dbstat_is_available() {
+    let temp = tempdir();
+    let fixture = custom_history_fixture("basic.jsonl");
+    json_output(ctx(&temp).args([
+        "import",
+        "--format",
+        "ctx-history-jsonl-v1",
+        "--path",
+        &fixture,
+        "--json",
+        "--progress",
+        "none",
+    ]));
+
+    let doctor = json_output(ctx(&temp).args(["doctor", "--storage", "--json"]));
+    let sqlite = &doctor["storage"]["sqlite"];
+    assert_eq!(sqlite["fts_derived_bytes_available"], true);
+    assert!(
+        sqlite["fts_derived_bytes"].as_u64().unwrap() > 0,
+        "expected dbstat to measure FTS/shadow bytes: {doctor:#}"
+    );
+    let live = sqlite["live_bytes"].as_u64().unwrap();
+    let primary = sqlite["primary_live_bytes"].as_u64().unwrap();
+    let fts = sqlite["fts_derived_bytes"].as_u64().unwrap();
+    let reclaimable = sqlite["freelist_reclaimable_bytes"].as_u64().unwrap();
+    let logical = sqlite["logical_bytes"].as_u64().unwrap();
+    assert_eq!(primary + fts, live);
+    assert_eq!(live + reclaimable, logical);
+
+    let human = ctx(&temp)
+        .args(["doctor", "--storage", "--progress", "none"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let human = String::from_utf8(human).unwrap();
+    assert!(human.contains("primary_live"));
+}
+
+#[test]
+fn status_old_schema_fails_without_migrating() {
+    let temp = tempdir();
+    let db = temp.path().join("work.sqlite");
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch("PRAGMA user_version = 14;").unwrap();
+    drop(conn);
+
+    let (_stdout, stderr) = failure_output(ctx(&temp).args(["status", "--json"]));
+
+    assert!(stderr.contains("schema version 14 is older than this ctx binary"));
+    assert!(stderr.contains("ctx setup") || stderr.contains("ctx import"));
+    let version: i64 = Connection::open(&db)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 14, "status must not migrate old schemas");
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_storage_reports_insecure_permissions_without_mutating() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir();
+    ctx(&temp)
+        .args(["setup", "--catalog-only"])
+        .assert()
+        .success();
+    let root_mode = fs::metadata(temp.path()).unwrap().permissions().mode() & 0o777;
+    let db = temp.path().join("work.sqlite");
+    let db_mode = fs::metadata(&db).unwrap().permissions().mode() & 0o777;
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&db, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let doctor = json_output(ctx(&temp).args(["doctor", "--storage", "--json"]));
+
+    fs::set_permissions(&db, fs::Permissions::from_mode(db_mode)).unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(root_mode)).unwrap();
+    assert_eq!(doctor["ok"], false);
+    let findings = doctor["findings"].as_array().unwrap();
+    assert!(findings.iter().any(|f| f
+        .as_str()
+        .unwrap()
+        .contains("insecure data-root directory permissions")));
+    assert!(findings.iter().any(|f| f
+        .as_str()
+        .unwrap()
+        .contains("insecure ctx storage file permissions")));
+}
+
+#[test]
+fn status_read_only_sees_committed_rows_in_live_wal() {
+    let temp = tempdir();
+    ctx(&temp)
+        .args(["setup", "--catalog-only"])
+        .assert()
+        .success();
+    let before = json_output(ctx(&temp).args(["status", "--json"]));
+    let before_sources = before["indexed_sources"].as_u64().unwrap();
+
+    let db = temp.path().join("work.sqlite");
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO capture_sources \
+         (id, kind, provider, machine_id, process_id, cwd, raw_source_path, external_session_id, started_at_ms, ended_at_ms, fidelity, metadata_json) \
+         VALUES (?1, 'manual', 'custom', 'machine', NULL, NULL, NULL, NULL, 1, NULL, 'imported', '{}')",
+        params!["wal-visible-source"],
+    )
+    .unwrap();
+    assert!(temp.path().join("work.sqlite-wal").exists());
+
+    let after = json_output(ctx(&temp).args(["status", "--json"]));
+    assert_eq!(
+        after["indexed_sources"].as_u64().unwrap(),
+        before_sources + 1
     );
 }
 

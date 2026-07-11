@@ -59,7 +59,7 @@ This table describes core command effects.
 | Command | Reads | Writes |
 | --- | --- | --- |
 | `ctx setup` | provider transcript files and home path metadata for source discovery | data root, `work.sqlite`, `config.toml`, and SQLite index |
-| `ctx status` | data root metadata and existing SQLite store | none |
+| `ctx status` | data root metadata, existing SQLite store, file sizes, filesystem free-space probe | none |
 | `ctx sources` | known provider paths under the user's home and local history-source plugin manifests | none |
 | `ctx import` | provider transcript files and path metadata, the explicit custom history JSONL file passed with `--format ctx-history-jsonl-v1 --path`, or stdout from an explicit history-source plugin command | data root, `config.toml` if missing, and SQLite index |
 | `ctx show` | SQLite index | selected `--out` path for `show session` when provided |
@@ -67,7 +67,22 @@ This table describes core command effects.
 | `ctx search` | native provider transcript files, path metadata, enabled auto history-source plugin stdout, and SQLite index | SQLite index for newly discovered native provider or plugin history |
 | `ctx sql` | existing SQLite index only | none |
 | `ctx docs` | embedded documentation in the binary | selected topic `--out` path for `ctx docs show --out` or selected `--out` directory for `ctx docs man --out` |
-| `ctx doctor` | SQLite index and data root metadata | none |
+| `ctx doctor --storage` | SQLite index, data root metadata, file sizes, SQLite page/freelist metrics | none |
+
+`ctx status` and `ctx doctor --storage` do not migrate schemas, import history,
+checkpoint WAL files, vacuum, optimize, or write growth-tracking state. They use
+plain SQLite read-only opens so committed rows in a live WAL remain visible;
+SQLite may still coordinate through SHM while preserving database/WAL logical
+content. If an existing database cannot be opened or counted read-only, status
+returns an error rather than reporting zero counts.
+
+Storage status reports logical file sizes, not allocated disk blocks. Deep
+storage diagnostics distinguish SQLite logical bytes (`page_size * page_count`),
+total live bytes, primary live bytes, freelist/reclaimable bytes, and
+FTS-derived bytes via `dbstat` when available. Missing `dbstat` or filesystem free-space support is a
+bounded diagnostic, not a fatal error. Low-space thresholds are documented as
+512 MiB warning and 128 MiB critical because imports and SQLite maintenance may
+need temporary working space in addition to the final database footprint.
 
 Setup, import, and search do not require source repository writes, model APIs,
 API keys, or remote accounts.
@@ -129,9 +144,9 @@ cannot reconstruct text that was already stored as a placeholder.
 This fork's first schema change (version 1000) is different: it only adds
 internal search-rowid map tables and rebuilds or reimports nothing. Existing
 search data is untouched and the maps fill in lazily as rows are next written.
-The migration runs on the first *writable* open — `ctx status`, `ctx setup`,
-or `ctx import` — and read-only commands such as `ctx sql` and `ctx mcp`
-refuse to run until that has happened. Once migrated, the store can no longer
+The migration runs on the first *writable* open, such as `ctx setup` or
+`ctx import`. Read-only commands such as `ctx status`, `ctx doctor`, `ctx sql`,
+and `ctx mcp` refuse to run until that has happened. Once migrated, the store can no longer
 be opened by older ctx binaries (they report an unsupported schema version).
 The open-time version check cannot stop an instance of ctx that was already
 running before the upgrade, so restart long-lived ctx instances — an MCP
@@ -181,8 +196,8 @@ does not express, such as exact counts, joins, audits, and one-off scripts. It
 opens the existing SQLite store in read-only mode, rejects writes, rejects
 multiple statements, enforces row/column/value caps, and times out long-running
 queries. It also applies SQLite runtime limits to bound SQL text and generated
-value allocation. It does not initialize or migrate the store; run `ctx
-status`, `ctx setup`, or `ctx import` first when a schema migration is required.
+value allocation. It does not initialize or migrate the store; run `ctx setup`
+or `ctx import` first when a schema migration is required.
 
 Stable read-only views are the preferred compatibility surface:
 

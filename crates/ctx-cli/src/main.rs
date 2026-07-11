@@ -44,14 +44,14 @@ use ctx_history_capture::{
 };
 use ctx_history_core::{
     database_path, default_data_root, utc_now, CaptureProvider, ContextCitation,
-    ContextCitationType, CtxHistoryJsonlRecord, Event, EventRole, EventType, HistoryRecord,
-    ProviderRawRetention, RedactionState, Session,
+    ContextCitationType, CtxHistoryJsonlRecord, CtxIdPrefix, Event, EventRole, EventType,
+    HistoryRecord, ProviderRawRetention, RedactionState, Session,
 };
 use ctx_history_store::{
-    CatalogSession, CatalogSourceIndexUpdate, RawSqlOptions, RawSqlResult, RawSqlValue,
-    SourceImportFile, SourceImportFileIndexUpdate, Store, StoreError, RAW_SQL_DEFAULT_MAX_COLUMNS,
-    RAW_SQL_DEFAULT_MAX_ROWS, RAW_SQL_DEFAULT_MAX_SQL_BYTES, RAW_SQL_DEFAULT_MAX_VALUE_BYTES,
-    RAW_SQL_MAX_TIMEOUT,
+    CatalogSession, CatalogSourceIndexUpdate, IdPrefixResolution, RawSqlOptions, RawSqlResult,
+    RawSqlValue, SourceImportFile, SourceImportFileIndexUpdate, Store, StoreError,
+    RAW_SQL_DEFAULT_MAX_COLUMNS, RAW_SQL_DEFAULT_MAX_ROWS, RAW_SQL_DEFAULT_MAX_SQL_BYTES,
+    RAW_SQL_DEFAULT_MAX_VALUE_BYTES, RAW_SQL_MAX_TIMEOUT,
 };
 use history_source_plugins::{
     discover_history_source_plugins, discover_history_source_plugins_with_diagnostics,
@@ -174,7 +174,7 @@ enum ShowTarget {
 
 #[derive(Debug, Args)]
 struct ShowSessionArgs {
-    #[arg(help = "ctx session id or unambiguous id prefix")]
+    #[arg(help = "ctx session UUID or unambiguous 8+ hex UUID prefix (compact or canonical)")]
     id: Option<String>,
     #[arg(long, value_enum)]
     provider: Option<ProviderArg>,
@@ -192,7 +192,7 @@ struct ShowSessionArgs {
 
 #[derive(Debug, Args)]
 struct ShowEventArgs {
-    #[arg(help = "ctx event id or unambiguous id prefix")]
+    #[arg(help = "ctx event UUID or unambiguous 8+ hex UUID prefix (compact or canonical)")]
     id: String,
     #[arg(long, default_value_t = 0)]
     before: usize,
@@ -222,7 +222,7 @@ enum LocateTarget {
 
 #[derive(Debug, Args)]
 struct LocateSessionArgs {
-    #[arg(help = "ctx session id or unambiguous id prefix")]
+    #[arg(help = "ctx session UUID or unambiguous 8+ hex UUID prefix (compact or canonical)")]
     id: Option<String>,
     #[arg(long, value_enum)]
     provider: Option<ProviderArg>,
@@ -236,7 +236,7 @@ struct LocateSessionArgs {
 
 #[derive(Debug, Args)]
 struct LocateEventArgs {
-    #[arg(help = "ctx event id or unambiguous id prefix")]
+    #[arg(help = "ctx event UUID or unambiguous 8+ hex UUID prefix (compact or canonical)")]
     id: String,
     #[arg(long, value_enum, default_value_t = LocateFormat::Text)]
     format: LocateFormat,
@@ -2892,22 +2892,19 @@ fn push_session_metadata_markdown(
 }
 
 fn resolve_session_by_id_text(store: &Store, value: &str) -> Result<Session> {
-    if let Ok(id) = Uuid::parse_str(value.trim()) {
+    let prefix = parse_id_prefix(value, "session")?;
+    if let Some(id) = prefix.full_uuid() {
         return store.get_session(id).with_context(|| {
             format!("session {id} was not found; rerun the search that found it with `--verbose` to get ctx_session_id")
         });
     }
-    let prefix = normalize_uuid_prefix(value, "session")?;
-    match store.sessions_by_id_prefix(&prefix)?.as_slice() {
-        [session] => Ok(session.clone()),
-        [] => Err(anyhow!(
-            "session id prefix {prefix:?} was not found; rerun the search that found it with `--verbose` to get ctx_session_id"
+    match store.resolve_session_by_id_prefix(&prefix)? {
+        IdPrefixResolution::Found(session) => Ok(session),
+        IdPrefixResolution::NotFound => Err(anyhow!(
+            "session id prefix {:?} was not found; rerun the search that found it with `--verbose` to get ctx_session_id",
+            prefix.canonical()
         )),
-        matches => Err(anyhow!(
-            "session id prefix {prefix:?} is ambiguous; first matches are {} and {}; use a longer ctx_session_id",
-            matches[0].id,
-            matches[1].id
-        )),
+        IdPrefixResolution::Ambiguous(ambiguity) => Err(anyhow!(ambiguity.message("session", &prefix))),
     }
 }
 
@@ -2916,40 +2913,26 @@ fn resolve_session_id(store: &Store, value: &str) -> Result<Uuid> {
 }
 
 fn resolve_event(store: &Store, value: &str) -> Result<Event> {
-    if let Ok(id) = Uuid::parse_str(value.trim()) {
+    let prefix = parse_id_prefix(value, "event")?;
+    if let Some(id) = prefix.full_uuid() {
         return store.get_event(id).with_context(|| {
             format!(
                 "event {id} was not found; rerun the event search with `--events --verbose` to get ctx_event_id"
             )
         });
     }
-    let prefix = normalize_uuid_prefix(value, "event")?;
-    match store.events_by_id_prefix(&prefix)?.as_slice() {
-        [event] => Ok(event.clone()),
-        [] => Err(anyhow!(
-            "event id prefix {prefix:?} was not found; rerun the event search with `--events --verbose` to get ctx_event_id"
+    match store.resolve_event_by_id_prefix(&prefix)? {
+        IdPrefixResolution::Found(event) => Ok(event),
+        IdPrefixResolution::NotFound => Err(anyhow!(
+            "event id prefix {:?} was not found; rerun the event search with `--events --verbose` to get ctx_event_id",
+            prefix.canonical()
         )),
-        matches => Err(anyhow!(
-            "event id prefix {prefix:?} is ambiguous; first matches are {} and {}; use a longer ctx_event_id",
-            matches[0].id,
-            matches[1].id
-        )),
+        IdPrefixResolution::Ambiguous(ambiguity) => Err(anyhow!(ambiguity.message("event", &prefix))),
     }
 }
 
-fn normalize_uuid_prefix(value: &str, kind: &str) -> Result<String> {
-    let prefix = value.trim();
-    if prefix.len() < 8 {
-        return Err(anyhow!(
-            "{kind} id prefix must be at least 8 hex characters, or pass a full ctx UUID"
-        ));
-    }
-    if prefix.contains('-') || !prefix.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        return Err(anyhow!(
-            "{kind} id must be a full ctx UUID or an unambiguous hex prefix from verbose search output"
-        ));
-    }
-    Ok(prefix.to_ascii_lowercase())
+fn parse_id_prefix(value: &str, kind: &str) -> Result<CtxIdPrefix> {
+    CtxIdPrefix::parse(value).map_err(|err| anyhow!("{kind} {err}"))
 }
 
 fn push_event_text_block(out: &mut String, event: &Event) {

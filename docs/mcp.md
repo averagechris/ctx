@@ -18,6 +18,13 @@ The server exposes these tools:
 - `show_event`, return an indexed event and optional surrounding window by ctx
   event ID.
 
+MCP `search.session`, `show_session.ctx_session_id`, and
+`show_event.ctx_event_id` accept the same ctx-owned ID spellings as compatible
+CLI commands: full UUIDs, case-insensitive compact prefixes with at least 8 hex
+digits, and canonical-hyphenated prefixes (including a trailing canonical
+separator such as `abcdef12-`). Hyphens must appear only in canonical UUID
+positions.
+
 MCP search and SQL query the existing index only. They do not refresh provider
 history, import files, initialize storage, or write provider data.
 

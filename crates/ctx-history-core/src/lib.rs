@@ -20,8 +20,203 @@ pub enum CoreError {
 
 pub type Result<T> = std::result::Result<T, CoreError>;
 
+pub const MIN_UUID_PREFIX_HEX_DIGITS: usize = 8;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CtxIdPrefix {
+    canonical: String,
+    hex: String,
+    hex_digits: usize,
+    full: Option<Uuid>,
+}
+
+impl CtxIdPrefix {
+    pub fn parse(value: &str) -> std::result::Result<Self, CtxIdPrefixError> {
+        let value = value.trim();
+        if let Ok(id) = Uuid::parse_str(value) {
+            let canonical = id.to_string();
+            let hex = canonical.replace('-', "");
+            return Ok(Self {
+                canonical,
+                hex,
+                hex_digits: 32,
+                full: Some(id),
+            });
+        }
+        let has_separator = value.contains('-');
+        let mut hex = String::with_capacity(32);
+
+        for (idx, ch) in value.chars().enumerate() {
+            if ch == '-' {
+                if !matches!(idx, 8 | 13 | 18 | 23) {
+                    return Err(CtxIdPrefixError::MalformedSeparator);
+                }
+                continue;
+            }
+            if !ch.is_ascii_hexdigit() {
+                return Err(CtxIdPrefixError::NonHex);
+            }
+            hex.push(ch.to_ascii_lowercase());
+            if hex.len() > 32 {
+                return Err(CtxIdPrefixError::TooLong);
+            }
+        }
+
+        if hex.len() < MIN_UUID_PREFIX_HEX_DIGITS {
+            return Err(CtxIdPrefixError::TooShort {
+                hex_digits: hex.len(),
+            });
+        }
+
+        let mut canonical = canonical_uuid_prefix_from_hex(&hex);
+        if has_separator && value.ends_with('-') && matches!(hex.len(), 8 | 12 | 16 | 20) {
+            canonical.push('-');
+        }
+        if has_separator && value.to_ascii_lowercase() != canonical {
+            return Err(CtxIdPrefixError::MalformedSeparator);
+        }
+        let full = (hex.len() == 32)
+            .then(|| Uuid::parse_str(&canonical))
+            .transpose()?;
+        Ok(Self {
+            canonical,
+            hex_digits: hex.len(),
+            hex,
+            full,
+        })
+    }
+
+    pub fn canonical(&self) -> &str {
+        &self.canonical
+    }
+    pub fn hex(&self) -> &str {
+        &self.hex
+    }
+    pub fn hex_digits(&self) -> usize {
+        self.hex_digits
+    }
+    pub fn full_uuid(&self) -> Option<Uuid> {
+        self.full
+    }
+}
+
+fn canonical_uuid_prefix_from_hex(hex: &str) -> String {
+    let mut out = String::with_capacity(36);
+    for (idx, ch) in hex.chars().enumerate() {
+        if matches!(idx, 8 | 12 | 16 | 20) {
+            out.push('-');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum CtxIdPrefixError {
+    #[error(
+        "id prefix must include at least 8 hex digits; for example: 12345678 or 12345678-1234"
+    )]
+    TooShort { hex_digits: usize },
+    #[error("id prefix contains non-hex characters; use 0-9, a-f, or canonical UUID hyphens")]
+    NonHex,
+    #[error("id prefix hyphens must appear only in canonical UUID positions and match the canonical UUID spelling")]
+    MalformedSeparator,
+    #[error("id prefix is longer than a UUID")]
+    TooLong,
+    #[error("invalid full UUID: {0}")]
+    InvalidUuid(#[from] uuid::Error),
+}
+
 pub fn utc_now() -> DateTime<Utc> {
     DateTime::<Utc>::from(SystemTime::now())
+}
+
+#[cfg(test)]
+mod ctx_id_prefix_tests {
+    use super::{CtxIdPrefix, CtxIdPrefixError};
+
+    #[test]
+    fn parses_compact_and_canonical_uuid_prefixes() {
+        assert_eq!(
+            CtxIdPrefix::parse("ABCDEF12").unwrap().canonical(),
+            "abcdef12"
+        );
+        assert_eq!(
+            CtxIdPrefix::parse("abcdef123").unwrap().canonical(),
+            "abcdef12-3"
+        );
+        assert_eq!(
+            CtxIdPrefix::parse("abcdef12-3").unwrap().canonical(),
+            "abcdef12-3"
+        );
+        assert_eq!(
+            CtxIdPrefix::parse("abcdef12-").unwrap().canonical(),
+            "abcdef12-"
+        );
+        for (input, canonical) in [
+            ("abcdef12-", "abcdef12-"),
+            ("abcdef12-1234-", "abcdef12-1234-"),
+            ("abcdef12-1234-5678-", "abcdef12-1234-5678-"),
+            ("abcdef12-1234-5678-90ab-", "abcdef12-1234-5678-90ab-"),
+        ] {
+            assert_eq!(CtxIdPrefix::parse(input).unwrap().canonical(), canonical);
+        }
+        assert_eq!(
+            CtxIdPrefix::parse("abcdef12-1234-5678-90ab-cdefabcdef1")
+                .unwrap()
+                .hex_digits(),
+            31
+        );
+        assert!(CtxIdPrefix::parse("abcdef12-1234-5678-90ab-cdefabcdef12")
+            .unwrap()
+            .full_uuid()
+            .is_some());
+    }
+
+    #[test]
+    fn parses_all_full_uuid_spellings_before_prefix_validation() {
+        let canonical = "abcdef12-1234-5678-90ab-cdefabcdef12";
+        for input in [
+            canonical,
+            "ABCDEF12-1234-5678-90AB-CDEFABCDEF12",
+            "abcdef121234567890abcdefabcdef12",
+            "{abcdef12-1234-5678-90ab-cdefabcdef12}",
+            "urn:uuid:abcdef12-1234-5678-90ab-cdefabcdef12",
+        ] {
+            let parsed = CtxIdPrefix::parse(input).unwrap();
+            assert_eq!(parsed.canonical(), canonical);
+            assert_eq!(parsed.hex_digits(), 32);
+            assert!(parsed.full_uuid().is_some());
+        }
+    }
+
+    #[test]
+    fn rejects_short_nonhex_and_bad_hyphens() {
+        assert!(matches!(
+            CtxIdPrefix::parse("abcd"),
+            Err(CtxIdPrefixError::TooShort { .. })
+        ));
+        assert!(matches!(
+            CtxIdPrefix::parse("abcdef1z"),
+            Err(CtxIdPrefixError::NonHex)
+        ));
+        assert!(matches!(
+            CtxIdPrefix::parse("abcd-ef12"),
+            Err(CtxIdPrefixError::MalformedSeparator)
+        ));
+        assert!(matches!(
+            CtxIdPrefix::parse("abcdef12--"),
+            Err(CtxIdPrefixError::MalformedSeparator)
+        ));
+        assert!(matches!(
+            CtxIdPrefix::parse("abcdef12-12345"),
+            Err(CtxIdPrefixError::MalformedSeparator)
+        ));
+        assert!(matches!(
+            CtxIdPrefix::parse("abcdef12-1234-5678-90ab-cdefabcdef123"),
+            Err(CtxIdPrefixError::TooLong)
+        ));
+    }
 }
 
 macro_rules! text_enum {

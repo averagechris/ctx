@@ -114,6 +114,13 @@ produces zero events, the import reports a loud schema-mismatch failure
 instead of silently succeeding. Import notes (`ctx import --json` `notes`
 field) explain everything that was skipped and why.
 
+All providers share the additive import-health report fields documented in the
+JSON contract. `zero_yield_anomaly` is reserved for a non-empty source that
+imports no sessions, events, or edges and has no adapter-provided failure,
+skip, empty, or safe plugin cursor-only reason. Existing manifested source-file
+ledgers persist that stable code path-free for `ctx doctor`; providers imported
+without that ledger surface the anomaly only in the current import report.
+
 ### Cursor format and migration
 
 Adapter sync cursors are prefixed `opencode-v2:`

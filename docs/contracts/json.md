@@ -119,8 +119,36 @@ Writes the local SQLite index and returns:
 - `sources[]`.
 
 `totals` and each source row include file, byte, session, event, edge, skipped,
-and failed counts. `resume_mode` is currently `idempotent_rescan` when
-`--resume` is passed and `normal_scan` otherwise.
+and failed counts. `totals.zero_yield_anomaly_sources` counts source rows with
+one or more zero-yield anomalies. Per-source `health.reason_counts.zero_yield_anomaly`
+counts exact known import units where the importer can attribute them; otherwise
+ctx reports only the source-level anomaly. Each source row includes
+additive `health.classification` and `health.reason_counts` fields plus
+`skipped_reasons`. Classifications currently emitted are `success`,
+`partial_success`, `unchanged`, `all_skipped`, `empty`,
+`unsupported_or_malformed`, `zero_yield_anomaly`, and `failed`, but consumers
+must ignore unknown future values. Skip reason precision is limited by existing
+adapter ledgers; when only an aggregate skip count is available, ctx reports the
+stable `unspecified` reason instead of inferring from messages.
+`scanned_files` and `scanned_bytes` are pre-import observed regular-file
+inventory measurements from source discovery, not parser-consumed record counts.
+
+`zero_yield_anomaly` means a non-empty source produced zero imported sessions,
+events, and edges, with no failures, no known-safe skips, and no explicit empty
+or cursor-only result. It is not used for idempotent/all-skipped repeat imports,
+genuinely empty discovery, malformed/failed sources, or history-source plugin
+validated plugin cursor-only updates (`plugin_cursor_only`). `ctx import` still exits successfully by default and
+writes one valid JSON report to stdout; path/content-free anomaly warnings are
+written to stderr. `ctx import --strict` prints the same complete report first,
+then exits nonzero (runtime exit code 1) if any `zero_yield_anomaly` was found.
+`resume_mode` is currently `idempotent_rescan` when `--resume` is passed and
+`normal_scan` otherwise.
+
+`ctx doctor --json` includes additive `import_health` diagnostics. In this
+no-schema slice, `import_health.ledger_backed_zero_yield_anomalies` covers only
+stable anomaly codes persisted by existing manifested `source_import_files` and
+`catalog_sessions` ledgers; it is not universal historical coverage for custom,
+plugin, or unmanifested imports.
 
 ## Progress
 
@@ -274,8 +302,8 @@ external publication.
 `freshness` describes the pre-search refresh attempt:
 
 - `mode`, one of `auto`, `off`, or `strict`;
-- `status`, such as `completed`, `skipped`, `no_sources`,
-  `skipped_large_index`, or `failed`;
+- `status`, such as `completed`, `degraded_zero_yield`, `skipped`,
+  `no_sources`, `skipped_large_index`, or `failed`;
 - `source_count`;
 - `totals`, using the same import total fields as `ctx import --json`;
 - `error`, present when refresh failed but results were still served.

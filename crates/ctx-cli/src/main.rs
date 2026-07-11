@@ -51,8 +51,9 @@ use ctx_history_core::{
 use ctx_history_store::{
     CatalogSession, CatalogSourceIndexUpdate, IdPrefixResolution, RawSqlOptions, RawSqlResult,
     RawSqlValue, SourceImportFile, SourceImportFileIndexUpdate, Store, StoreError,
-    RAW_SQL_DEFAULT_MAX_COLUMNS, RAW_SQL_DEFAULT_MAX_ROWS, RAW_SQL_DEFAULT_MAX_SQL_BYTES,
-    RAW_SQL_DEFAULT_MAX_VALUE_BYTES, RAW_SQL_MAX_TIMEOUT,
+    CATALOG_IMPORT_OUTCOME_UNATTRIBUTED_CODE, RAW_SQL_DEFAULT_MAX_COLUMNS,
+    RAW_SQL_DEFAULT_MAX_ROWS, RAW_SQL_DEFAULT_MAX_SQL_BYTES, RAW_SQL_DEFAULT_MAX_VALUE_BYTES,
+    RAW_SQL_MAX_TIMEOUT, SOURCE_IMPORT_ZERO_YIELD_ANOMALY_CODE,
 };
 use history_source_plugins::{
     discover_history_source_plugins, discover_history_source_plugins_with_diagnostics,
@@ -157,6 +158,11 @@ struct ImportArgs {
     resume: bool,
     #[arg(long)]
     json: bool,
+    #[arg(
+        long,
+        help = "Exit nonzero after reporting if import health detects a zero-yield anomaly"
+    )]
+    strict: bool,
     #[arg(long, value_enum, default_value_t = ProgressArg::Auto)]
     progress: ProgressArg,
 }
@@ -723,13 +729,73 @@ struct ImportTotals {
     imported_edges: usize,
     skipped: usize,
     failed: usize,
+    zero_yield_anomaly_sources: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportHealthClassification {
+    Success,
+    PartialSuccess,
+    Unchanged,
+    AllSkipped,
+    Empty,
+    UnsupportedOrMalformed,
+    ZeroYieldAnomaly,
+    Failed,
+}
+
+impl ImportHealthClassification {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::PartialSuccess => "partial_success",
+            Self::Unchanged => "unchanged",
+            Self::AllSkipped => "all_skipped",
+            Self::Empty => "empty",
+            Self::UnsupportedOrMalformed => "unsupported_or_malformed",
+            Self::ZeroYieldAnomaly => "zero_yield_anomaly",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ImportHealth {
+    classification: ImportHealthClassification,
+    reason_counts: Value,
+    zero_yield_anomaly_count: usize,
+}
+
+impl ImportHealth {
+    fn zero_yield_anomaly(&self) -> bool {
+        self.zero_yield_anomaly_count > 0
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "classification": self.classification.as_str(),
+            "reason_counts": self.reason_counts.clone(),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ImportSourceReport {
+    health: ImportHealth,
+    json: Value,
+}
+
+struct HistorySourcePluginImportOutcome {
+    summary: ProviderImportSummary,
+    stats: SourceStats,
+    source_only: bool,
 }
 
 #[derive(Debug)]
 struct ImportReport {
     resume: bool,
     totals: ImportTotals,
-    sources: Vec<Value>,
+    sources: Vec<ImportSourceReport>,
 }
 
 impl ImportReport {
@@ -743,6 +809,18 @@ impl ImportReport {
 
     fn resume_mode(&self) -> &'static str {
         resume_mode_name(self.resume)
+    }
+
+    fn has_zero_yield_anomaly(&self) -> bool {
+        self.sources
+            .iter()
+            .any(|source| source.zero_yield_anomaly_count() > 0)
+    }
+}
+
+impl ImportSourceReport {
+    fn zero_yield_anomaly_count(&self) -> u64 {
+        self.health.zero_yield_anomaly_count as u64
     }
 }
 
@@ -766,6 +844,16 @@ fn resume_mode_name(resume: bool) -> &'static str {
 
 impl ImportTotals {
     fn add(&mut self, summary: &ProviderImportSummary, stats: &SourceStats) {
+        let health = classify_import_health(stats, summary);
+        self.add_with_health(summary, stats, &health);
+    }
+
+    fn add_with_health(
+        &mut self,
+        summary: &ProviderImportSummary,
+        stats: &SourceStats,
+        health: &ImportHealth,
+    ) {
         self.source_files += stats.files;
         self.source_bytes = self.source_bytes.saturating_add(stats.bytes);
         self.imported_sources += 1;
@@ -774,6 +862,9 @@ impl ImportTotals {
         self.imported_edges += summary.imported_edges;
         self.skipped += summary.skipped;
         self.failed += summary.failed;
+        if health.zero_yield_anomaly_count > 0 {
+            self.zero_yield_anomaly_sources += 1;
+        }
     }
 
     fn add_source_failure(&mut self, stats: &SourceStats) {
@@ -841,9 +932,14 @@ impl SearchRefreshReport {
     }
 
     fn completed(mode: RefreshArg, source_count: usize, totals: ImportTotals) -> Self {
+        let status = if totals.zero_yield_anomaly_sources > 0 {
+            "degraded_zero_yield"
+        } else {
+            "completed"
+        };
         Self {
             mode,
-            status: "completed",
+            status,
             source_count,
             totals,
             error: None,
@@ -975,12 +1071,7 @@ impl ProgressReporter {
             ProgressRenderMode::Json => {
                 eprintln!(
                     "{}",
-                    json!({
-                        "type": "ctx_progress",
-                        "operation": self.operation,
-                        "level": "warning",
-                        "message": message.as_ref(),
-                    })
+                    progress_event_json(self.operation, "warning", message.as_ref(), false, None)
                 );
             }
             ProgressRenderMode::Plain { .. } => eprintln!("warning: {}", message.as_ref()),
@@ -1289,7 +1380,33 @@ fn format_bytes(bytes: u64) -> String {
 struct ShowDto;
 struct SearchDto;
 
-fn main() -> Result<()> {
+#[derive(Debug)]
+struct SilentExit {
+    code: i32,
+}
+
+impl std::fmt::Display for SilentExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "silent exit {}", self.code)
+    }
+}
+
+impl std::error::Error for SilentExit {}
+
+fn main() {
+    match main_result() {
+        Ok(()) => {}
+        Err(err) => {
+            if let Some(silent) = err.downcast_ref::<SilentExit>() {
+                std::process::exit(silent.code);
+            }
+            eprintln!("Error: {err:?}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn main_result() -> Result<()> {
     let cli = Cli::parse();
     let data_root = cli
         .data_root
@@ -1351,6 +1468,7 @@ fn run_setup(args: SetupArgs, data_root: PathBuf) -> Result<()> {
             all: true,
             resume: false,
             json: args.json,
+            strict: false,
             progress: args.progress,
         };
         Some(run_import_internal(
@@ -1451,7 +1569,7 @@ fn setup_import_json(report: Option<&ImportReport>) -> Value {
             "resume": report.resume,
             "resume_mode": report.resume_mode(),
             "totals": import_totals_json(&report.totals),
-            "sources": report.sources.clone(),
+            "sources": report.sources.iter().map(|source| source.json.clone()).collect::<Vec<_>>(),
         }),
         None => json!({
             "ran": false,
@@ -1641,7 +1759,24 @@ fn run_import(args: ImportArgs, data_root: PathBuf) -> Result<()> {
             operation: "import",
         },
     )?;
-    print_import_report(&report, json)
+    emit_import_health_warnings(&report, progress);
+    print_import_report(&report, json)?;
+    if args.strict && report.has_zero_yield_anomaly() {
+        if progress == ProgressArg::Json {
+            eprintln!(
+                "{}",
+                progress_event_json("import", "error", "ctx import --strict detected zero-yield anomaly; report was printed, retry an explicit provider or run `ctx doctor`", true, Some("zero_yield_anomaly_strict"))
+            );
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+            let _ = std::io::stderr().flush();
+            return Err(SilentExit { code: 1 }.into());
+        }
+        return Err(anyhow!(
+            "ctx import --strict detected zero-yield anomaly; report was printed, retry an explicit provider or run `ctx doctor`"
+        ));
+    }
+    Ok(())
 }
 
 fn run_import_internal(
@@ -1722,8 +1857,11 @@ fn run_import_internal(
             &data_root,
             args.reset_cursor,
         ) {
-            Ok((summary, stats)) => {
-                totals.add(&summary, &stats);
+            Ok(outcome) => {
+                let summary = outcome.summary;
+                let stats = outcome.stats;
+                let health = history_source_plugin_health(&stats, &summary, outcome.source_only);
+                totals.add_with_health(&summary, &stats, &health);
                 progress.done(
                     "indexing",
                     format!("imported history source plugin {}", plugin_source.label()),
@@ -1733,10 +1871,11 @@ fn run_import_internal(
                     progress.finish_line();
                     print_history_source_plugin_imported(&plugin_source, &summary);
                 }
-                imported_sources.push(history_source_plugin_import_json(
+                imported_sources.push(history_source_plugin_import_json_with_source_only(
                     &plugin_source,
                     &stats,
                     &summary,
+                    outcome.source_only,
                 ));
             }
             Err(err) => {
@@ -2011,7 +2150,7 @@ fn run_import_internal(
     if totals.imported_sources == 0 && totals.failed_sources > 0 {
         let detail = imported_sources
             .iter()
-            .find_map(|source| source.get("error").and_then(Value::as_str))
+            .find_map(|source| source.json.get("error").and_then(Value::as_str))
             .map(|error| format!("; first failure: {error}"))
             .unwrap_or_default();
         return Err(anyhow!("all import sources failed{detail}"));
@@ -2150,7 +2289,7 @@ fn import_report_json(report: &ImportReport) -> Value {
         "resume": report.resume,
         "resume_mode": report.resume_mode(),
         "totals": import_totals_json(&report.totals),
-        "sources": report.sources.clone(),
+        "sources": report.sources.iter().map(|source| source.json.clone()).collect::<Vec<_>>(),
     })
 }
 
@@ -2165,6 +2304,61 @@ fn import_totals_json(totals: &ImportTotals) -> Value {
         "imported_edges": totals.imported_edges,
         "skipped": totals.skipped,
         "failed": totals.failed,
+        "zero_yield_anomaly_sources": totals.zero_yield_anomaly_sources,
+    })
+}
+
+fn emit_import_health_warnings(report: &ImportReport, progress: ProgressArg) {
+    for source in &report.sources {
+        let count = source.zero_yield_anomaly_count();
+        if count > 0 {
+            let provider = source
+                .json
+                .get("provider")
+                .and_then(Value::as_str)
+                .unwrap_or("source");
+            let message = format!("import health detected zero-yield anomaly for {provider}; {count} import unit(s) yielded no sessions, events, or edges without a safe skip/empty reason. Next steps: run `ctx sources`, retry with an explicit provider, or run `ctx doctor`.");
+            if progress == ProgressArg::Json {
+                eprintln!(
+                    "{}",
+                    progress_event_json(
+                        "import",
+                        "warning",
+                        &message,
+                        false,
+                        Some("zero_yield_anomaly")
+                    )
+                );
+            } else {
+                eprintln!("warning: {message}");
+            }
+        }
+    }
+}
+
+fn progress_event_json(
+    operation: &str,
+    level: &str,
+    message: &str,
+    done: bool,
+    code: Option<&str>,
+) -> Value {
+    json!({
+        "type": "ctx_progress",
+        "operation": operation,
+        "phase": "import_health",
+        "level": level,
+        "code": code,
+        "message": message,
+        "completed_bytes": 0,
+        "total_bytes": 0,
+        "percent": 100.0,
+        "elapsed_seconds": 0.0,
+        "eta_seconds": null,
+        "completed_files": null,
+        "total_files": null,
+        "imported_events": null,
+        "done": done,
     })
 }
 
@@ -2178,6 +2372,10 @@ fn print_import_report_human(report: &ImportReport) {
     println!("imported_edges: {}", report.totals.imported_edges);
     println!("skipped: {}", report.totals.skipped);
     println!("failed: {}", report.totals.failed);
+    println!(
+        "zero_yield_anomaly_sources: {}",
+        report.totals.zero_yield_anomaly_sources
+    );
     println!("resume: {}", report.resume);
     println!("resume_mode: {}", report.resume_mode());
 }
@@ -2242,22 +2440,29 @@ fn source_import_json(
     source: &SourceInfo,
     stats: &SourceStats,
     summary: &ProviderImportSummary,
-) -> Value {
-    json!({
+) -> ImportSourceReport {
+    let health = classify_import_health(stats, summary);
+    let json = json!({
         "status": "imported",
+        "health": health.to_json(),
         "provider": source.provider.as_str(),
         "path": source.path,
         "source_format": source.source_format,
         "source_files": stats.files,
         "source_bytes": stats.bytes,
+        "scanned_files": stats.files,
+        "scanned_bytes": stats.bytes,
         "imported_sessions": summary.imported_sessions,
         "imported_events": summary.imported_events,
         "imported_edges": summary.imported_edges,
         "skipped": summary.skipped,
+        "skipped_reasons": skipped_reasons_json(summary),
         "failed": summary.failed,
+        "malformed_or_unsupported_count": summary.failed,
         "failures": provider_failures_json(summary),
         "notes": summary.notes,
-    })
+    });
+    ImportSourceReport { health, json }
 }
 
 fn custom_format_import_json(
@@ -2265,31 +2470,41 @@ fn custom_format_import_json(
     path: &Path,
     stats: &SourceStats,
     summary: &ProviderImportSummary,
-) -> Value {
-    json!({
+) -> ImportSourceReport {
+    let health = classify_import_health(stats, summary);
+    let json = json!({
         "status": "imported",
+        "health": health.to_json(),
         "provider": CaptureProvider::Custom.as_str(),
         "path": path,
         "format": format.as_str(),
         "source_format": format.as_str(),
         "source_files": stats.files,
         "source_bytes": stats.bytes,
+        "scanned_files": stats.files,
+        "scanned_bytes": stats.bytes,
         "imported_sessions": summary.imported_sessions,
         "imported_events": summary.imported_events,
         "imported_edges": summary.imported_edges,
         "skipped": summary.skipped,
+        "skipped_reasons": skipped_reasons_json(summary),
         "failed": summary.failed,
+        "malformed_or_unsupported_count": summary.failed,
         "failures": provider_failures_json(summary),
-    })
+    });
+    ImportSourceReport { health, json }
 }
 
-fn history_source_plugin_import_json(
+fn history_source_plugin_import_json_with_source_only(
     source: &HistorySourcePluginSource,
     stats: &SourceStats,
     summary: &ProviderImportSummary,
-) -> Value {
-    json!({
+    source_only: bool,
+) -> ImportSourceReport {
+    let health = history_source_plugin_health(stats, summary, source_only);
+    let json = json!({
         "status": "imported",
+        "health": health.to_json(),
         "provider": CaptureProvider::Custom.as_str(),
         "kind": "history_source_plugin",
         "plugin": source.plugin_name,
@@ -2300,13 +2515,18 @@ fn history_source_plugin_import_json(
         "manifest_path": source.manifest_path,
         "source_files": stats.files,
         "source_bytes": stats.bytes,
+        "scanned_files": stats.files,
+        "scanned_bytes": stats.bytes,
         "imported_sessions": summary.imported_sessions,
         "imported_events": summary.imported_events,
         "imported_edges": summary.imported_edges,
         "skipped": summary.skipped,
+        "skipped_reasons": skipped_reasons_json(summary),
         "failed": summary.failed,
+        "malformed_or_unsupported_count": summary.failed,
         "failures": provider_failures_json(summary),
-    })
+    });
+    ImportSourceReport { health, json }
 }
 
 fn provider_failures_json(summary: &ProviderImportSummary) -> Vec<Value> {
@@ -2323,21 +2543,141 @@ fn provider_failures_json(summary: &ProviderImportSummary) -> Vec<Value> {
         .collect()
 }
 
-fn source_failure_json(failure: &ImportSourceFailure) -> Value {
-    json!({
+fn history_source_plugin_health(
+    stats: &SourceStats,
+    summary: &ProviderImportSummary,
+    source_only: bool,
+) -> ImportHealth {
+    if history_source_plugin_cursor_only(summary, source_only) {
+        ImportHealth {
+            classification: ImportHealthClassification::Unchanged,
+            reason_counts: json!({"plugin_cursor_only": 1}),
+            zero_yield_anomaly_count: 0,
+        }
+    } else {
+        classify_import_health(stats, summary)
+    }
+}
+
+fn history_source_plugin_cursor_only(summary: &ProviderImportSummary, source_only: bool) -> bool {
+    let imported = summary.imported_sessions + summary.imported_events + summary.imported_edges;
+    imported == 0 && summary.failed == 0 && summary.skipped == 0 && source_only
+}
+
+fn classify_import_health(stats: &SourceStats, summary: &ProviderImportSummary) -> ImportHealth {
+    let imported = summary.imported_sessions + summary.imported_events + summary.imported_edges;
+    let classification = if imported > 0 && (summary.failed > 0 || summary.zero_yield_anomalies > 0)
+    {
+        ImportHealthClassification::PartialSuccess
+    } else if summary.unchanged_sources > 0
+        && imported == 0
+        && summary.failed == 0
+        && summary.skipped == 0
+        && summary.zero_yield_anomalies == 0
+    {
+        ImportHealthClassification::Unchanged
+    } else if summary.zero_yield_anomalies > 0 {
+        ImportHealthClassification::ZeroYieldAnomaly
+    } else if summary.failed > 0 {
+        ImportHealthClassification::UnsupportedOrMalformed
+    } else if imported > 0 {
+        ImportHealthClassification::Success
+    } else if summary.empty_sources > 0 || summary.empty_files > 0 {
+        ImportHealthClassification::Empty
+    } else if summary.skipped > 0 {
+        ImportHealthClassification::AllSkipped
+    } else if stats.bytes == 0 {
+        ImportHealthClassification::Empty
+    } else {
+        ImportHealthClassification::ZeroYieldAnomaly
+    };
+    let mut reasons = serde_json::Map::new();
+    if summary.skipped > 0 {
+        reasons.insert("unspecified".to_owned(), json!(summary.skipped));
+    }
+    if summary.failed > 0 {
+        reasons.insert("malformed_or_unsupported".to_owned(), json!(summary.failed));
+    }
+    if summary.zero_yield_anomalies > 0 {
+        reasons.insert(
+            "zero_yield_anomaly".to_owned(),
+            json!(summary.zero_yield_anomalies),
+        );
+    }
+    if summary.unchanged_sources > 0 {
+        reasons.insert(
+            "no_pending_files".to_owned(),
+            json!(summary.unchanged_sources),
+        );
+    }
+    if summary.empty_sources > 0 || summary.empty_files > 0 {
+        reasons.insert(
+            "empty".to_owned(),
+            json!(summary.empty_sources + summary.empty_files),
+        );
+    }
+    let zero_yield_anomaly_count = if summary.zero_yield_anomalies > 0 {
+        summary.zero_yield_anomalies
+    } else if classification == ImportHealthClassification::ZeroYieldAnomaly {
+        1
+    } else {
+        0
+    };
+    ImportHealth {
+        classification,
+        reason_counts: Value::Object(reasons),
+        zero_yield_anomaly_count,
+    }
+}
+
+fn skipped_reasons_json(summary: &ProviderImportSummary) -> Value {
+    if summary.skipped == 0 {
+        json!({})
+    } else {
+        json!({"unspecified": summary.skipped})
+    }
+}
+
+fn source_failure_json(failure: &ImportSourceFailure) -> ImportSourceReport {
+    let health = ImportHealth {
+        classification: ImportHealthClassification::Failed,
+        reason_counts: json!({"failure": 1}),
+        zero_yield_anomaly_count: 0,
+    };
+    let json = json!({
         "status": "failed",
+        "health": health.to_json(),
         "provider": failure.source.provider.as_str(),
         "path": failure.source.path,
         "source_format": failure.source.source_format,
         "source_files": failure.stats.files,
         "source_bytes": failure.stats.bytes,
+        "scanned_files": failure.stats.files,
+        "scanned_bytes": failure.stats.bytes,
+        "imported_sessions": 0,
+        "imported_events": 0,
+        "imported_edges": 0,
+        "skipped": 0,
+        "failed": 1,
+        "skipped_reasons": {},
+        "malformed_or_unsupported_count": 1,
         "error": source_error_reason(&failure.source, &failure.error),
-    })
+    });
+    ImportSourceReport { health, json }
 }
 
-fn history_source_plugin_failure_json(source: &HistorySourcePluginSource, error: &str) -> Value {
-    json!({
+fn history_source_plugin_failure_json(
+    source: &HistorySourcePluginSource,
+    error: &str,
+) -> ImportSourceReport {
+    let health = ImportHealth {
+        classification: ImportHealthClassification::Failed,
+        reason_counts: json!({"failure": 1}),
+        zero_yield_anomaly_count: 0,
+    };
+    let json = json!({
         "status": "failed",
+        "health": health.to_json(),
         "provider": CaptureProvider::Custom.as_str(),
         "kind": "history_source_plugin",
         "plugin": source.plugin_name,
@@ -2348,8 +2688,18 @@ fn history_source_plugin_failure_json(source: &HistorySourcePluginSource, error:
         "manifest_path": source.manifest_path,
         "source_files": 0,
         "source_bytes": 0,
+        "scanned_files": 0,
+        "scanned_bytes": 0,
+        "imported_sessions": 0,
+        "imported_events": 0,
+        "imported_edges": 0,
+        "skipped": 0,
+        "failed": 1,
+        "skipped_reasons": {},
+        "malformed_or_unsupported_count": 1,
         "error": one_line_error(error),
-    })
+    });
+    ImportSourceReport { health, json }
 }
 
 fn print_source_imported(source: &SourceInfo, summary: &ProviderImportSummary) {
@@ -3902,6 +4252,10 @@ fn run_search(args: SearchArgs, data_root: PathBuf) -> Result<()> {
                     "warning: search refresh failed; serving existing index; use --refresh strict to fail instead: {error}"
                 );
             }
+        } else if refresh.status == "degraded_zero_yield" && args.refresh == RefreshArg::Auto {
+            eprintln!(
+                "warning: search refresh detected zero-yield import health anomalies; serving search results; run `ctx doctor` or `ctx import --strict`"
+            );
         }
         if packet.results.is_empty() {
             if let Some(file) = args
@@ -4103,11 +4457,16 @@ fn refresh_before_search(args: &SearchArgs, data_root: &Path) -> Result<SearchRe
     }
     let source_count = sources.len().saturating_add(plugin_sources.len());
     match refresh_sources_for_search(data_root, sources, plugin_sources, args.refresh, args.json) {
-        Ok(totals) => Ok(SearchRefreshReport::completed(
-            args.refresh,
-            source_count,
-            totals,
-        )),
+        Ok(totals) => {
+            if args.refresh == RefreshArg::Strict && totals.zero_yield_anomaly_sources > 0 {
+                return Err(anyhow!("strict search refresh detected zero-yield import anomaly; run `ctx import --strict` or `ctx doctor`"));
+            }
+            Ok(SearchRefreshReport::completed(
+                args.refresh,
+                source_count,
+                totals,
+            ))
+        }
         Err(err) if args.refresh == RefreshArg::Auto => Ok(SearchRefreshReport::failed(
             RefreshArg::Auto,
             source_count,
@@ -4261,12 +4620,14 @@ fn refresh_sources_for_search(
                 "refreshing",
                 format!("running history source plugin {}", plugin_source.label()),
             );
-            let (summary, stats) =
+            let outcome =
                 import_history_source_plugin(&mut store, &plugin_source, data_root, false)
                     .with_context(|| {
                         format!("refresh history source plugin {}", plugin_source.label())
                     })?;
-            totals.add(&summary, &stats);
+            let health =
+                history_source_plugin_health(&outcome.stats, &outcome.summary, outcome.source_only);
+            totals.add_with_health(&outcome.summary, &outcome.stats, &health);
             progress.done(
                 "refreshing",
                 format!("refreshed history source plugin {}", plugin_source.label()),
@@ -4284,6 +4645,7 @@ fn run_doctor(args: DoctorArgs, data_root: PathBuf) -> Result<()> {
     progress.message("opening", "opening ctx store");
     let db_path = database_path(data_root.clone());
     let mut findings = Vec::new();
+    let mut import_health_zero_yield_anomalies = 0usize;
     if !data_root.exists() {
         findings.push(format!("data root does not exist: {}", data_root.display()));
     }
@@ -4299,6 +4661,12 @@ fn run_doctor(args: DoctorArgs, data_root: PathBuf) -> Result<()> {
             "running sqlite integrity and foreign key checks",
         );
         findings.extend(store.validate()?);
+        import_health_zero_yield_anomalies = store.count_source_import_zero_yield_anomalies()?;
+        if import_health_zero_yield_anomalies > 0 {
+            findings.push(format!(
+                "import health: {import_health_zero_yield_anomalies} ledger-backed source file(s) previously produced zero imported entities without a safe skip/empty reason; rerun `ctx import` after the source changes or retry with an explicit provider"
+            ));
+        }
     }
     let storage = if args.storage {
         Some(storage_status::snapshot_deep(&data_root, CONFIG_FILE)?)
@@ -4330,6 +4698,11 @@ fn run_doctor(args: DoctorArgs, data_root: PathBuf) -> Result<()> {
             "share_safe": false,
             "storage": storage.as_ref().map(storage_status::storage_json),
             "storage_optional_diagnostics": storage.as_ref().map(storage_status::optional_diagnostic_messages).unwrap_or_default(),
+            "import_health": {
+                "ledger_backed_zero_yield_anomalies": import_health_zero_yield_anomalies,
+                "coverage": "manifested_and_catalog_sources_only",
+                "not_persisted_for": ["custom_format", "history_source_plugin", "unmanifested_native_import", "full_rescan_native_import"],
+            },
             "findings": all_findings,
         }))?;
     } else if ok {
@@ -4528,7 +4901,7 @@ fn import_history_source_plugin(
     source: &HistorySourcePluginSource,
     data_root: &Path,
     full_rescan: bool,
-) -> Result<(ProviderImportSummary, SourceStats)> {
+) -> Result<HistorySourcePluginImportOutcome> {
     let record = import_record_for_history_source_plugin(source);
     let record_id = record.id;
     let options = CustomHistoryJsonlV1ImportOptions::default();
@@ -4554,6 +4927,7 @@ fn import_history_source_plugin(
     let _plugin_stderr = &run.stderr;
     validate_history_source_plugin_output(source, &run.stdout, &machine_id, full_rescan)?;
     let stdout = annotate_history_source_plugin_output(source, &run.stdout)?;
+    let source_only = history_source_plugin_output_is_source_only(&stdout)?;
     let validation = validate_custom_history_jsonl_v1_reader(Cursor::new(stdout.as_slice()))
         .map_err(anyhow::Error::from)?;
     if validation.failed > 0 {
@@ -4579,7 +4953,34 @@ fn import_history_source_plugin(
     if summary.failed > 0 {
         return Err(history_source_plugin_import_failure(source, &summary));
     }
-    Ok((summary, stats))
+    Ok(HistorySourcePluginImportOutcome {
+        summary,
+        stats,
+        source_only,
+    })
+}
+
+fn history_source_plugin_output_is_source_only(stdout: &[u8]) -> Result<bool> {
+    let text = std::str::from_utf8(stdout).context("history source plugin output is not UTF-8")?;
+    let mut saw_source_with_after_cursor = false;
+    let mut saw_history_entity = false;
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        match serde_json::from_str::<CtxHistoryJsonlRecord>(line)? {
+            CtxHistoryJsonlRecord::Source(source) => {
+                saw_source_with_after_cursor = source
+                    .cursor
+                    .as_ref()
+                    .and_then(|cursor| cursor.after.as_ref())
+                    .is_some();
+            }
+            CtxHistoryJsonlRecord::Session(_)
+            | CtxHistoryJsonlRecord::Event(_)
+            | CtxHistoryJsonlRecord::FileTouch(_)
+            | CtxHistoryJsonlRecord::Edge(_) => saw_history_entity = true,
+            CtxHistoryJsonlRecord::Manifest(_) => {}
+        }
+    }
+    Ok(saw_source_with_after_cursor && !saw_history_entity)
 }
 
 fn annotate_history_source_plugin_output(
@@ -5054,7 +5455,10 @@ fn import_manifested_source(
 
     let pending = store.list_pending_source_import_files(source.provider, &source_root)?;
     if pending.is_empty() {
-        return Ok(ProviderImportSummary::default());
+        return Ok(ProviderImportSummary {
+            unchanged_sources: 1,
+            ..ProviderImportSummary::default()
+        });
     }
 
     let mut summary = ProviderImportSummary::default();
@@ -5065,17 +5469,36 @@ fn import_manifested_source(
         let imported =
             import_one_source_inner(store, &pending_source, progress.clone(), false, true);
         match imported {
-            Ok(file_summary) => {
-                store.mark_source_import_file_indexed(
-                    source.provider,
-                    SourceImportFileIndexUpdate {
-                        source_root: &source_root,
-                        source_path: &pending_file.source_path,
-                        file_size_bytes: pending_file.file_size_bytes,
-                        file_modified_at_ms: pending_file.file_modified_at_ms,
-                        indexed_at_ms: utc_now().timestamp_millis(),
-                    },
-                )?;
+            Ok(mut file_summary) => {
+                let file_stats = SourceStats {
+                    files: 1,
+                    bytes: pending_file.file_size_bytes,
+                };
+                if pending_file.file_size_bytes == 0 {
+                    file_summary.empty_files = 1;
+                }
+                let health = classify_import_health(&file_stats, &file_summary);
+                if health.zero_yield_anomaly() {
+                    file_summary.zero_yield_anomalies = 1;
+                    store.mark_source_import_file_failed(
+                        source.provider,
+                        &source_root,
+                        &pending_file.source_path,
+                        SOURCE_IMPORT_ZERO_YIELD_ANOMALY_CODE,
+                        utc_now().timestamp_millis(),
+                    )?;
+                } else {
+                    store.mark_source_import_file_indexed(
+                        source.provider,
+                        SourceImportFileIndexUpdate {
+                            source_root: &source_root,
+                            source_path: &pending_file.source_path,
+                            file_size_bytes: pending_file.file_size_bytes,
+                            file_modified_at_ms: pending_file.file_modified_at_ms,
+                            indexed_at_ms: utc_now().timestamp_millis(),
+                        },
+                    )?;
+                }
                 merge_provider_import_summary(&mut summary, file_summary);
             }
             Err(err) => {
@@ -5148,6 +5571,10 @@ fn merge_provider_import_summary(
     summary.skipped_events += other.skipped_events;
     summary.imported_edges += other.imported_edges;
     summary.skipped_edges += other.skipped_edges;
+    summary.unchanged_sources += other.unchanged_sources;
+    summary.zero_yield_anomalies += other.zero_yield_anomalies;
+    summary.empty_sources += other.empty_sources;
+    summary.empty_files += other.empty_files;
     summary.failures.extend(other.failures);
     summary.notes.extend(other.notes);
 }
@@ -5272,7 +5699,10 @@ fn import_incremental_codex_session_tree(
 
     let pending = store.list_pending_catalog_sessions(CaptureProvider::Codex, &source_root)?;
     if pending.is_empty() {
-        return Ok(ProviderImportSummary::default());
+        return Ok(ProviderImportSummary {
+            unchanged_sources: 1,
+            ..ProviderImportSummary::default()
+        });
     }
 
     let mut summary = ProviderImportSummary::default();
@@ -5335,6 +5765,23 @@ fn import_incremental_codex_session_tree(
                 merge_provider_import_summary(&mut summary, tail_summary);
                 continue;
             }
+            let tail_entities = tail_summary.imported_sessions
+                + tail_summary.imported_events
+                + tail_summary.imported_edges
+                + tail_summary.skipped_sessions
+                + tail_summary.skipped_events
+                + tail_summary.skipped_edges;
+            if tail_entities == 0 {
+                store.mark_catalog_source_failed(
+                    CaptureProvider::Codex,
+                    &session.source_root,
+                    &session.source_path,
+                    SOURCE_IMPORT_ZERO_YIELD_ANOMALY_CODE,
+                    utc_now().timestamp_millis(),
+                )?;
+                summary.zero_yield_anomalies += 1;
+                continue;
+            }
             let tail_event_count = tail_summary
                 .imported_events
                 .saturating_add(tail_summary.skipped_events)
@@ -5381,31 +5828,88 @@ fn import_incremental_codex_session_tree(
                 return Err(err);
             }
         };
-        mark_catalog_sessions_indexed(store, &full_import_sessions, &full_summary)?;
+        let (anomalies, empty_files) = mark_catalog_sessions_indexed_or_anomalous(
+            store,
+            &full_import_sessions,
+            &full_summary,
+        )?;
+        if anomalies > 0 {
+            summary.zero_yield_anomalies += anomalies;
+        }
+        if empty_files > 0 {
+            summary.empty_files += empty_files;
+        }
         merge_provider_import_summary(&mut summary, full_summary);
     }
     Ok(summary)
 }
 
-fn mark_catalog_sessions_indexed(
+fn mark_catalog_sessions_indexed_or_anomalous(
     store: &Store,
     sessions: &[CatalogSession],
     summary: &ProviderImportSummary,
-) -> Result<()> {
+) -> Result<(usize, usize)> {
+    let batch_entities = summary.imported_sessions
+        + summary.imported_events
+        + summary.imported_edges
+        + summary.skipped_sessions
+        + summary.skipped_events
+        + summary.skipped_edges;
+    let mut anomalies = 0usize;
+    let mut empty_files = 0usize;
+    let has_failures_or_skips = summary.failed > 0
+        || summary.skipped > 0
+        || summary.skipped_sessions > 0
+        || summary.skipped_events > 0
+        || summary.skipped_edges > 0;
     let indexed_at_ms = utc_now().timestamp_millis();
-    let event_count = if sessions.len() == 1 {
-        Some(
-            summary
-                .imported_events
-                .saturating_add(summary.skipped_events) as u64,
-        )
-    } else {
-        None
-    };
+    let external_session_ids = sessions
+        .iter()
+        .filter_map(|session| session.external_session_id.clone())
+        .collect::<Vec<_>>();
+    let existing_external_session_ids =
+        store.existing_external_session_ids(CaptureProvider::Codex, &external_session_ids)?;
     for session in sessions {
-        mark_catalog_session_indexed(store, session, event_count, indexed_at_ms)?;
+        if session.file_size_bytes == 0 {
+            mark_catalog_session_indexed(store, session, None, indexed_at_ms)?;
+            empty_files += 1;
+            continue;
+        }
+        let has_indexed_session = match session.external_session_id.as_deref() {
+            Some(external_session_id) => {
+                existing_external_session_ids.contains(external_session_id)
+            }
+            None => batch_entities > 0,
+        };
+        if has_indexed_session {
+            let event_count = (sessions.len() == 1).then_some(
+                summary
+                    .imported_events
+                    .saturating_add(summary.skipped_events) as u64,
+            );
+            mark_catalog_session_indexed(store, session, event_count, indexed_at_ms)?;
+        } else if has_failures_or_skips {
+            store.mark_catalog_source_failed(
+                CaptureProvider::Codex,
+                &session.source_root,
+                &session.source_path,
+                CATALOG_IMPORT_OUTCOME_UNATTRIBUTED_CODE,
+                indexed_at_ms,
+            )?;
+        } else if batch_entities == 0 || session.external_session_id.is_some() {
+            store.mark_catalog_source_failed(
+                CaptureProvider::Codex,
+                &session.source_root,
+                &session.source_path,
+                SOURCE_IMPORT_ZERO_YIELD_ANOMALY_CODE,
+                indexed_at_ms,
+            )?;
+            anomalies += 1;
+        } else {
+            mark_catalog_session_indexed(store, session, None, indexed_at_ms)?;
+        }
     }
-    Ok(())
+    Ok((anomalies, empty_files))
 }
 
 fn mark_catalog_session_indexed(
@@ -5921,7 +6425,12 @@ fn home_dir() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{catalog_import_checkpoint_matches, sha256_file_prefix_hex, shell_quote_arg};
+    use super::{
+        catalog_import_checkpoint_matches, classify_import_health,
+        history_source_plugin_cursor_only, sha256_file_prefix_hex, shell_quote_arg, ImportHealth,
+        ImportHealthClassification, ImportReport, ImportSourceReport, ImportTotals, SourceStats,
+    };
+    use ctx_history_capture::ProviderImportSummary;
     use std::{fs, io::Write};
     use tempfile::tempdir;
 
@@ -5948,6 +6457,154 @@ mod tests {
 
         fs::write(&path, "mutated\n").unwrap();
         assert!(!catalog_import_checkpoint_matches(&path, 7, Some(&prefix_hash)).unwrap());
+    }
+
+    #[test]
+    fn import_health_classifies_zero_yield_without_safe_reason_as_anomaly() {
+        let stats = SourceStats {
+            files: 1,
+            bytes: 42,
+        };
+        let summary = ProviderImportSummary::default();
+        assert_eq!(
+            classify_import_health(&stats, &summary).classification,
+            ImportHealthClassification::ZeroYieldAnomaly
+        );
+    }
+
+    #[test]
+    fn import_health_does_not_flag_empty_or_all_skipped() {
+        assert_eq!(
+            classify_import_health(&SourceStats::default(), &ProviderImportSummary::default())
+                .classification,
+            ImportHealthClassification::Empty
+        );
+        let summary = ProviderImportSummary {
+            skipped: 3,
+            skipped_events: 3,
+            ..ProviderImportSummary::default()
+        };
+        assert_eq!(
+            classify_import_health(
+                &SourceStats {
+                    files: 1,
+                    bytes: 42
+                },
+                &summary
+            )
+            .classification,
+            ImportHealthClassification::AllSkipped
+        );
+    }
+
+    #[test]
+    fn import_health_classifies_partial_and_malformed() {
+        let stats = SourceStats {
+            files: 1,
+            bytes: 42,
+        };
+        let partial = ProviderImportSummary {
+            imported_events: 1,
+            failed: 1,
+            ..ProviderImportSummary::default()
+        };
+        assert_eq!(
+            classify_import_health(&stats, &partial).classification,
+            ImportHealthClassification::PartialSuccess
+        );
+
+        let malformed = ProviderImportSummary {
+            failed: 1,
+            ..ProviderImportSummary::default()
+        };
+        assert_eq!(
+            classify_import_health(&stats, &malformed).classification,
+            ImportHealthClassification::UnsupportedOrMalformed
+        );
+    }
+
+    #[test]
+    fn plugin_cursor_only_is_not_anomaly() {
+        assert!(history_source_plugin_cursor_only(
+            &ProviderImportSummary::default(),
+            true
+        ));
+    }
+
+    #[test]
+    fn report_detects_zero_yield_anomaly_without_path_content() {
+        let report = ImportReport {
+            resume: false,
+            totals: ImportTotals::default(),
+            sources: vec![ImportSourceReport {
+                health: ImportHealth {
+                    classification: ImportHealthClassification::ZeroYieldAnomaly,
+                    reason_counts: serde_json::json!({}),
+                    zero_yield_anomaly_count: 1,
+                },
+                json: serde_json::json!({"provider": "codex"}),
+            }],
+        };
+        assert!(report.has_zero_yield_anomaly());
+    }
+
+    #[test]
+    fn aggregate_counts_source_rows_and_anomalous_files_separately() {
+        let summary = ProviderImportSummary {
+            imported_events: 1,
+            zero_yield_anomalies: 2,
+            ..ProviderImportSummary::default()
+        };
+        let stats = SourceStats { files: 3, bytes: 9 };
+        let health = classify_import_health(&stats, &summary);
+        assert_eq!(
+            health.classification,
+            ImportHealthClassification::PartialSuccess
+        );
+        assert_eq!(health.zero_yield_anomaly_count, 2);
+        let mut totals = ImportTotals::default();
+        totals.add_with_health(&summary, &stats, &health);
+        assert_eq!(totals.zero_yield_anomaly_sources, 1);
+    }
+
+    #[test]
+    fn empty_file_bookkeeping_is_safe_with_imported_siblings() {
+        let summary = ProviderImportSummary {
+            imported_events: 1,
+            empty_files: 1,
+            ..ProviderImportSummary::default()
+        };
+        let health = classify_import_health(
+            &SourceStats {
+                files: 2,
+                bytes: 42,
+            },
+            &summary,
+        );
+        assert_eq!(health.classification, ImportHealthClassification::Success);
+        assert_eq!(health.zero_yield_anomaly_count, 0);
+        let mut totals = ImportTotals::default();
+        totals.add_with_health(
+            &summary,
+            &SourceStats {
+                files: 2,
+                bytes: 42,
+            },
+            &health,
+        );
+        assert_eq!(totals.zero_yield_anomaly_sources, 0);
+    }
+
+    #[test]
+    fn search_refresh_completed_degrades_when_import_health_has_anomaly() {
+        use super::{RefreshArg, SearchRefreshReport};
+        let totals = ImportTotals {
+            zero_yield_anomaly_sources: 1,
+            ..ImportTotals::default()
+        };
+        let report = SearchRefreshReport::completed(RefreshArg::Auto, 1, totals);
+        assert_eq!(report.status, "degraded_zero_yield");
+        assert_eq!(report.to_json()["status"], "degraded_zero_yield");
     }
 
     #[test]

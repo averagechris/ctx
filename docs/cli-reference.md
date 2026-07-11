@@ -101,6 +101,7 @@ ctx import --history-source-manifest ./ctx-history-plugin.json
 ctx import --history-source example-agent/default --reset-cursor
 ctx import --resume
 ctx import --json
+ctx import --strict --json
 ctx import --progress json --json
 ```
 
@@ -111,6 +112,13 @@ Use `import` to repair, re-run, resume, or target a specific provider/path. It
 creates the data root and default config if needed, reads provider transcript
 files, and writes indexed source metadata, sessions, events, searchable text,
 citations, and import totals to SQLite.
+
+Import reports include path/content-free health classifications for each source
+and a `zero_yield_anomaly_sources` total. A zero-yield anomaly means ctx scanned
+a non-empty source but imported no sessions, events, or edges and saw no safe
+skip, empty, or plugin cursor-only reason. By default the import completes and
+prints a warning on stderr. `--strict` prints the complete human or JSON report
+first, then exits with runtime code 1 if any zero-yield anomaly was detected.
 
 Custom history can be imported from an explicit JSONL file with
 `--format ctx-history-jsonl-v1 --path <file>`. This path is not discovered or

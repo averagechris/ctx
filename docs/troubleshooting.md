@@ -27,6 +27,26 @@ ctx search "the missing phrase"
 Use `ctx import --resume --json` when you want output to mark the run as an
 idempotent rescan.
 
+## Import Reports Zero-Yield Anomaly
+
+`zero_yield_anomaly` means ctx scanned a non-empty source but imported no
+sessions, events, or edges and did not observe a safe all-skipped, empty, or
+plugin cursor-only result. The warning intentionally omits source paths,
+queries, and transcript content. Next steps:
+
+```bash
+ctx sources
+ctx import --provider <provider> --path <path>
+ctx doctor --json
+```
+
+`ctx import --strict` is useful in automation: it prints the complete report
+first, then exits 1 if an anomaly was detected. Doctor can report only anomalies
+persisted through existing manifested `source_import_files` and
+`catalog_sessions` ledgers. Custom
+JSONL, history-source plugin, and unmanifested import paths do not have
+universal durable zero-yield coverage in this no-schema slice.
+
 After upgrading to `0.10.x` or newer, a refresh can take longer once because ctx marks
 older provider import cache rows pending and re-reads source transcripts to
 populate touched-file metadata and unredacted local transcript text.

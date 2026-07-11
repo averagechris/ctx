@@ -6,12 +6,12 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Subcommand};
-use ctx_history_core::{database_path, EventType};
+use ctx_history_core::{database_path, CtxIdPrefix, EventType};
 use ctx_history_store::{
-    RawSqlOptions, Store, StoreError, RAW_SQL_DEFAULT_MAX_COLUMNS, RAW_SQL_DEFAULT_MAX_ROWS,
-    RAW_SQL_DEFAULT_MAX_SQL_BYTES, RAW_SQL_DEFAULT_MAX_VALUE_BYTES, RAW_SQL_DEFAULT_TIMEOUT,
-    RAW_SQL_MAX_COLUMNS_CAP, RAW_SQL_MAX_ROWS_CAP, RAW_SQL_MAX_SQL_BYTES_CAP, RAW_SQL_MAX_TIMEOUT,
-    RAW_SQL_MAX_VALUE_BYTES_CAP,
+    IdPrefixResolution, RawSqlOptions, Store, StoreError, RAW_SQL_DEFAULT_MAX_COLUMNS,
+    RAW_SQL_DEFAULT_MAX_ROWS, RAW_SQL_DEFAULT_MAX_SQL_BYTES, RAW_SQL_DEFAULT_MAX_VALUE_BYTES,
+    RAW_SQL_DEFAULT_TIMEOUT, RAW_SQL_MAX_COLUMNS_CAP, RAW_SQL_MAX_ROWS_CAP,
+    RAW_SQL_MAX_SQL_BYTES_CAP, RAW_SQL_MAX_TIMEOUT, RAW_SQL_MAX_VALUE_BYTES_CAP,
 };
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -415,7 +415,7 @@ fn tool_sql(arguments: &Value, data_root: &Path) -> Result<Value> {
 
 fn tool_show_session(arguments: &Value, data_root: &Path) -> Result<Value> {
     let store = open_existing_store(data_root)?;
-    let session_id = required_uuid(arguments, "ctx_session_id")?;
+    let session_id = resolve_session_id_arg(&store, arguments, "ctx_session_id")?;
     let mode = optional_transcript_mode(arguments, "mode")?.unwrap_or(TranscriptMode::Lite);
     let session = store.get_session(session_id)?;
     let events = store.events_for_session(session.id)?;
@@ -430,7 +430,7 @@ fn tool_show_session(arguments: &Value, data_root: &Path) -> Result<Value> {
 
 fn tool_show_event(arguments: &Value, data_root: &Path) -> Result<Value> {
     let store = open_existing_store(data_root)?;
-    let event_id = required_uuid(arguments, "ctx_event_id")?;
+    let event_id = resolve_event_id_arg(&store, arguments, "ctx_event_id")?;
     let before = optional_usize(arguments, "before")?.unwrap_or(0);
     let after = optional_usize(arguments, "after")?.unwrap_or(0);
     let window = optional_usize(arguments, "window")?;
@@ -540,7 +540,7 @@ fn tool_definitions() -> Vec<Value> {
                 "include_subagents": { "type": "boolean", "default": false, "description": "Include subagent sessions in addition to primary-agent sessions." },
                 "event_type": { "type": "string", "enum": event_type_names() },
                 "file": { "type": "string", "description": "Indexed touched-file path. Required unless query is provided." },
-                "session": { "type": "string", "description": "ctx session id." },
+                "session": { "type": "string", "description": "ctx session UUID or unambiguous 8+ hex UUID prefix (compact or canonical-hyphenated)." },
                 "events": { "type": "boolean", "default": false },
                 "include_current_session": { "type": "boolean", "default": false, "description": "Include the active Codex session tree when CODEX_THREAD_ID is set." }
             }), vec![]),
@@ -570,7 +570,7 @@ fn tool_definitions() -> Vec<Value> {
             "title": "Show Session",
             "description": "Return an indexed session transcript by ctx session id.",
             "inputSchema": object_schema(json!({
-                "ctx_session_id": { "type": "string" },
+                "ctx_session_id": { "type": "string", "description": "ctx session UUID or unambiguous 8+ hex UUID prefix (compact or canonical-hyphenated)." },
                 "mode": { "type": "string", "enum": ["full", "lite", "log"], "default": "lite" }
             }), vec!["ctx_session_id"]),
             "annotations": { "readOnlyHint": true },
@@ -580,7 +580,7 @@ fn tool_definitions() -> Vec<Value> {
             "title": "Show Event",
             "description": "Return an indexed event and optional surrounding event window by ctx event id.",
             "inputSchema": object_schema(json!({
-                "ctx_event_id": { "type": "string" },
+                "ctx_event_id": { "type": "string", "description": "ctx event UUID or unambiguous 8+ hex UUID prefix (compact or canonical-hyphenated)." },
                 "before": { "type": "integer", "minimum": 0, "default": 0 },
                 "after": { "type": "integer", "minimum": 0, "default": 0 },
                 "window": { "type": "integer", "minimum": 0 }
@@ -673,14 +673,42 @@ fn optional_usize(arguments: &Value, key: &str) -> Result<Option<usize>> {
     }
 }
 
-fn required_uuid(arguments: &Value, key: &str) -> Result<Uuid> {
-    optional_uuid(arguments, key)?.ok_or_else(|| anyhow!("{key} is required"))
+fn resolve_session_id_arg(store: &Store, arguments: &Value, key: &str) -> Result<Uuid> {
+    let value = optional_string(arguments, key)?.ok_or_else(|| anyhow!("{key} is required"))?;
+    let prefix = CtxIdPrefix::parse(&value).map_err(|err| anyhow!("session {err}"))?;
+    if let Some(id) = prefix.full_uuid() {
+        store.get_session(id)?;
+        return Ok(id);
+    }
+    match store.resolve_session_by_id_prefix(&prefix)? {
+        IdPrefixResolution::Found(session) => Ok(session.id),
+        IdPrefixResolution::NotFound => Err(anyhow!(
+            "session id prefix {:?} was not found",
+            prefix.canonical()
+        )),
+        IdPrefixResolution::Ambiguous(ambiguity) => {
+            Err(anyhow!(ambiguity.message("session", &prefix)))
+        }
+    }
 }
 
-fn optional_uuid(arguments: &Value, key: &str) -> Result<Option<Uuid>> {
-    optional_string(arguments, key)?
-        .map(|value| Uuid::parse_str(&value).with_context(|| format!("invalid {key}")))
-        .transpose()
+fn resolve_event_id_arg(store: &Store, arguments: &Value, key: &str) -> Result<Uuid> {
+    let value = optional_string(arguments, key)?.ok_or_else(|| anyhow!("{key} is required"))?;
+    let prefix = CtxIdPrefix::parse(&value).map_err(|err| anyhow!("event {err}"))?;
+    if let Some(id) = prefix.full_uuid() {
+        store.get_event(id)?;
+        return Ok(id);
+    }
+    match store.resolve_event_by_id_prefix(&prefix)? {
+        IdPrefixResolution::Found(event) => Ok(event.id),
+        IdPrefixResolution::NotFound => Err(anyhow!(
+            "event id prefix {:?} was not found",
+            prefix.canonical()
+        )),
+        IdPrefixResolution::Ambiguous(ambiguity) => {
+            Err(anyhow!(ambiguity.message("event", &prefix)))
+        }
+    }
 }
 
 fn optional_provider(arguments: &Value, key: &str) -> Result<Option<ProviderArg>> {

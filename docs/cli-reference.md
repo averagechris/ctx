@@ -221,7 +221,10 @@ returns the strongest matching span from each session, plus
 that session also matched. Use `--session <ctx-session-id>` after a default
 search has identified a session to inspect; scoped session search returns dense
 event hits. Session/event commands accept full ctx IDs or unambiguous ctx ID
-prefixes of at least eight hex characters. Use `--events` without `--session`
+prefixes of at least eight hex digits. Prefixes are case-insensitive and may be
+compact or canonical-hyphenated; a canonical trailing separator after 8, 12, 16,
+or 20 hex digits is accepted, but misplaced or doubled separators are rejected.
+Use `--events` without `--session`
 for dense event-level results across sessions. Repeat
 `--term <query-or-keyword>` when you want to broaden a search across several
 related words or phrases and merge the ranked results; `--term` is OR-style

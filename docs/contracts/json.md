@@ -213,7 +213,9 @@ Returns:
 
 - `schema_version`;
 - `query`;
+- `query_plan`, with `schema_version: 1`, `mode`, `clauses[]` (`original`, normalized `terms[]`), `within_clause_operator`, `between_clause_operator: "OR"`, and `filters_operator: "AND"`;
 - `filters`;
+- `broadened_search`, optional; when present it is `{ "executed": false, "from_match": "phrase|all", "to_match": "all|any", "command": "ctx search ...", "argv": ["ctx", "search", ...] }` for a no-result CLI query that can be broadened one step; compact JSON omits it when no broader mode is useful;
 - `freshness`;
 - `generated_at`;
 - `results[]`;
@@ -249,6 +251,8 @@ file match is backed by normalized touched-file storage and can appear when
 search uses `--file <path>` or when file-path metadata contributes to ranking.
 `citations[]` can cite sessions, events, files, or source metadata depending on
 which indexed item produced the match.
+
+`query_plan` is additive schema v1 and contains only query structure, normalized terms, and operators; it does not include unrelated index content. Existing `query` remains the original compatible spelling. MCP search returns the same `query_plan`; CLI-only `broadened_search.command` is a shell-quoted suggestion rendered from `broadened_search.argv`; it is never executed by ctx.
 
 Search JSON is local/private by default and is not share-safe or redacted for
 external publication.

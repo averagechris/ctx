@@ -199,3 +199,5 @@ Long report shape:
   short excerpts needed to support a claim.
 - Treat `~/.ctx`, provider transcript paths, and JSON output as private local
   history unless the user explicitly asks to share reviewed excerpts.
+
+Search matching: default `ctx search "multi word"` is `--match all` (all normalized words in one indexed section, any order). Use repeated `--term` for OR clauses, `--match phrase` for adjacent ordered words, and `--match any` only when intentionally broadening. Punctuation (`_`, `-`, `/`, `.`, quotes, `*`, `:`) separates tokens, diacritics are not folded, and operator-looking text is literal. Filters stay AND. ctx does not silently retry broader modes; copy only labeled `suggestion (not run)` commands when you want that broadening.

@@ -45,7 +45,7 @@ use ctx_history_capture::{
 use ctx_history_core::{
     database_path, default_data_root, utc_now, CaptureProvider, ContextCitation,
     ContextCitationType, CtxHistoryJsonlRecord, Event, EventRole, EventType, HistoryRecord,
-    ProviderRawRetention, RedactionState, Session,
+    ProviderRawRetention, RedactionState, SearchMatchMode, Session,
 };
 use ctx_history_store::{
     CatalogSession, CatalogSourceIndexUpdate, RawSqlOptions, RawSqlResult, RawSqlValue,
@@ -255,6 +255,13 @@ struct SearchArgs {
     term: Vec<String>,
     #[arg(
         long,
+        value_enum,
+        default_value_t = SearchMatchArg::All,
+        help = "How words inside each query clause match: all (default), any, or phrase"
+    )]
+    r#match: SearchMatchArg,
+    #[arg(
+        long,
         default_value_t = 20,
         value_parser = parse_search_limit,
         help = "Maximum results to return, from 1 to 200"
@@ -343,6 +350,23 @@ struct SearchArgs {
         help = "Print expanded text details such as full ids, provider ids, citations, and next commands"
     )]
     verbose: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SearchMatchArg {
+    All,
+    Any,
+    Phrase,
+}
+
+impl From<SearchMatchArg> for SearchMatchMode {
+    fn from(value: SearchMatchArg) -> Self {
+        match value {
+            SearchMatchArg::All => Self::All,
+            SearchMatchArg::Any => Self::Any,
+            SearchMatchArg::Phrase => Self::Phrase,
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -494,6 +518,114 @@ fn search_no_results_target(query: &str, terms: &[String]) -> String {
         "search".to_owned()
     } else {
         rendered_terms.join(" ")
+    }
+}
+
+fn broader_search_command(args: &SearchArgs, query: &str) -> Option<String> {
+    broader_search_argv(args, query).map(|parts| {
+        parts
+            .iter()
+            .map(|part| shell_quote_arg(part))
+            .collect::<Vec<_>>()
+            .join(" ")
+    })
+}
+
+fn broader_search_argv(args: &SearchArgs, query: &str) -> Option<Vec<String>> {
+    let has_multiword_clause = std::iter::once(query)
+        .chain(args.term.iter().map(String::as_str))
+        .any(|clause| ctx_history_core::search_query_terms(clause).len() >= 2);
+    if !has_multiword_clause {
+        return None;
+    }
+    let next_match = match args.r#match {
+        SearchMatchArg::Phrase => SearchMatchArg::All,
+        SearchMatchArg::All => SearchMatchArg::Any,
+        SearchMatchArg::Any => return None,
+    };
+    let mut parts = vec!["ctx".to_owned()];
+    parts.push("search".to_owned());
+    parts.push("--match".to_owned());
+    parts.push(next_match.as_str().to_owned());
+    parts.push("--limit".to_owned());
+    parts.push(args.limit.to_string());
+    if let Some(provider) = args.provider {
+        parts.push(format!("--provider={}", provider.cli_name()));
+    }
+    for (flag, value) in [
+        ("--history-source", args.history_source.as_deref()),
+        ("--provider-key", args.provider_key.as_deref()),
+        ("--source-id", args.source_id.as_deref()),
+        ("--source-format", args.source_format.as_deref()),
+        ("--workspace", args.workspace.as_deref()),
+        ("--since", args.since.as_deref()),
+        ("--event-type", args.event_type.as_deref()),
+        ("--session", args.session.as_deref()),
+    ] {
+        if let Some(value) = value {
+            parts.push(format!("{flag}={value}"));
+        }
+    }
+    if let Some(file) = &args.file {
+        parts.push(format!("--file={}", file.display()));
+    }
+    for term in &args.term {
+        if !term.trim().is_empty() {
+            parts.push(format!("--term={term}"));
+        }
+    }
+    for (enabled, flag) in [
+        (args.include_subagents, "--include-subagents"),
+        (args.primary_only, "--primary-only"),
+        (args.events, "--events"),
+        (args.include_current_session, "--include-current-session"),
+        (args.verbose, "--verbose"),
+        (args.json, "--json"),
+    ] {
+        if enabled {
+            parts.push(flag.to_owned());
+        }
+    }
+    if args.refresh != RefreshArg::Auto {
+        parts.push(format!("--refresh={}", args.refresh.as_str()));
+    }
+    if !query.trim().is_empty() {
+        parts.push("--".to_owned());
+        parts.push(query.to_owned());
+    }
+    Some(parts)
+}
+
+fn broadened_search_json(args: &SearchArgs, query: &str) -> Value {
+    let Some(argv) = broader_search_argv(args, query) else {
+        return Value::Null;
+    };
+    let command = argv
+        .iter()
+        .map(|part| shell_quote_arg(part))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let to_match = match args.r#match {
+        SearchMatchArg::Phrase => SearchMatchArg::All,
+        SearchMatchArg::All => SearchMatchArg::Any,
+        SearchMatchArg::Any => return Value::Null,
+    };
+    compact_json(json!({
+        "executed": false,
+        "from_match": args.r#match.as_str(),
+        "to_match": to_match.as_str(),
+        "command": command,
+        "argv": argv,
+    }))
+}
+
+impl SearchMatchArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Any => "any",
+            Self::Phrase => "phrase",
+        }
     }
 }
 
@@ -3300,11 +3432,14 @@ impl SearchDto {
         packet: &ctx_history_search::SearchPacket,
         refresh: &SearchRefreshReport,
         suggested_next_query: Option<&str>,
+        broadened_search: Value,
     ) -> Value {
         compact_json(json!({
             "schema_version": packet.schema_version,
             "query": packet.query,
+            "query_plan": packet.query_plan,
             "filters": packet.filters,
+            "broadened_search": broadened_search,
             "freshness": refresh.to_json(),
             "generated_at": packet.generated_at,
             "results": packet
@@ -3339,7 +3474,7 @@ impl SearchDto {
                         "source_path": result.raw_source_path,
                         "source_exists": result.raw_source_exists,
                         "cursor": result.cursor,
-                        "suggested_next_commands": search_next_commands(result, suggested_next_query),
+                        "suggested_next_commands": search_next_commands(result, suggested_next_query, packet.query_plan.mode),
                         "why_matched": result.why_matched,
                         "citations": public_citations(&result.citations),
                         "links": result.links,
@@ -3372,6 +3507,7 @@ fn search_result_item_type(
 fn search_next_commands(
     result: &ctx_history_search::SearchPacketResult,
     query: Option<&str>,
+    match_mode: SearchMatchMode,
 ) -> Vec<String> {
     let mut commands = Vec::new();
     if result.result_scope == ctx_history_search::SearchResultScope::Session {
@@ -3381,10 +3517,7 @@ fn search_next_commands(
                 commands.push(format!("ctx show event {event_id} --window 10"));
             }
             if let Some(query) = query.filter(|query| !query.trim().is_empty()) {
-                commands.push(format!(
-                    "ctx search {} --session {id}",
-                    shell_quote_arg(query)
-                ));
+                commands.push(scoped_search_command(query, id, match_mode));
             }
             commands.push(format!("ctx locate session {id}"));
             if let Some(event_id) = result.event_id {
@@ -3400,16 +3533,35 @@ fn search_next_commands(
     if result.result_scope != ctx_history_search::SearchResultScope::Session {
         if let Some(id) = result.session_id {
             if let Some(query) = query.filter(|query| !query.trim().is_empty()) {
-                commands.push(format!(
-                    "ctx search {} --session {id}",
-                    shell_quote_arg(query)
-                ));
+                commands.push(scoped_search_command(query, id, match_mode));
             }
             commands.push(format!("ctx show session {id}"));
             commands.push(format!("ctx locate session {id}"));
         }
     }
     commands
+}
+
+fn scoped_search_command(query: &str, session_id: Uuid, match_mode: SearchMatchMode) -> String {
+    if match_mode == SearchMatchMode::All {
+        return format!(
+            "ctx search {} --session {session_id}",
+            shell_quote_arg(query)
+        );
+    }
+    let mut parts = vec!["ctx".to_owned(), "search".to_owned()];
+    parts.extend(["--match".to_owned(), match_mode.as_str().to_owned()]);
+    parts.extend([
+        "--session".to_owned(),
+        session_id.to_string(),
+        "--".to_owned(),
+        query.to_owned(),
+    ]);
+    parts
+        .iter()
+        .map(|part| shell_quote_arg(part))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn public_citations(citations: &[ContextCitation]) -> Vec<Value> {
@@ -3905,13 +4057,13 @@ fn run_search(args: SearchArgs, data_root: PathBuf) -> Result<()> {
         Store::open(&db_path)?
     };
     let source_identity = SourceIdentityFilterArgs::from(&args);
-    let query = args.query.unwrap_or_default();
+    let query = args.query.clone().unwrap_or_default();
     let event_results = args.events || args.session.is_some();
     let options = ctx_history_search::PacketOptions {
         limit: args.limit,
         filters: search_filters(
             SearchFilterInput {
-                session: args.session,
+                session: args.session.clone(),
                 provider: args.provider,
                 source_identity,
                 workspace: args.workspace.clone(),
@@ -3929,6 +4081,7 @@ fn run_search(args: SearchArgs, data_root: PathBuf) -> Result<()> {
         } else {
             ctx_history_search::SearchResultMode::Sessions
         },
+        match_mode: args.r#match.into(),
         ..ctx_history_search::PacketOptions::default()
     };
     let uses_composed_terms = args.term.iter().any(|term| !term.trim().is_empty());
@@ -3944,6 +4097,11 @@ fn run_search(args: SearchArgs, data_root: PathBuf) -> Result<()> {
             &packet,
             &refresh,
             suggested_next_query,
+            if packet.results.is_empty() {
+                broadened_search_json(&args, &query)
+            } else {
+                Value::Null
+            },
         ))?;
     } else {
         if refresh.status == "failed" && args.refresh == RefreshArg::Auto {
@@ -3978,14 +4136,19 @@ fn run_search(args: SearchArgs, data_root: PathBuf) -> Result<()> {
                 if indexed_items == 0 {
                     println!("next: ctx import --all");
                 } else {
-                    println!("next: try broader terms with ctx search --term \"<term>\"");
+                    println!("hint: default matching is --match all: all words in one query/--term must appear in one indexed section; repeated --term clauses are OR; filters are AND. Use --match phrase for adjacent ordered words or --match any to broaden.");
+                    if let Some(command) = broader_search_command(&args, &query) {
+                        println!("suggestion (not run): {command}");
+                    } else {
+                        println!("next: try another query or remove filters");
+                    }
                 }
             }
         }
         let suggested_next_query = (!uses_composed_terms).then_some(query.as_str());
         for (index, result) in packet.results.iter().enumerate() {
             if args.verbose {
-                print_search_result_verbose(result, suggested_next_query);
+                print_search_result_verbose(result, suggested_next_query, packet.query_plan.mode);
             } else {
                 print_search_result_compact(index + 1, result);
             }
@@ -4020,6 +4183,7 @@ fn print_search_result_compact(index: usize, result: &ctx_history_search::Search
 fn print_search_result_verbose(
     result: &ctx_history_search::SearchPacketResult,
     suggested_next_query: Option<&str>,
+    match_mode: SearchMatchMode,
 ) {
     println!("{}", result.title);
     if let Some(event_id) = result.event_id {
@@ -4054,7 +4218,7 @@ fn print_search_result_verbose(
             );
         }
     }
-    for command in search_next_commands(result, suggested_next_query)
+    for command in search_next_commands(result, suggested_next_query, match_mode)
         .into_iter()
         .take(3)
     {

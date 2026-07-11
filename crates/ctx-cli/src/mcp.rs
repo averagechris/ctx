@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Subcommand};
-use ctx_history_core::{database_path, EventType};
+use ctx_history_core::{database_path, EventType, SearchMatchMode};
 use ctx_history_store::{
     RawSqlOptions, Store, StoreError, RAW_SQL_DEFAULT_MAX_COLUMNS, RAW_SQL_DEFAULT_MAX_ROWS,
     RAW_SQL_DEFAULT_MAX_SQL_BYTES, RAW_SQL_DEFAULT_MAX_VALUE_BYTES, RAW_SQL_DEFAULT_TIMEOUT,
@@ -221,6 +221,7 @@ fn handle_tools_call(params: Value, data_root: &Path) -> Result<Value, Value> {
                     "session",
                     "events",
                     "include_current_session",
+                    "match",
                 ],
             )?;
             tool_search(&arguments, data_root)
@@ -347,6 +348,15 @@ fn tool_search(arguments: &Value, data_root: &Path) -> Result<Value> {
     let events = optional_bool(arguments, "events")?.unwrap_or(false) || session.is_some();
     let include_current_session =
         optional_bool(arguments, "include_current_session")?.unwrap_or(false);
+    let match_mode = match optional_string(arguments, "match")?
+        .as_deref()
+        .unwrap_or("all")
+    {
+        "all" => SearchMatchMode::All,
+        "any" => SearchMatchMode::Any,
+        "phrase" => SearchMatchMode::Phrase,
+        _ => return Err(anyhow!("match must be one of all, any, phrase")),
+    };
 
     let options = ctx_history_search::PacketOptions {
         limit,
@@ -375,11 +385,12 @@ fn tool_search(arguments: &Value, data_root: &Path) -> Result<Value> {
         } else {
             ctx_history_search::SearchResultMode::Sessions
         },
+        match_mode,
         ..ctx_history_search::PacketOptions::default()
     };
     let packet = ctx_history_search::search_packet(&store, &query, &options)?;
     let refresh = SearchRefreshReport::skipped(RefreshArg::Off, "skipped");
-    let mut value = SearchDto::packet(&store, &packet, &refresh, Some(&query));
+    let mut value = SearchDto::packet(&store, &packet, &refresh, Some(&query), Value::Null);
     mark_share_safe(&mut value);
     Ok(value)
 }
@@ -529,6 +540,7 @@ fn tool_definitions() -> Vec<Value> {
             "description": "Search the existing local ctx index by query text or touched-file path. This does not refresh or import provider history.",
             "inputSchema": object_schema(json!({
                 "query": { "type": "string", "description": "Non-empty text query. Required unless file is provided." },
+                "match": { "type": "string", "enum": ["all", "any", "phrase"], "default": "all", "description": "Within-query word matching: all tokens in one indexed section, any token, or adjacent ordered phrase. Punctuation is normalized as separators and input is literal, not FTS syntax." },
                 "limit": { "type": "integer", "minimum": 1, "maximum": MAX_SEARCH_LIMIT, "default": 20 },
                 "provider": { "type": "string", "enum": provider_names() },
                 "history_source": { "type": "string", "description": "Custom history source selector as plugin/source or provider_key/source_id." },

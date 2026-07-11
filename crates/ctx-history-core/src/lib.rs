@@ -7,6 +7,233 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchMatchMode {
+    #[default]
+    All,
+    Any,
+    Phrase,
+}
+
+impl SearchMatchMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Any => "any",
+            Self::Phrase => "phrase",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchQueryClause {
+    pub original: String,
+    pub terms: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchQueryPlan {
+    pub schema_version: u32,
+    pub mode: SearchMatchMode,
+    pub clauses: Vec<SearchQueryClause>,
+    pub within_clause_operator: String,
+    pub between_clause_operator: String,
+    pub filters_operator: String,
+}
+
+impl SearchQueryPlan {
+    pub fn new(mode: SearchMatchMode, clauses: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
+        let clauses = clauses
+            .into_iter()
+            .filter_map(|clause| {
+                let original = clause.as_ref().trim().to_owned();
+                if original.is_empty() {
+                    return None;
+                }
+                let mut terms = search_query_terms(&original);
+                if !matches!(mode, SearchMatchMode::Phrase) {
+                    let mut seen = std::collections::BTreeSet::new();
+                    terms.retain(|term| seen.insert(term.clone()));
+                }
+                Some(SearchQueryClause { terms, original })
+            })
+            .collect();
+        Self {
+            schema_version: 1,
+            mode,
+            clauses,
+            within_clause_operator: match mode {
+                SearchMatchMode::All => "AND",
+                SearchMatchMode::Any => "OR",
+                SearchMatchMode::Phrase => "ADJACENT_ORDERED",
+            }
+            .to_owned(),
+            between_clause_operator: "OR".to_owned(),
+            filters_operator: "AND".to_owned(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.clauses.iter().all(|clause| clause.terms.is_empty())
+    }
+
+    pub fn fts_match_query(&self) -> Option<String> {
+        let parts = self
+            .clauses
+            .iter()
+            .filter(|clause| !clause.terms.is_empty())
+            .map(|clause| match self.mode {
+                SearchMatchMode::All => clause
+                    .terms
+                    .iter()
+                    .map(|t| quote_fts_term(t))
+                    .collect::<Vec<_>>()
+                    .join(" AND "),
+                SearchMatchMode::Any => clause
+                    .terms
+                    .iter()
+                    .map(|t| quote_fts_term(t))
+                    .collect::<Vec<_>>()
+                    .join(" OR "),
+                SearchMatchMode::Phrase => quote_fts_term(&clause.terms.join(" ")),
+            })
+            .collect::<Vec<_>>();
+        (!parts.is_empty()).then(|| {
+            parts
+                .into_iter()
+                .map(|p| format!("({p})"))
+                .collect::<Vec<_>>()
+                .join(" OR ")
+        })
+    }
+
+    /// True when an FTS5 unicode61 MATCH over a single indexed column that
+    /// stores exactly `value` already implies `matches_text(value)`. For
+    /// pure-ASCII terms and value, unicode61 tokenization (non-alphanumeric
+    /// separators, including `_`, and case folding) is identical to ctx
+    /// portable literal tokens and diacritic removal cannot fire, so the SQL
+    /// MATCH verdict is exact for every mode (AND, OR, and phrase adjacency)
+    /// and hot paths may skip Rust re-verification. Any non-ASCII input
+    /// conservatively requires `matches_text`.
+    pub fn fts_match_is_exact_for(&self, value: &str) -> bool {
+        value.is_ascii()
+            && self
+                .clauses
+                .iter()
+                .all(|clause| clause.terms.iter().all(|term| term.is_ascii()))
+    }
+
+    /// Match `value` against this plan using ctx literal-token semantics.
+    /// Streams tokens with early exit instead of materializing the haystack,
+    /// since callers run this per indexed hit on hot search paths; semantics
+    /// are identical to matching over `search_query_terms(value)`.
+    pub fn matches_text(&self, value: &str) -> bool {
+        self.clauses.iter().any(|clause| match self.mode {
+            SearchMatchMode::All => {
+                if clause.terms.is_empty() {
+                    return false;
+                }
+                // Non-phrase clause terms are deduplicated at construction.
+                let mut found = vec![false; clause.terms.len()];
+                let mut remaining = clause.terms.len();
+                for_each_search_token(value, |token| {
+                    if let Some(index) = clause
+                        .terms
+                        .iter()
+                        .position(|term| term == token)
+                        .filter(|index| !found[*index])
+                    {
+                        found[index] = true;
+                        remaining -= 1;
+                    }
+                    remaining == 0
+                });
+                remaining == 0
+            }
+            SearchMatchMode::Any => {
+                let mut matched = false;
+                for_each_search_token(value, |token| {
+                    matched = clause.terms.iter().any(|term| term == token);
+                    matched
+                });
+                matched
+            }
+            SearchMatchMode::Phrase => {
+                let len = clause.terms.len();
+                if len == 0 {
+                    return false;
+                }
+                // Ring buffer of the last `len` tokens; token strings are
+                // reused once the ring is full.
+                let mut ring: Vec<String> = Vec::with_capacity(len);
+                let mut start = 0_usize;
+                let mut matched = false;
+                for_each_search_token(value, |token| {
+                    if ring.len() < len {
+                        ring.push(token.to_owned());
+                    } else {
+                        ring[start].clear();
+                        ring[start].push_str(token);
+                        start = (start + 1) % len;
+                    }
+                    if ring.len() == len {
+                        matched = (0..len).all(|i| ring[(start + i) % len] == clause.terms[i]);
+                    }
+                    matched
+                });
+                matched
+            }
+        })
+    }
+}
+
+impl Default for SearchQueryPlan {
+    fn default() -> Self {
+        Self::new(SearchMatchMode::All, std::iter::empty::<&str>())
+    }
+}
+
+fn quote_fts_term(term: &str) -> String {
+    format!("\"{}\"", term.replace('"', "\"\""))
+}
+
+/// Streams ctx portable literal tokens from `input` into `visit`, reusing one
+/// token buffer. `visit` returns `true` to stop early. This is the single
+/// tokenizer behind `search_query_terms` and `SearchQueryPlan::matches_text`.
+fn for_each_search_token(input: &str, mut visit: impl FnMut(&str) -> bool) {
+    let mut cur = String::new();
+    for ch in input.chars() {
+        if ch.is_alphanumeric() {
+            for lower in ch.to_lowercase() {
+                cur.push(lower);
+            }
+        } else if !cur.is_empty() {
+            if visit(&cur) {
+                return;
+            }
+            cur.clear();
+        }
+    }
+    if !cur.is_empty() {
+        visit(&cur);
+    }
+}
+
+/// Normalize search input into ctx's portable literal tokens. Unicode letters
+/// and numbers are token characters; punctuation such as `_`, `-`, `/`, `.`,
+/// quotes, and operator-looking text is a separator or a literal token. Words
+/// are Unicode-lowercased but ctx does not promise diacritic folding or
+/// canonical equivalence. Terms are never interpreted as raw FTS syntax.
+pub fn search_query_terms(query: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for_each_search_token(query, |token| {
+        out.push(token.to_owned());
+        false
+    });
+    out
+}
+
 #[derive(Debug, Error)]
 pub enum CoreError {
     #[error("could not determine a home directory for the default ctx data root")]
@@ -1618,6 +1845,103 @@ mod tests {
                 index + 1,
                 case["id"].as_str().unwrap()
             );
+        }
+    }
+
+    #[test]
+    fn search_query_plan_defines_literal_punctuation_and_modes() {
+        assert_eq!(
+            search_query_terms("Foo-bar/write_to.file NEAR baz\"qux col:name * NOT"),
+            vec!["foo", "bar", "write", "to", "file", "near", "baz", "qux", "col", "name", "not"]
+        );
+        assert_eq!(
+            search_query_terms("Café cafe\u{301} straße STRASSE Δοκιμή 東京"),
+            vec!["café", "cafe", "straße", "strasse", "δοκιμή", "東京"]
+        );
+        let all = SearchQueryPlan::new(SearchMatchMode::All, ["Foo-bar"]);
+        assert!(all.matches_text("bar, then foo"));
+        assert!(!all.matches_text("foo only"));
+        assert_eq!(all.fts_match_query().unwrap(), "(\"foo\" AND \"bar\")");
+        assert!(
+            SearchQueryPlan::new(SearchMatchMode::All, ["write_to_file"])
+                .matches_text("write to file")
+        );
+
+        let any = SearchQueryPlan::new(SearchMatchMode::Any, ["Foo-bar"]);
+        assert!(any.matches_text("foo only"));
+        assert_eq!(any.fts_match_query().unwrap(), "(\"foo\" OR \"bar\")");
+
+        let phrase = SearchQueryPlan::new(SearchMatchMode::Phrase, ["Foo-bar"]);
+        assert!(phrase.matches_text("foo bar"));
+        assert!(!phrase.matches_text("bar foo"));
+        assert_eq!(phrase.fts_match_query().unwrap(), "(\"foo bar\")");
+
+        let repeated = SearchQueryPlan::new(SearchMatchMode::Phrase, ["a b", "c d"]);
+        assert_eq!(repeated.between_clause_operator, "OR");
+        assert!(repeated.matches_text("prefix c d suffix"));
+    }
+
+    /// The streaming early-exit `matches_text` must be semantically identical
+    /// to matching over the materialized `search_query_terms` haystack for
+    /// every mode, including repeated phrase tokens, unicode lowercasing, and
+    /// punctuation-only input.
+    #[test]
+    fn matches_text_streaming_equals_materialized_token_semantics() {
+        fn naive(plan: &SearchQueryPlan, value: &str) -> bool {
+            let hay = search_query_terms(value);
+            plan.clauses.iter().any(|clause| match plan.mode {
+                SearchMatchMode::All => {
+                    !clause.terms.is_empty() && clause.terms.iter().all(|t| hay.contains(t))
+                }
+                SearchMatchMode::Any => clause.terms.iter().any(|t| hay.contains(t)),
+                SearchMatchMode::Phrase => {
+                    !clause.terms.is_empty()
+                        && hay
+                            .windows(clause.terms.len())
+                            .any(|w| w == clause.terms.as_slice())
+                }
+            })
+        }
+        let queries = [
+            "alpha",
+            "alpha beta",
+            "beta alpha",
+            "Café straße",
+            "write_to_file",
+            "a b a",
+            "a a",
+            "...",
+            "",
+        ];
+        let values = [
+            "",
+            "...",
+            "alpha",
+            "alpha beta gamma",
+            "beta alpha",
+            "xx alpha yy beta",
+            "a b a b",
+            "a a b a a",
+            "café CAFE",
+            "write to file now",
+            "the write file to",
+            "東京 alpha École",
+        ];
+        for mode in [
+            SearchMatchMode::All,
+            SearchMatchMode::Any,
+            SearchMatchMode::Phrase,
+        ] {
+            for query in queries {
+                let plan = SearchQueryPlan::new(mode, [query]);
+                for value in values {
+                    assert_eq!(
+                        plan.matches_text(value),
+                        naive(&plan, value),
+                        "mode {mode:?} query {query:?} value {value:?}"
+                    );
+                }
+            }
         }
     }
 

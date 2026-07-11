@@ -21,9 +21,21 @@ The server exposes these tools:
 MCP search and SQL query the existing index only. They do not refresh provider
 history, import files, initialize storage, or write provider data.
 
-MCP search defaults to primary-agent sessions only, matching `ctx search`.
-Pass `include_subagents: true` when implementation details, code review notes,
-test output, or failure traces from subagent sessions are relevant. When
+MCP `search` accepts `match: "all"|"any"|"phrase"`, matching the CLI. The
+positional `query` is one clause. `all` is the default and requires every
+normalized token in that clause to appear in one indexed section; order and
+adjacency are not required. `any` requires at least one token and rewards more
+matched tokens. `phrase` requires normalized tokens to be ordered and adjacent.
+Tokenization uses ctx portable literal tokens: letters/numbers are
+tokens, diacritics are not folded, and punctuation such as `_`, `-`, `/`, `.`, quotes, `*`, and `:` separates
+tokens; operator-looking input such as `OR`, `NOT`, `title:body`, or `star*` is
+literal, not raw FTS syntax. Search results include structured `query_plan` with
+mode, normalized clauses, OR between clauses, and AND filters. MCP does not emit
+CLI shell broadening commands.
+
+MCP search defaults to primary-agent sessions only, matching `ctx search`. Pass
+`include_subagents: true` when implementation details, code review notes, test
+output, or failure traces from subagent sessions are relevant. When
 `CODEX_THREAD_ID` is set, MCP search also excludes the active Codex session tree
 by default; pass `include_current_session: true` when the active session tree is
 the target.

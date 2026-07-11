@@ -29,6 +29,38 @@ fn custom_history_fixture(name: &str) -> String {
     materialized_fixture("custom-history-jsonl", name)
 }
 
+fn write_match_fixture(temp: &TempDir) -> String {
+    let path = temp.path().join("match-fixture.jsonl");
+    fs::write(
+        &path,
+        [
+            r#"{"record_type":"manifest","schema_version":"ctx-history-jsonl-v1"}"#,
+            r#"{"record_type":"source","source_id":"match-source","provider_key":"match-agent","source_format":"match-jsonl","raw_source_path":"/tmp/match.jsonl","fingerprint":"sha256:match","observed_at":"2026-06-23T12:00:10Z"}"#,
+            r#"{"record_type":"session","source_id":"match-source","session_id":"match-session","native_session_id":"native-match-session","cwd":"/workspace/match","started_at":"2026-06-23T12:00:00Z","agent_type":"primary","role_hint":"developer","is_primary":true,"status":"completed"}"#,
+            r#"{"record_type":"event","source_id":"match-source","session_id":"match-session","event_index":0,"event_id":"evt-0","native_cursor":"line:1","event_type":"message","role":"user","occurred_at":"2026-06-23T12:00:01Z","payload":{"text":"Alpha beta write_to_file OR NOT title:body star*"},"preview":"Alpha beta write_to_file OR NOT title:body star*"}"#,
+            r#"{"record_type":"event","source_id":"match-source","session_id":"match-session","event_index":1,"event_id":"evt-1","native_cursor":"line:2","event_type":"message","role":"assistant","occurred_at":"2026-06-23T12:00:02Z","payload":{"text":"beta alpha write to file"},"preview":"beta alpha write to file"}"#,
+            r#"{"record_type":"event","source_id":"match-source","session_id":"match-session","event_index":2,"event_id":"evt-2","native_cursor":"line:3","event_type":"tool_call","role":"assistant","occurred_at":"2026-06-23T12:00:03Z","payload":{"text":"gamma only"},"preview":"gamma only"}"#,
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+    path.display().to_string()
+}
+
+fn import_match_fixture(temp: &TempDir) {
+    let fixture = write_match_fixture(temp);
+    json_output(ctx(temp).args([
+        "import",
+        "--format",
+        "ctx-history-jsonl-v1",
+        "--path",
+        &fixture,
+        "--json",
+        "--progress",
+        "none",
+    ]));
+}
+
 #[derive(Debug)]
 struct HistorySourcePluginFixture {
     manifest_dir: PathBuf,
@@ -942,6 +974,279 @@ fn import_custom_history_jsonl_format_is_searchable_and_idempotent() {
     assert_eq!(second["totals"]["imported_events"], 0);
     assert_eq!(second["totals"]["imported_edges"], 0);
     assert_eq!(second["totals"]["skipped"], 6);
+}
+
+#[test]
+fn search_match_modes_terms_json_and_no_result_suggestion_are_explicit() {
+    let temp = tempdir();
+    import_match_fixture(&temp);
+
+    let all = json_output(ctx(&temp).args([
+        "search",
+        "alpha beta",
+        "--match",
+        "all",
+        "--events",
+        "--refresh",
+        "off",
+        "--limit",
+        "10",
+        "--json",
+    ]));
+    assert_eq!(all["query_plan"]["mode"], "all");
+    assert_eq!(all["query_plan"]["within_clause_operator"], "AND");
+    assert_eq!(all["results"].as_array().unwrap().len(), 1, "{all:#}");
+    assert_eq!(
+        all["results"][0]["citations"].as_array().unwrap().len(),
+        2,
+        "{all:#}"
+    );
+
+    let phrase = json_output(ctx(&temp).args([
+        "search",
+        "alpha beta",
+        "--match",
+        "phrase",
+        "--events",
+        "--refresh",
+        "off",
+        "--limit",
+        "10",
+        "--json",
+    ]));
+    assert_eq!(phrase["query_plan"]["mode"], "phrase");
+    assert_eq!(phrase["results"].as_array().unwrap().len(), 1, "{phrase:#}");
+
+    let any = json_output(ctx(&temp).args([
+        "search",
+        "alpha zzz",
+        "--match",
+        "any",
+        "--events",
+        "--refresh",
+        "off",
+        "--limit",
+        "10",
+        "--json",
+    ]));
+    assert_eq!(any["query_plan"]["mode"], "any");
+    assert!(!any["results"].as_array().unwrap().is_empty(), "{any:#}");
+
+    let repeated = json_output(ctx(&temp).args([
+        "search",
+        "missing",
+        "--term",
+        "gamma only",
+        "--events",
+        "--refresh",
+        "off",
+        "--limit",
+        "10",
+        "--json",
+    ]));
+    assert_eq!(repeated["query_plan"]["between_clause_operator"], "OR");
+    assert_eq!(
+        repeated["results"].as_array().unwrap().len(),
+        1,
+        "{repeated:#}"
+    );
+
+    let punctuation = json_output(ctx(&temp).args([
+        "search",
+        "write_to_file",
+        "--match",
+        "phrase",
+        "--events",
+        "--refresh",
+        "off",
+        "--limit",
+        "10",
+        "--json",
+    ]));
+    assert_eq!(
+        punctuation["results"][0]["citations"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2,
+        "{punctuation:#}"
+    );
+
+    let literal = json_output(ctx(&temp).args([
+        "search",
+        "OR NOT title:body star*",
+        "--match",
+        "all",
+        "--events",
+        "--refresh",
+        "off",
+        "--limit",
+        "10",
+        "--json",
+    ]));
+    assert_eq!(
+        literal["results"].as_array().unwrap().len(),
+        1,
+        "{literal:#}"
+    );
+
+    let none = json_output(ctx(&temp).args([
+        "search",
+        "alpha absent",
+        "--match",
+        "all",
+        "--provider",
+        "custom",
+        "--history-source",
+        "match-agent/match-source",
+        "--provider-key",
+        "match-agent",
+        "--source-id",
+        "match-source",
+        "--source-format",
+        "match-jsonl",
+        "--workspace",
+        "/workspace/match",
+        "--since",
+        "1d",
+        "--event-type",
+        "message",
+        "--file",
+        "src/lib.rs",
+        "--include-subagents",
+        "--events",
+        "--include-current-session",
+        "--refresh",
+        "off",
+        "--verbose",
+        "--term",
+        "missing-term",
+        "--limit",
+        "7",
+        "--json",
+    ]));
+    assert!(none["results"].as_array().unwrap().is_empty(), "{none:#}");
+    assert_eq!(none["broadened_search"]["executed"], false);
+    assert_eq!(none["broadened_search"]["from_match"], "all");
+    assert_eq!(none["broadened_search"]["to_match"], "any");
+    let command = none["broadened_search"]["command"].as_str().unwrap();
+    for expected in [
+        "--match any",
+        "--limit 7",
+        "--provider=custom",
+        "--history-source=match-agent/match-source",
+        "--provider-key=match-agent",
+        "--source-id=match-source",
+        "--source-format=match-jsonl",
+        "--workspace=/workspace/match",
+        "--since=1d",
+        "--event-type=message",
+        "--file=src/lib.rs",
+        "--term=missing-term",
+        "--include-subagents",
+        "--events",
+        "--include-current-session",
+        "--json",
+        "--refresh=off",
+        "--verbose",
+        "-- 'alpha absent'",
+    ] {
+        assert!(
+            command.contains(expected),
+            "missing {expected:?} in {command}"
+        );
+    }
+    let argv = none["broadened_search"]["argv"].as_array().unwrap();
+    assert_eq!(argv[0], "ctx");
+    assert!(argv.iter().any(|value| value == "search"));
+    let start = argv.iter().position(|value| value == "search").unwrap();
+    let replay_args = argv[start..]
+        .iter()
+        .map(|value| value.as_str().unwrap())
+        .collect::<Vec<_>>();
+    let replay = json_output(ctx(&temp).args(replay_args));
+    assert_eq!(replay["query_plan"]["mode"], "any");
+    assert_eq!(replay["filters"]["provider"], "custom");
+
+    let human = String::from_utf8(
+        ctx(&temp)
+            .args([
+                "search",
+                "alpha absent",
+                "--match",
+                "all",
+                "--events",
+                "--refresh",
+                "off",
+                "--limit",
+                "7",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        human.contains("suggestion (not run): ctx search --match any --limit 7"),
+        "{human}"
+    );
+    assert!(human.contains("no results for"), "{human}");
+}
+
+#[test]
+fn mcp_search_match_modes_schema_and_query_plan_are_exposed() {
+    let temp = tempdir();
+    import_match_fixture(&temp);
+    let responses = mcp_roundtrip(
+        &temp,
+        &[
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search","arguments":{"query":"alpha beta","match":"all","events":true,"limit":10}}}),
+            json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"search","arguments":{"query":"alpha beta","match":"phrase","events":true,"limit":10}}}),
+            json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"search","arguments":{"query":"alpha zzz","match":"any","events":true,"limit":10}}}),
+            json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"search","arguments":{"query":"no-such-token","match":"all","events":true,"limit":10}}}),
+        ],
+    );
+    let tools = responses[1]["result"]["tools"].as_array().unwrap();
+    let search_tool = tools.iter().find(|tool| tool["name"] == "search").unwrap();
+    assert_eq!(
+        search_tool["inputSchema"]["properties"]["match"]["enum"],
+        json!(["all", "any", "phrase"])
+    );
+    for (index, mode) in [(2, "all"), (3, "phrase"), (4, "any"), (5, "all")] {
+        let content = &responses[index]["result"]["structuredContent"];
+        assert_eq!(content["query_plan"]["mode"], mode, "{content:#}");
+        assert_eq!(
+            content["broadened_search"],
+            Value::Null,
+            "MCP should not emit shell command diagnostics"
+        );
+    }
+    assert_eq!(
+        responses[2]["result"]["structuredContent"]["results"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        responses[3]["result"]["structuredContent"]["results"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(!responses[4]["result"]["structuredContent"]["results"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(responses[5]["result"]["structuredContent"]["results"]
+        .as_array()
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -5341,7 +5646,10 @@ fn human_search_reports_no_results() {
         .clone();
     let indexed = String::from_utf8(indexed).unwrap();
     assert!(indexed.contains("no results for definitely-no-results-here"));
-    assert!(indexed.contains("next: try broader terms with ctx search --term \"<term>\""));
+    assert!(indexed.contains("hint: default matching is --match all"));
+    assert!(indexed.contains(
+        "suggestion (not run): ctx search --match any --limit 20 -- definitely-no-results-here"
+    ));
 
     let term_only = ctx(&temp)
         .args(["search", "--term", "term-only-no-results"])
@@ -5352,6 +5660,8 @@ fn human_search_reports_no_results() {
         .clone();
     let term_only = String::from_utf8(term_only).unwrap();
     assert!(term_only.contains("no results for --term term-only-no-results"));
+    assert!(term_only.contains("suggestion (not run): ctx search --match any --limit 20"));
+    assert!(term_only.contains("--term=term-only-no-results"));
 }
 
 #[test]

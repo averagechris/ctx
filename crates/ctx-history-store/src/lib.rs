@@ -17,8 +17,8 @@ use ctx_history_core::{
     new_id, utc_now, AgentType, Artifact, ArtifactKind, CaptureProvider, CaptureSource,
     CaptureSourceDescriptor, CtxIdPrefix, EntityTimestamps, Event, EventRole, EventType, Fidelity,
     FileTouched, HistoryRecord, HistoryRecordLink, RedactionState, Run, RunStatus, RunType,
-    Session, SessionEdge, SessionHistoryArchive, SessionStatus, Summary, SyncCursor, SyncMetadata,
-    SyncState, VcsChange, VcsWorkspace, Visibility,
+    SearchMatchMode, SearchQueryPlan, Session, SessionEdge, SessionHistoryArchive, SessionStatus,
+    Summary, SyncCursor, SyncMetadata, SyncState, VcsChange, VcsWorkspace, Visibility,
 };
 
 pub const SOURCE_IMPORT_ZERO_YIELD_ANOMALY_CODE: &str = "zero_yield_anomaly";
@@ -164,6 +164,15 @@ pub fn schema_version_is_migratable(user_version: i64) -> bool {
 }
 
 const BUSY_TIMEOUT: Duration = Duration::from_millis(30_000);
+/// Page budget for the degraded no-FTS record fallback scan in
+/// [`Store::search_records_plan_page`]. With the per-call page size of
+/// `max(limit * 20, 100)` this caps the scan window at
+/// `20 * max(limit * 20, 100)` newest records (2,000 at the minimum page
+/// size, 80,000 at the CLI's 200-result cap) instead of an unbounded walk of
+/// the whole table. Mirrors the ranked event path's scan-budget rationale
+/// (`FILTERED_SEARCH_MAX_PAGES` in `ctx-history-search`): a degraded index
+/// should degrade to bounded work, not to an O(table) scan per query.
+const RECORD_FALLBACK_SCAN_MAX_PAGES: usize = 20;
 const OBJECTS_DIR: &str = "objects";
 const SPOOL_DIR: &str = "spool";
 const LEGACY_HISTORY_DIR_NAME: &str = "work-record";
@@ -1301,6 +1310,7 @@ pub struct Store {
     conn: Connection,
     busy_timeout: Duration,
     event_search_page_executions: std::cell::Cell<u64>,
+    record_list_page_executions: std::cell::Cell<u64>,
 }
 
 impl Store {
@@ -1337,6 +1347,7 @@ impl Store {
             conn,
             busy_timeout: BUSY_TIMEOUT,
             event_search_page_executions: std::cell::Cell::new(0),
+            record_list_page_executions: std::cell::Cell::new(0),
         })
     }
 
@@ -1412,6 +1423,7 @@ impl Store {
             conn,
             busy_timeout,
             event_search_page_executions: std::cell::Cell::new(0),
+            record_list_page_executions: std::cell::Cell::new(0),
         };
         // migrate() validates the on-disk schema version before applying
         // any persistent connection configuration (journal mode), so a
@@ -3995,6 +4007,8 @@ impl Store {
     }
 
     pub fn list_records_page(&self, limit: usize, offset: usize) -> Result<Vec<HistoryRecord>> {
+        self.record_list_page_executions
+            .set(self.record_list_page_executions.get().saturating_add(1));
         let mut stmt = self.conn.prepare(
             record_select_sql("ORDER BY created_at DESC, id LIMIT ?1 OFFSET ?2").as_str(),
         )?;
@@ -4002,8 +4016,88 @@ impl Store {
         collect_rows(rows)
     }
 
+    /// Internal, non-contractual test instrumentation: number of record list
+    /// page statements executed by this store handle. Tests assert on this
+    /// counter to prove fallback scans stay page-bounded; production callers
+    /// must not depend on it as a public behavioral or telemetry contract.
+    #[doc(hidden)]
+    pub fn record_list_page_executions(&self) -> u64 {
+        self.record_list_page_executions.get()
+    }
+
     pub fn search_records(&self, query: &str, limit: usize) -> Result<Vec<HistoryRecord>> {
         self.search_records_page(query, limit, 0)
+    }
+
+    pub fn search_records_plan(
+        &self,
+        plan: &SearchQueryPlan,
+        limit: usize,
+    ) -> Result<Vec<HistoryRecord>> {
+        self.search_records_plan_page(plan, limit, 0)
+    }
+
+    /// Plan-aware ranked record search. When the FTS projection exists this
+    /// is a single indexed query. Without it (degraded store: the
+    /// `ctx_history_search` table was dropped or never built), a bounded
+    /// Rust-side fallback scans newest-first record pages and matches record
+    /// sections literally. The fallback reads at most
+    /// [`RECORD_FALLBACK_SCAN_MAX_PAGES`] pages of `max(limit * 20, 100)`
+    /// records per call: within that window results and `offset` skipping are
+    /// deterministic (records ordered by `created_at DESC, id`), but matches
+    /// older than the window are missed. Repair via `refresh_search_index` /
+    /// reindexing restores exact search.
+    pub fn search_records_plan_page(
+        &self,
+        plan: &SearchQueryPlan,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<HistoryRecord>> {
+        if plan.fts_match_query().is_none() {
+            return Ok(Vec::new());
+        }
+        if let Some(records) = self.search_records_fts_plan(plan, limit, offset)? {
+            return Ok(records);
+        }
+        let like_terms = plan
+            .clauses
+            .iter()
+            .flat_map(|clause| clause.terms.iter())
+            .collect::<Vec<_>>();
+        if like_terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut records = Vec::new();
+        let mut source_offset = 0usize;
+        let mut matched_seen = 0usize;
+        let mut pages_scanned = 0usize;
+        let page_size = limit.saturating_mul(20).max(100);
+        loop {
+            pages_scanned = pages_scanned.saturating_add(1);
+            let page = self.list_records_page(page_size, source_offset)?;
+            let page_len = page.len();
+            for record in page {
+                if record_sections_match_plan(plan, &record) {
+                    if matched_seen < offset {
+                        matched_seen += 1;
+                        continue;
+                    }
+                    records.push(record);
+                    if records.len() >= limit {
+                        return Ok(records);
+                    }
+                }
+            }
+            if page_len < page_size || pages_scanned >= RECORD_FALLBACK_SCAN_MAX_PAGES {
+                break;
+            }
+            source_offset = source_offset.saturating_add(page_size);
+        }
+        Ok(records)
+    }
+
+    pub fn has_event_search_index(&self) -> Result<bool> {
+        table_exists(&self.conn, "event_search")
     }
 
     pub fn search_records_page(
@@ -4012,10 +4106,11 @@ impl Store {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<HistoryRecord>> {
-        if fts_match_query(query).is_none() {
+        let plan = SearchQueryPlan::new(SearchMatchMode::All, [query]);
+        if plan.fts_match_query().is_none() {
             return Ok(Vec::new());
         }
-        if let Some(records) = self.search_records_fts(query, limit, offset)? {
+        if let Some(records) = self.search_records_fts_plan(&plan, limit, offset)? {
             return Ok(records);
         }
         let like = format!("%{}%", query);
@@ -4029,16 +4124,16 @@ impl Store {
         collect_rows(rows)
     }
 
-    fn search_records_fts(
+    fn search_records_fts_plan(
         &self,
-        query: &str,
+        plan: &SearchQueryPlan,
         limit: usize,
         offset: usize,
     ) -> Result<Option<Vec<HistoryRecord>>> {
         if !table_exists(&self.conn, "ctx_history_search")? {
             return Ok(None);
         }
-        let Some(match_query) = fts_match_query(query) else {
+        let Some(match_query) = plan.fts_match_query() else {
             return Ok(Some(Vec::new()));
         };
         let has_event_search = table_exists(&self.conn, "event_search")?;
@@ -4156,16 +4251,35 @@ impl Store {
         self.event_search_page_executions.get()
     }
 
+    pub fn search_event_hits_plan_page(
+        &self,
+        plan: &SearchQueryPlan,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<EventSearchHit>> {
+        self.search_event_hits_page_inner(plan, limit, offset)
+    }
+
     pub fn search_event_hits_page(
         &self,
         query: &str,
         limit: usize,
         offset: usize,
     ) -> Result<Vec<EventSearchHit>> {
+        let plan = SearchQueryPlan::new(SearchMatchMode::All, [query]);
+        self.search_event_hits_page_inner(&plan, limit, offset)
+    }
+
+    fn search_event_hits_page_inner(
+        &self,
+        plan: &SearchQueryPlan,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<EventSearchHit>> {
         if !table_exists(&self.conn, "event_search")? {
             return Ok(Vec::new());
         }
-        let Some(match_query) = fts_match_query(query) else {
+        let Some(match_query) = plan.fts_match_query() else {
             return Ok(Vec::new());
         };
         let mut stmt = self.conn.prepare(SEARCH_EVENT_HITS_PAGE_SQL)?;
@@ -4192,13 +4306,29 @@ impl Store {
         offset: usize,
         filters: &EventSearchSqlFilters,
     ) -> Result<Vec<EventSearchHit>> {
+        let plan = SearchQueryPlan::new(SearchMatchMode::All, [query]);
+        self.search_event_hits_plan_page_filtered(&plan, limit, offset, filters)
+    }
+
+    /// Plan-aware variant of `search_event_hits_page_filtered`: the FTS MATCH
+    /// expression is derived from the literal-token `SearchQueryPlan`
+    /// (all/any/phrase) instead of an implicit AND-of-words query. The match
+    /// expression is only ever a bound `?1` parameter, so both filtered SQL
+    /// shapes (and their EXPLAIN plans) are byte-identical across match modes.
+    pub fn search_event_hits_plan_page_filtered(
+        &self,
+        plan: &SearchQueryPlan,
+        limit: usize,
+        offset: usize,
+        filters: &EventSearchSqlFilters,
+    ) -> Result<Vec<EventSearchHit>> {
         if filters.is_empty() {
-            return self.search_event_hits_page(query, limit, offset);
+            return self.search_event_hits_page_inner(plan, limit, offset);
         }
         if !table_exists(&self.conn, "event_search")? {
             return Ok(Vec::new());
         }
-        let Some(match_query) = fts_match_query(query) else {
+        let Some(match_query) = plan.fts_match_query() else {
             return Ok(Vec::new());
         };
         // The provider fallback chain is the only predicate that needs the
@@ -6430,18 +6560,14 @@ fn parse_provider_event_dedupe_key(dedupe_key: &str) -> Option<(String, String, 
     }
 }
 
-fn fts_match_query(query: &str) -> Option<String> {
-    let terms = query
-        .split_whitespace()
-        .map(|term| term.trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '-'))
-        .filter(|term| term.chars().any(char::is_alphanumeric))
-        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
-        .collect::<Vec<_>>();
-    if terms.is_empty() {
-        None
-    } else {
-        Some(terms.join(" AND "))
-    }
+fn record_sections_match_plan(plan: &SearchQueryPlan, record: &HistoryRecord) -> bool {
+    plan.matches_text(&record.title)
+        || plan.matches_text(&record.body)
+        || record.tags.iter().any(|tag| plan.matches_text(tag))
+        || record
+            .workspace
+            .as_deref()
+            .is_some_and(|workspace| plan.matches_text(workspace))
 }
 
 fn backfill_legacy_tables(conn: &Connection) -> Result<()> {
@@ -8730,6 +8856,202 @@ mod search_order_tests {
     }
 
     #[test]
+    fn search_query_plan_literals_modes_and_unicode61_punctuation_match_fts() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let one = local_preview_event(
+            1,
+            "Alpha beta write_to_file OR NOT title:body star*",
+            RedactionState::SafePreview,
+        );
+        let two = local_preview_event(
+            2,
+            "beta alpha write to file or not title body star",
+            RedactionState::SafePreview,
+        );
+        let three = local_preview_event(3, "alpha only", RedactionState::SafePreview);
+        for event in [&one, &two, &three] {
+            store.upsert_event(event).unwrap();
+        }
+        store.refresh_search_index().unwrap();
+
+        let all = SearchQueryPlan::new(SearchMatchMode::All, ["alpha beta"]);
+        let all_ids = store
+            .search_event_hits_plan_page(&all, 10, 0)
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.event_id)
+            .collect::<Vec<_>>();
+        assert!(all_ids.contains(&one.id));
+        assert!(all_ids.contains(&two.id));
+        assert!(!all_ids.contains(&three.id));
+
+        let phrase = SearchQueryPlan::new(SearchMatchMode::Phrase, ["write_to_file"]);
+        let phrase_ids = store
+            .search_event_hits_plan_page(&phrase, 10, 0)
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.event_id)
+            .collect::<Vec<_>>();
+        assert!(phrase_ids.contains(&one.id));
+        assert!(phrase_ids.contains(&two.id));
+
+        let any = SearchQueryPlan::new(SearchMatchMode::Any, ["gamma alpha"]);
+        let any_ids = store
+            .search_event_hits_plan_page(&any, 10, 0)
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.event_id)
+            .collect::<Vec<_>>();
+        assert!(any_ids.contains(&three.id));
+
+        let operators = SearchQueryPlan::new(SearchMatchMode::All, ["OR NOT title:body star*"]);
+        let operator_ids = store
+            .search_event_hits_plan_page(&operators, 10, 0)
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.event_id)
+            .collect::<Vec<_>>();
+        assert!(operator_ids.contains(&one.id));
+        assert!(operator_ids.contains(&two.id));
+    }
+
+    #[test]
+    fn search_records_plan_no_fts_scans_past_early_non_matches_and_offsets_matches() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        store
+            .conn
+            .execute("DROP TABLE ctx_history_search", [])
+            .unwrap();
+        for index in 0..430 {
+            let body = if index == 425 {
+                "deep fallback needle"
+            } else {
+                "ordinary"
+            };
+            let mut record =
+                HistoryRecord::new(format!("record {index}"), body, Vec::new(), "note", None);
+            record.id =
+                Uuid::parse_str(&format!("018f45d0-0000-7000-8000-00000003{index:04x}")).unwrap();
+            record.created_at = fixed_time() + chrono::Duration::seconds(index as i64);
+            record.updated_at = record.created_at;
+            store.insert_record(&record).unwrap();
+        }
+        let plan = SearchQueryPlan::new(SearchMatchMode::All, ["deep fallback needle"]);
+        let hits = store.search_records_plan_page(&plan, 1, 0).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].body.contains("deep fallback needle"));
+        assert!(store
+            .search_records_plan_page(&plan, 1, 1)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// The degraded no-FTS fallback must do bounded database work per call:
+    /// at most `RECORD_FALLBACK_SCAN_MAX_PAGES` record list pages, proven via
+    /// the page-execution counter instead of timing. Within the scan window
+    /// results and offset skipping stay deterministic; matches older than the
+    /// window are missed (documented degraded behavior), never scanned for
+    /// with unbounded O(table) work.
+    #[test]
+    fn search_records_plan_no_fts_scan_work_is_page_bounded() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        store
+            .conn
+            .execute("DROP TABLE ctx_history_search", [])
+            .unwrap();
+        // limit 1 => page size 100; budget = 20 pages = the 2,000 newest
+        // records. 2,150 records total leaves 150 older than the window.
+        let total = 2_150_usize;
+        store.begin_immediate_batch().unwrap();
+        for index in 0..total {
+            let body = match index {
+                0 => "beyondbudgetneedle oldest record",
+                2_105 => "windowedneedle second",
+                2_145 => "windowedneedle first",
+                _ => "ordinary",
+            };
+            let mut record =
+                HistoryRecord::new(format!("record {index}"), body, Vec::new(), "note", None);
+            record.id =
+                Uuid::parse_str(&format!("018f45d0-0000-7000-8000-00000004{index:04x}")).unwrap();
+            record.created_at = fixed_time() + chrono::Duration::seconds(index as i64);
+            record.updated_at = record.created_at;
+            store.insert_record(&record).unwrap();
+        }
+        store.commit_batch().unwrap();
+
+        // A query with no match in the window stops at the page budget
+        // instead of walking all 22 pages of the table.
+        let beyond = SearchQueryPlan::new(SearchMatchMode::All, ["beyondbudgetneedle"]);
+        let before = store.record_list_page_executions();
+        let hits = store.search_records_plan_page(&beyond, 1, 0).unwrap();
+        assert_eq!(
+            store.record_list_page_executions() - before,
+            RECORD_FALLBACK_SCAN_MAX_PAGES as u64,
+            "no-FTS fallback must stop at the page budget"
+        );
+        assert!(
+            hits.is_empty(),
+            "a match older than the scan window is missed in degraded no-FTS mode"
+        );
+        assert!(store
+            .list_records(usize::MAX)
+            .unwrap()
+            .iter()
+            .any(|record| record.body.contains("beyondbudgetneedle")));
+
+        // Within the window, matches return early with deterministic offset
+        // skipping over the newest-first ordering.
+        let windowed = SearchQueryPlan::new(SearchMatchMode::All, ["windowedneedle"]);
+        let before = store.record_list_page_executions();
+        let first = store.search_records_plan_page(&windowed, 1, 0).unwrap();
+        assert_eq!(store.record_list_page_executions() - before, 1);
+        assert_eq!(first.len(), 1);
+        assert!(first[0].body.contains("windowedneedle first"));
+        let second = store.search_records_plan_page(&windowed, 1, 1).unwrap();
+        assert_eq!(second.len(), 1);
+        assert!(second[0].body.contains("windowedneedle second"));
+        assert!(store
+            .search_records_plan_page(&windowed, 1, 2)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn search_records_plan_no_fts_does_not_match_across_record_sections() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        store
+            .conn
+            .execute("DROP TABLE ctx_history_search", [])
+            .unwrap();
+        for index in 0..25 {
+            let mut record = HistoryRecord::new(
+                format!("alpha decoy {index}"),
+                "beta decoy",
+                Vec::new(),
+                "note",
+                None,
+            );
+            record.created_at = fixed_time() + chrono::Duration::seconds(index);
+            record.updated_at = record.created_at;
+            store.insert_record(&record).unwrap();
+        }
+        let mut valid =
+            HistoryRecord::new("valid", "alpha beta same section", Vec::new(), "note", None);
+        valid.created_at = fixed_time() + chrono::Duration::seconds(100);
+        valid.updated_at = valid.created_at;
+        store.insert_record(&valid).unwrap();
+        let plan = SearchQueryPlan::new(SearchMatchMode::All, ["alpha beta"]);
+        let hits = store.search_records_plan_page(&plan, 1, 0).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, valid.id);
+    }
+
+    #[test]
     fn search_records_equal_fts_scores_use_record_id_across_refresh_and_reopen() {
         let temp = tempdir();
         let path = temp.path().join("work.sqlite");
@@ -9864,6 +10186,128 @@ mod search_order_tests {
                 .unwrap(),
             store.search_event_hits_page(query, 3, 1).unwrap()
         );
+    }
+
+    /// Differential oracle across match modes: for all/any/phrase plans, the
+    /// filtered SQL page equals the unfiltered plan-ranked stream filtered in
+    /// Rust and sliced by limit/offset. The MATCH expression is only ever a
+    /// bound `?1` parameter, so every mode runs through the same prepared SQL
+    /// constants whose EXPLAIN shapes are asserted by
+    /// `event_hits_page_query_plan_bounds_wide_hydration_to_ranked_page` and
+    /// `filtered_event_hits_page_query_plan_keeps_two_phase_shape`; the page
+    /// execution counter below proves plan calls take those same statements.
+    #[test]
+    fn filtered_event_hits_plan_page_modes_equal_rust_filtered_plan_stream() {
+        let corpus = pushdown_corpus();
+        let store = &corpus.store;
+
+        let plans = [
+            SearchQueryPlan::new(SearchMatchMode::All, ["pushfilter"]),
+            SearchQueryPlan::new(SearchMatchMode::All, ["subagent pushfilter"]),
+            SearchQueryPlan::new(SearchMatchMode::Any, ["subagent sessionless qzzqx"]),
+            SearchQueryPlan::new(SearchMatchMode::Phrase, ["pushfilter subagent"]),
+            SearchQueryPlan::new(SearchMatchMode::Phrase, ["subagent pushfilter"]),
+            // Operator-looking input stays literal in every mode.
+            SearchQueryPlan::new(SearchMatchMode::All, ["pushfilter OR subagent"]),
+        ];
+        let filter_shapes = [
+            EventSearchSqlFilters::default(),
+            EventSearchSqlFilters {
+                agent_scope: Some(EventSearchAgentScope::PrimaryOrSessionless),
+                ..EventSearchSqlFilters::default()
+            },
+            EventSearchSqlFilters {
+                provider: Some(CaptureProvider::Claude),
+                ..EventSearchSqlFilters::default()
+            },
+            EventSearchSqlFilters {
+                session_id: Some(corpus.s_subagent),
+                event_type: Some(EventType::Message),
+                ..EventSearchSqlFilters::default()
+            },
+        ];
+
+        let mut nonempty_mode_combos = 0;
+        for plan in &plans {
+            let full = store.search_event_hits_plan_page(plan, 100, 0).unwrap();
+            for filters in &filter_shapes {
+                let expected_all: Vec<EventSearchHit> = full
+                    .iter()
+                    .filter(|hit| oracle_matches(hit, filters))
+                    .cloned()
+                    .collect();
+                if !expected_all.is_empty() {
+                    nonempty_mode_combos += 1;
+                }
+                for (limit, offset) in [(100_usize, 0_usize), (2, 0), (2, 1), (1, 2)] {
+                    let expected: Vec<EventSearchHit> = expected_all
+                        .iter()
+                        .skip(offset)
+                        .take(limit.max(1))
+                        .cloned()
+                        .collect();
+                    let before = store.event_search_page_executions();
+                    let actual = store
+                        .search_event_hits_plan_page_filtered(plan, limit, offset, filters)
+                        .unwrap();
+                    assert_eq!(
+                        store.event_search_page_executions() - before,
+                        1,
+                        "plan-filtered pages must run one ranked page statement"
+                    );
+                    assert_eq!(
+                        actual, expected,
+                        "plan={plan:?} filters={filters:?} limit={limit} offset={offset}"
+                    );
+                }
+            }
+        }
+        assert!(nonempty_mode_combos > 8, "mode corpus must not be vacuous");
+
+        // Mode semantics are visible in the SQL stream itself: `all` requires
+        // both tokens, `phrase` additionally requires adjacency/order, and
+        // reversed phrase order matches nothing.
+        let all_hits = store
+            .search_event_hits_plan_page(
+                &SearchQueryPlan::new(SearchMatchMode::All, ["subagent pushfilter"]),
+                100,
+                0,
+            )
+            .unwrap();
+        assert!(!all_hits.is_empty());
+        assert!(all_hits
+            .iter()
+            .all(|hit| hit.preview.contains("pushfilter subagent")));
+        let phrase_hits = store
+            .search_event_hits_plan_page(
+                &SearchQueryPlan::new(SearchMatchMode::Phrase, ["pushfilter subagent"]),
+                100,
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            phrase_hits
+                .iter()
+                .map(|hit| hit.event_id)
+                .collect::<Vec<_>>(),
+            all_hits.iter().map(|hit| hit.event_id).collect::<Vec<_>>()
+        );
+        assert!(store
+            .search_event_hits_plan_page(
+                &SearchQueryPlan::new(SearchMatchMode::Phrase, ["subagent pushfilter"]),
+                100,
+                0,
+            )
+            .unwrap()
+            .is_empty());
+        let any_hits = store
+            .search_event_hits_plan_page(
+                &SearchQueryPlan::new(SearchMatchMode::Any, ["subagent sessionless qzzqx"]),
+                100,
+                0,
+            )
+            .unwrap();
+        assert!(any_hits.len() > phrase_hits.len());
     }
 
     /// The filtered shapes must preserve the two-phase plan: candidate

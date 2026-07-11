@@ -100,3 +100,5 @@ ctx show session <ctx-session-id> --format json
 
 Use cited search snippets and `show` output as retrieved material when the next
 step is to brief another agent.
+
+Search matching: default `ctx search "multi word"` is `--match all` (all normalized words in one indexed section, any order). Use repeated `--term` for OR clauses, `--match phrase` for adjacent ordered words, and `--match any` only when intentionally broadening. Punctuation (`_`, `-`, `/`, `.`, quotes, `*`, `:`) separates tokens, diacritics are not folded, and operator-looking text is literal. Filters stay AND. ctx does not silently retry broader modes; copy only labeled `suggestion (not run)` commands when you want that broadening.

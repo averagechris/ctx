@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Added
+
+- `ctx search --match all|any|phrase` (and the MCP `search` tool's `match`
+  argument) makes multiword matching explicit: `all` (default) requires every
+  normalized word of a clause in one indexed section, `any` broadens and
+  rewards more matched tokens, and `phrase` requires adjacent ordered words.
+  Queries are always literal ctx tokens — punctuation separates, diacritics
+  are not folded, and FTS operator syntax is never interpreted. Search JSON
+  gains a structured `query_plan`, and no-result searches print a labeled
+  `suggestion (not run)` one-step broadening command (JSON
+  `broadened_search`) instead of ctx ever retrying broader semantics itself.
+
 ### Fixed
 
 - Delegated the Pages OAuth grant through Linux release builds so their nested

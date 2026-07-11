@@ -208,6 +208,8 @@ ctx search "tool output" --event-type tool_output
 ctx search --file crates/foo/src/lib.rs
 ctx search "token budget" --refresh off
 ctx search "signed metadata" --term checksum --term release
+ctx search "signed metadata" --match phrase
+ctx search "signed metadata" --match any
 ctx search "token budget" --limit 5
 ctx search "token budget" --session <ctx-session-id>
 ctx search "review findings" --include-subagents
@@ -238,10 +240,18 @@ prefixes of at least eight hex digits. Prefixes are case-insensitive and may be
 compact or canonical-hyphenated; a canonical trailing separator after 8, 12, 16,
 or 20 hex digits is accepted, but misplaced or doubled separators are rejected.
 Use `--events` without `--session`
-for dense event-level results across sessions. Repeat
-`--term <query-or-keyword>` when you want to broaden a search across several
-related words or phrases and merge the ranked results; `--term` is OR-style
-broadening, not a must-include filter.
+for dense event-level results across sessions. The positional query and each
+`--term <query-or-keyword>` are independent OR clauses; filters are AND and the
+limit is global. `--match all` (default) requires every normalized token in one
+clause to appear in one indexed section without requiring order. `--match any`
+requires at least one token and rewards more matched tokens. `--match phrase`
+requires normalized tokens to be ordered and adjacent. Tokenization uses ctx portable literal tokens: letters/numbers are tokens, diacritics are not folded, punctuation including `_`,
+`-`, `/`, `.`, quotes, `*`, and `:` separates tokens, and input such as `OR`,
+`NOT`, `title:body`, or `star*` is literal rather than raw FTS syntax. ctx never
+silently retries broader semantics; no-result output may print a labeled
+`suggestion (not run)` command that broadens `phrase -> all` or `all -> any`
+while preserving filters, repeated terms, flags, refresh mode, verbosity, and
+`--limit`.
 Custom history imports can be filtered by `--history-source` using
 `plugin/source` or `provider_key/source_id`, or by exact `--provider-key`,
 `--source-id`, and `--source-format` values. These filters imply
@@ -261,8 +271,8 @@ Results are local hits over indexed history. Event hits include `ctx_event_id`;
 hits with known session context include `ctx_session_id`; provider metadata
 including `provider_session_id` is included when known. Results also include
 title, snippet, rank, result scope, match reasons, source-path/cursor data,
-citations, `suggested_next_commands`, a JSON `freshness` object, and
-pagination/truncation fields in JSON. Default text output is compact and
+citations, `suggested_next_commands`, JSON `query_plan`, `broadened_search`
+(no-result diagnostic), `freshness`, and pagination/truncation fields in JSON. Default text output is compact and
 optimized for agent reading; use `--verbose` for expanded text diagnostics.
 
 Filters:
@@ -277,7 +287,8 @@ Filters:
 - `--file <path>`, indexed touched-file path metadata, not the current
   filesystem;
 - `--session <ctx-session-id-or-prefix>`, for dense event results within one session;
-- `--term <query-or-keyword>`, repeatable broadening terms merged with OR-style semantics;
+- `--match all|any|phrase`, matching within each query/term clause;
+- `--term <query-or-keyword>`, repeatable broadening clauses merged with OR-style semantics;
 - `--events`, for dense event-level results instead of the default session-diverse results;
 - `--include-subagents`;
 - `--limit <n>`, capped at `200`;
@@ -424,3 +435,6 @@ ctx doctor --json
 
 See [contracts/json.md](contracts/json.md) for the current field-level contract
 and known compatibility limits.
+
+
+Relevance note: `--match any` rewards results that match more normalized tokens, but ctx reranks only a bounded candidate pool (at least `max(limit*8, 50)` candidates, collected on unfiltered searches and on `--match any` searches whose filters are pushed exactly into the ranked query, subject to existing scan caps), not the entire historical corpus.

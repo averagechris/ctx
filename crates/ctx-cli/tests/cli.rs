@@ -14,6 +14,37 @@ fn tempdir() -> TempDir {
     Builder::new().prefix("ctx-search-mvp-").tempdir().unwrap()
 }
 
+fn insert_ambiguous_ctx_ids(temp: &TempDir) {
+    let conn = Connection::open(temp.path().join("work.sqlite")).unwrap();
+    let now_ms = 1_788_768_000_000_i64;
+    for (idx, id) in [
+        "aaaaaaaa-1000-7000-8000-000000000001",
+        "aaaaaaaa-2000-7000-8000-000000000002",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        conn.execute(
+            "INSERT INTO sessions (id, provider, external_session_id, agent_type, role_hint, is_primary, status, fidelity, started_at_ms, created_at_ms, updated_at_ms, visibility, sync_state, sync_version, metadata_json) VALUES (?1, 'codex', ?2, 'primary', 'primary', 1, 'imported', 'imported', ?3, ?3, ?3, 'local_only', 'local_only', 0, '{}')",
+            params![id, format!("ambiguous-session-{idx}"), now_ms],
+        )
+        .unwrap();
+    }
+    for (idx, id) in [
+        "bbbbbbbb-1000-7000-8000-000000000001",
+        "bbbbbbbb-2000-7000-8000-000000000002",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        conn.execute(
+            "INSERT INTO events (id, seq, event_type, role, occurred_at_ms, payload_json, dedupe_key, visibility, redaction_state, fidelity, sync_state, sync_version, metadata_json) VALUES (?1, ?2, 'message', 'user', ?3, '{\"text\":\"private transcript text\"}', ?4, 'local_only', 'raw', 'imported', 'local_only', 0, '{}')",
+            params![id, idx as i64, now_ms, format!("ambiguous-event-{idx}")],
+        )
+        .unwrap();
+    }
+}
+
 fn ctx(temp: &TempDir) -> Command {
     let mut command = Command::cargo_bin("ctx").unwrap();
     command.env("CTX_DATA_ROOT", temp.path());
@@ -2416,6 +2447,21 @@ fn fresh_home_search_mvp_flow() {
     ]));
     assert_eq!(show_event_prefix["event"]["ctx_event_id"], ctx_event_id);
 
+    let compact_cross_hyphen = ctx_event_id.replace('-', "")[..9].to_ascii_uppercase();
+    let show_event_compact_cross_hyphen =
+        json_output(ctx(&temp).args(["show", "event", &compact_cross_hyphen, "--format", "json"]));
+    assert_eq!(
+        show_event_compact_cross_hyphen["event"]["ctx_event_id"],
+        ctx_event_id
+    );
+
+    let show_event_canonical_cross_hyphen =
+        json_output(ctx(&temp).args(["show", "event", &ctx_event_id[..10], "--format", "json"]));
+    assert_eq!(
+        show_event_canonical_cross_hyphen["event"]["ctx_event_id"],
+        ctx_event_id
+    );
+
     let show_session =
         json_output(ctx(&temp).args(["show", "session", &ctx_session_id, "--format", "json"]));
     assert_eq!(show_session["schema_version"], 1);
@@ -2424,9 +2470,34 @@ fn fresh_home_search_mvp_flow() {
     assert_eq!(show_session["session"]["item_id"], ctx_session_id);
     assert_eq!(show_session["mode"], "lite");
 
+    let braced_session_id = format!("{{{ctx_session_id}}}");
+    let show_session_braced =
+        json_output(ctx(&temp).args(["show", "session", &braced_session_id, "--format", "json"]));
+    assert_eq!(show_session_braced["session"]["item_id"], ctx_session_id);
+
+    let uppercase_event_id = ctx_event_id.to_ascii_uppercase();
+    let show_event_uppercase_full =
+        json_output(ctx(&temp).args(["show", "event", &uppercase_event_id, "--format", "json"]));
+    assert_eq!(
+        show_event_uppercase_full["event"]["ctx_event_id"],
+        ctx_event_id
+    );
+
+    let urn_event_id = format!("urn:uuid:{ctx_event_id}");
+    let locate_event_urn =
+        json_output(ctx(&temp).args(["locate", "event", &urn_event_id, "--json"]));
+    assert_eq!(locate_event_urn["ctx_event_id"], ctx_event_id);
+
     let show_session_prefix =
         json_output(ctx(&temp).args(["show", "session", &ctx_session_id[..8], "--format", "json"]));
     assert_eq!(show_session_prefix["session"]["item_id"], ctx_session_id);
+
+    let show_session_trailing_hyphen =
+        json_output(ctx(&temp).args(["show", "session", &ctx_session_id[..9], "--format", "json"]));
+    assert_eq!(
+        show_session_trailing_hyphen["session"]["item_id"],
+        ctx_session_id
+    );
 
     let show_session_full = json_output(ctx(&temp).args([
         "show",
@@ -2451,6 +2522,53 @@ fn fresh_home_search_mvp_flow() {
     assert!(locate_event["provider_session_id"].is_string());
     assert!(locate_event["source"]["path"].is_string());
     assert!(locate_event["cursor"].is_string());
+
+    let locate_event_prefix = json_output(ctx(&temp).args([
+        "locate",
+        "event",
+        &ctx_event_id.replace('-', "")[..9],
+        "--json",
+    ]));
+    assert_eq!(locate_event_prefix["ctx_event_id"], ctx_event_id);
+
+    let locate_session_prefix = json_output(ctx(&temp).args([
+        "locate",
+        "session",
+        &ctx_session_id.replace('-', "")[..12],
+        "--json",
+    ]));
+    assert_eq!(locate_session_prefix["ctx_session_id"], ctx_session_id);
+
+    let search_session_prefix = json_output(ctx(&temp).args([
+        "search",
+        "onboarding",
+        "--session",
+        &ctx_session_id[..10],
+        "--events",
+        "--json",
+    ]));
+    assert!(!search_session_prefix["results"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    ctx(&temp)
+        .args(["show", "session", &ctx_session_id[..4]])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("at least 8 hex digits"));
+    ctx(&temp)
+        .args(["show", "event", "abcd-ef12"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "hyphens must appear only in canonical UUID positions",
+        ));
+    ctx(&temp)
+        .args(["show", "event", "ffffffff"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("was not found"));
 
     let export_path = temp.path().join("transcript.md");
     ctx(&temp)
@@ -3034,6 +3152,8 @@ fn mcp_search_and_show_tools_return_structured_json_without_refresh() {
     let ctx_session_id = first_result["ctx_session_id"].as_str().unwrap();
     let ctx_event_id = first_result["ctx_event_id"].as_str().unwrap();
 
+    let mcp_session_prefix = &ctx_session_id[..9];
+    let mcp_event_prefix = ctx_event_id.replace('-', "")[..9].to_ascii_uppercase();
     let show_responses = mcp_roundtrip(
         &temp,
         &[
@@ -3054,7 +3174,7 @@ fn mcp_search_and_show_tools_return_structured_json_without_refresh() {
                 "params": {
                     "name": "show_session",
                     "arguments": {
-                        "ctx_session_id": ctx_session_id,
+                        "ctx_session_id": mcp_session_prefix,
                         "mode": "lite"
                     }
                 }
@@ -3066,8 +3186,31 @@ fn mcp_search_and_show_tools_return_structured_json_without_refresh() {
                 "params": {
                     "name": "show_event",
                     "arguments": {
-                        "ctx_event_id": ctx_event_id,
+                        "ctx_event_id": mcp_event_prefix,
                         "window": 1
+                    }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "session-braced",
+                "method": "tools/call",
+                "params": {
+                    "name": "show_session",
+                    "arguments": {
+                        "ctx_session_id": format!("{{{ctx_session_id}}}"),
+                        "mode": "lite"
+                    }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "event-urn",
+                "method": "tools/call",
+                "params": {
+                    "name": "show_event",
+                    "arguments": {
+                        "ctx_event_id": format!("urn:uuid:{}", ctx_event_id.to_ascii_uppercase())
                     }
                 }
             }),
@@ -3087,6 +3230,90 @@ fn mcp_search_and_show_tools_return_structured_json_without_refresh() {
     assert_eq!(event["ctx_event_id"], ctx_event_id);
     assert_eq!(event["ctx_session_id"], ctx_session_id);
     assert!(!event["events"].as_array().unwrap().is_empty());
+    assert_eq!(
+        show_responses[3]["result"]["structuredContent"]["ctx_session_id"],
+        ctx_session_id
+    );
+    assert_eq!(
+        show_responses[4]["result"]["structuredContent"]["ctx_event_id"],
+        ctx_event_id
+    );
+
+    let filtered = mcp_roundtrip(
+        &temp,
+        &[
+            json!({"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ctx-test","version":"0"}}}),
+            json!({"jsonrpc":"2.0","id":"search","method":"tools/call","params":{"name":"search","arguments":{"query":"onboarding","session": mcp_session_prefix,"events": true}}}),
+        ],
+    );
+    assert!(!filtered[1]["result"]["structuredContent"]["results"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn ambiguous_ctx_id_prefix_errors_are_bounded_and_consistent() {
+    let temp = tempdir();
+    let fixture = provider_history_fixture("codex-sessions");
+    json_output(ctx(&temp).args([
+        "import",
+        "--provider",
+        "codex",
+        "--path",
+        &fixture,
+        "--json",
+        "--progress",
+        "none",
+    ]));
+    insert_ambiguous_ctx_ids(&temp);
+
+    for args in [
+        vec!["show", "session", "aaaaaaaa"],
+        vec!["locate", "session", "aaaaaaaa"],
+        vec!["show", "event", "bbbbbbbb"],
+        vec!["locate", "event", "bbbbbbbb"],
+        vec!["search", "onboarding", "--session", "aaaaaaaa", "--events"],
+    ] {
+        let output = ctx(&temp)
+            .args(args)
+            .assert()
+            .failure()
+            .get_output()
+            .stderr
+            .clone();
+        let stderr = String::from_utf8(output).unwrap();
+        assert!(stderr.contains("ambiguous across 2"), "{stderr}");
+        assert!(stderr.contains("add 1 additional hex digit"), "{stderr}");
+        assert!(stderr.contains("9 total hex digits"), "{stderr}");
+        assert!(!stderr.contains("aaaaaaaa-1000"), "{stderr}");
+        assert!(!stderr.contains("aaaaaaaa-2000"), "{stderr}");
+        assert!(!stderr.contains("bbbbbbbb-1000"), "{stderr}");
+        assert!(!stderr.contains("bbbbbbbb-2000"), "{stderr}");
+        assert!(!stderr.contains("ambiguous-session"), "{stderr}");
+        assert!(!stderr.contains("private transcript text"), "{stderr}");
+    }
+
+    let responses = mcp_roundtrip(
+        &temp,
+        &[
+            json!({"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ctx-test","version":"0"}}}),
+            json!({"jsonrpc":"2.0","id":"session","method":"tools/call","params":{"name":"show_session","arguments":{"ctx_session_id":"aaaaaaaa"}}}),
+            json!({"jsonrpc":"2.0","id":"event","method":"tools/call","params":{"name":"show_event","arguments":{"ctx_event_id":"bbbbbbbb"}}}),
+            json!({"jsonrpc":"2.0","id":"search","method":"tools/call","params":{"name":"search","arguments":{"query":"onboarding","session":"aaaaaaaa","events":true}}}),
+        ],
+    );
+    for response in &responses[1..] {
+        let error = response["result"]["structuredContent"]["error"]
+            .as_str()
+            .unwrap();
+        assert!(error.contains("ambiguous across 2"), "{error}");
+        assert!(error.contains("add 1 additional hex digit"), "{error}");
+        assert!(error.contains("9 total hex digits"), "{error}");
+        assert!(!error.contains("aaaaaaaa-1000"), "{error}");
+        assert!(!error.contains("bbbbbbbb-1000"), "{error}");
+        assert!(!error.contains("private transcript text"), "{error}");
+    }
 }
 
 #[test]

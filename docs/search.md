@@ -44,7 +44,12 @@ A result can include:
   and scoped follow-up searches.
 
 Search result IDs are ctx-owned. Commands accept full ctx IDs or unambiguous
-ctx ID prefixes of at least eight hex characters. Provider-owned IDs are
+ctx ID prefixes of at least eight hex digits. Prefixes are case-insensitive and
+may be compact (`abcdef12`, `abcdef123`) or canonical-hyphenated
+(`abcdef12-`, `abcdef12-3`); if hyphens are present, they must be in canonical
+UUID positions and spell an exact prefix of the canonical UUID. The minimum is
+counted by hex digits, so `abcd` is too short while the trailing canonical
+hyphen in `abcdef12-` is accepted. Provider-owned IDs are
 exposed as metadata so humans can recognize the original provider session, but
 they are not positional lookup IDs. Provider-owned lookup must be explicit, for
 example `--provider codex --provider-session <provider-session-id>` on commands

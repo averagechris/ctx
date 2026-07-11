@@ -15,9 +15,9 @@ use std::os::unix::fs::PermissionsExt;
 use chrono::{DateTime, Utc};
 use ctx_history_core::{
     new_id, utc_now, AgentType, Artifact, ArtifactKind, CaptureProvider, CaptureSource,
-    CaptureSourceDescriptor, EntityTimestamps, Event, EventRole, EventType, Fidelity, FileTouched,
-    HistoryRecord, HistoryRecordLink, RedactionState, Run, RunStatus, RunType, Session,
-    SessionEdge, SessionHistoryArchive, SessionStatus, Summary, SyncCursor, SyncMetadata,
+    CaptureSourceDescriptor, CtxIdPrefix, EntityTimestamps, Event, EventRole, EventType, Fidelity,
+    FileTouched, HistoryRecord, HistoryRecordLink, RedactionState, Run, RunStatus, RunType,
+    Session, SessionEdge, SessionHistoryArchive, SessionStatus, Summary, SyncCursor, SyncMetadata,
     SyncState, VcsChange, VcsWorkspace, Visibility,
 };
 use rusqlite::{
@@ -92,6 +92,37 @@ pub enum StoreError {
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum IdPrefixResolution<T> {
+    Found(T),
+    NotFound,
+    Ambiguous(IdPrefixAmbiguity),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdPrefixAmbiguity {
+    pub candidate_count: usize,
+    pub minimum_total_hex_digits: usize,
+    pub additional_hex_digits: usize,
+}
+
+impl IdPrefixAmbiguity {
+    pub fn message(&self, kind: &str, prefix: &CtxIdPrefix) -> String {
+        let digit_word = if self.additional_hex_digits == 1 {
+            "digit"
+        } else {
+            "digits"
+        };
+        format!(
+            "{kind} id prefix {:?} is ambiguous across {} {kind}s; add {} additional hex {digit_word} ({} total hex digits)",
+            prefix.canonical(),
+            self.candidate_count,
+            self.additional_hex_digits,
+            self.minimum_total_hex_digits
+        )
+    }
+}
 
 const SCHEMA_VERSION: i64 = 15;
 const BUSY_TIMEOUT: Duration = Duration::from_millis(30_000);
@@ -1141,6 +1172,52 @@ impl Store {
             conn,
             busy_timeout: BUSY_TIMEOUT,
         })
+    }
+
+    fn resolve_id_prefix(
+        &self,
+        table: &'static str,
+        prefix: &CtxIdPrefix,
+    ) -> Result<IdPrefixResolution<Uuid>> {
+        let sql = match table {
+            "sessions" => "SELECT id FROM sessions WHERE id GLOB ?1 ORDER BY id",
+            "events" => "SELECT id FROM events WHERE id GLOB ?1 ORDER BY id",
+            _ => unreachable!("unsupported id prefix table"),
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut rows = stmt.query(params![format!("{}*", prefix.canonical())])?;
+        let mut candidate_count = 0_usize;
+        let mut first_id = None;
+        let mut previous_hex: Option<String> = None;
+        let mut max_adjacent_lcp = prefix.hex_digits();
+
+        while let Some(row) = rows.next()? {
+            let id_text: String = row.get(0)?;
+            let id = Uuid::parse_str(&id_text)?;
+            if first_id.is_none() {
+                first_id = Some(id);
+            }
+            candidate_count += 1;
+            let compact = id_text.replace('-', "");
+            if let Some(previous) = &previous_hex {
+                max_adjacent_lcp = max_adjacent_lcp.max(common_prefix_len(previous, &compact));
+            }
+            previous_hex = Some(compact);
+        }
+
+        match (candidate_count, first_id) {
+            (0, _) => Ok(IdPrefixResolution::NotFound),
+            (1, Some(id)) => Ok(IdPrefixResolution::Found(id)),
+            (_, _) => {
+                let minimum_total_hex_digits = (max_adjacent_lcp + 1).min(32);
+                Ok(IdPrefixResolution::Ambiguous(IdPrefixAmbiguity {
+                    candidate_count,
+                    minimum_total_hex_digits,
+                    additional_hex_digits: minimum_total_hex_digits
+                        .saturating_sub(prefix.hex_digits()),
+                }))
+            }
+        }
     }
 
     pub fn open_with_busy_timeout(path: impl AsRef<Path>, busy_timeout: Duration) -> Result<Self> {
@@ -2250,12 +2327,17 @@ impl Store {
             .ok_or(StoreError::NotFound(id))
     }
 
-    pub fn sessions_by_id_prefix(&self, prefix: &str) -> Result<Vec<Session>> {
-        let mut stmt = self
-            .conn
-            .prepare(session_select_sql("WHERE id LIKE ?1 ORDER BY id LIMIT 2").as_str())?;
-        let rows = stmt.query_map(params![format!("{prefix}%")], session_from_row)?;
-        collect_rows(rows)
+    pub fn resolve_session_by_id_prefix(
+        &self,
+        prefix: &CtxIdPrefix,
+    ) -> Result<IdPrefixResolution<Session>> {
+        match self.resolve_id_prefix("sessions", prefix)? {
+            IdPrefixResolution::Found(id) => self.get_session(id).map(IdPrefixResolution::Found),
+            IdPrefixResolution::NotFound => Ok(IdPrefixResolution::NotFound),
+            IdPrefixResolution::Ambiguous(ambiguity) => {
+                Ok(IdPrefixResolution::Ambiguous(ambiguity))
+            }
+        }
     }
 
     pub fn session_by_external_session(
@@ -2660,12 +2742,17 @@ impl Store {
             .ok_or(StoreError::NotFound(id))
     }
 
-    pub fn events_by_id_prefix(&self, prefix: &str) -> Result<Vec<Event>> {
-        let mut stmt = self
-            .conn
-            .prepare(event_select_sql("WHERE id LIKE ?1 ORDER BY id LIMIT 2").as_str())?;
-        let rows = stmt.query_map(params![format!("{prefix}%")], event_from_row)?;
-        collect_rows(rows)
+    pub fn resolve_event_by_id_prefix(
+        &self,
+        prefix: &CtxIdPrefix,
+    ) -> Result<IdPrefixResolution<Event>> {
+        match self.resolve_id_prefix("events", prefix)? {
+            IdPrefixResolution::Found(id) => self.get_event(id).map(IdPrefixResolution::Found),
+            IdPrefixResolution::NotFound => Ok(IdPrefixResolution::NotFound),
+            IdPrefixResolution::Ambiguous(ambiguity) => {
+                Ok(IdPrefixResolution::Ambiguous(ambiguity))
+            }
+        }
     }
 
     pub fn events_for_session(&self, session_id: Uuid) -> Result<Vec<Event>> {
@@ -7492,6 +7579,14 @@ fn collect_rows<T>(
     Ok(values)
 }
 
+fn common_prefix_len(left: &str, right: &str) -> usize {
+    left.as_bytes()
+        .iter()
+        .zip(right.as_bytes())
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
 #[cfg(test)]
 mod search_order_tests {
     use super::*;
@@ -7853,6 +7948,124 @@ mod catalog_tests {
             ended_at: None,
             timestamps: timestamps(),
             sync: sync_metadata(),
+        }
+    }
+
+    fn imported_event(id: Uuid, seq: u64) -> Event {
+        Event {
+            id,
+            seq,
+            history_record_id: None,
+            session_id: None,
+            run_id: None,
+            event_type: EventType::Message,
+            role: Some(EventRole::User),
+            occurred_at: fixed_time(),
+            capture_source_id: None,
+            payload: serde_json::json!({"text":"private transcript text"}),
+            payload_blob_id: None,
+            dedupe_key: Some(format!("event-{seq}")),
+            redaction_state: RedactionState::Raw,
+            sync: sync_metadata(),
+        }
+    }
+
+    #[test]
+    fn id_prefix_resolution_reports_deterministic_ambiguity_and_unique_matches() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let session_ids = [
+            Uuid::parse_str("aaaaaaaa-1100-7000-8000-000000000001").unwrap(),
+            Uuid::parse_str("aaaaaaaa-1200-7000-8000-000000000002").unwrap(),
+            Uuid::parse_str("aaaaaaaa-2000-7000-8000-000000000003").unwrap(),
+        ];
+        for (idx, id) in session_ids.into_iter().enumerate() {
+            let mut session = imported_session(&format!("session-{idx}"));
+            session.id = id;
+            store.upsert_session(&session).unwrap();
+        }
+        let event_ids = [
+            Uuid::parse_str("bbbbbbbb-1000-7000-8000-000000000001").unwrap(),
+            Uuid::parse_str("bbbbbbbb-1001-7000-8000-000000000002").unwrap(),
+            Uuid::parse_str("bbbbbbbb-2000-7000-8000-000000000003").unwrap(),
+        ];
+        for (idx, id) in event_ids.into_iter().enumerate() {
+            store.upsert_event(&imported_event(id, idx as u64)).unwrap();
+        }
+
+        let ambiguous_sessions = CtxIdPrefix::parse("AAAAAAAA").unwrap();
+        assert_eq!(ambiguous_sessions.canonical(), "aaaaaaaa");
+        match store
+            .resolve_session_by_id_prefix(&ambiguous_sessions)
+            .unwrap()
+        {
+            IdPrefixResolution::Ambiguous(ambiguity) => {
+                assert_eq!(ambiguity.candidate_count, 3);
+                assert_eq!(ambiguity.minimum_total_hex_digits, 10);
+                assert_eq!(ambiguity.additional_hex_digits, 2);
+            }
+            other => panic!("expected ambiguous sessions, got {other:?}"),
+        }
+
+        let unique_session = CtxIdPrefix::parse("aaaaaaaa11").unwrap();
+        assert!(matches!(
+            store.resolve_session_by_id_prefix(&unique_session).unwrap(),
+            IdPrefixResolution::Found(Session { id, .. }) if id == session_ids[0]
+        ));
+        let unique_event = CtxIdPrefix::parse("bbbbbbbb-2").unwrap();
+        assert!(matches!(
+            store.resolve_event_by_id_prefix(&unique_event).unwrap(),
+            IdPrefixResolution::Found(Event { id, .. }) if id == event_ids[2]
+        ));
+        let ambiguous_events = CtxIdPrefix::parse("bbbbbbbb").unwrap();
+        match store.resolve_event_by_id_prefix(&ambiguous_events).unwrap() {
+            IdPrefixResolution::Ambiguous(ambiguity) => {
+                assert_eq!(ambiguity.candidate_count, 3);
+                assert_eq!(ambiguity.minimum_total_hex_digits, 12);
+                assert_eq!(ambiguity.additional_hex_digits, 4);
+            }
+            other => panic!("expected ambiguous events, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn id_prefix_queries_use_index_range_searches() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let session_prefix = CtxIdPrefix::parse("aaaaaaaa").unwrap();
+        let event_prefix = CtxIdPrefix::parse("bbbbbbbb").unwrap();
+
+        for (sql, pattern) in [
+            (
+                "EXPLAIN QUERY PLAN SELECT id FROM sessions WHERE id GLOB ?1 ORDER BY id",
+                format!("{}*", session_prefix.canonical()),
+            ),
+            (
+                "EXPLAIN QUERY PLAN SELECT id FROM events WHERE id GLOB ?1 ORDER BY id",
+                format!("{}*", event_prefix.canonical()),
+            ),
+        ] {
+            let details = store
+                .conn
+                .prepare(sql)
+                .unwrap()
+                .query_map(params![pattern], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let plan = details.join("\n").to_ascii_uppercase();
+            assert!(
+                plan.contains("SEARCH"),
+                "expected range search plan, got:\n{plan}"
+            );
+            assert!(
+                plan.contains("ID>?") && plan.contains("ID<?"),
+                "expected id range bounds, got:\n{plan}"
+            );
+            assert!(
+                !plan.contains("SCAN"),
+                "expected no full scan, got:\n{plan}"
+            );
         }
     }
 

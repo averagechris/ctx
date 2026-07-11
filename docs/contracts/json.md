@@ -52,7 +52,25 @@ Reads local storage state and returns:
 - `pending_catalog_sessions`;
 - `failed_catalog_sessions`;
 - `stale_catalog_sessions`;
-- `local_only: true`.
+- `storage` with logical file sizes for `main_db_bytes`, `wal_bytes`,
+  `shm_bytes`, `objects_bytes`, `spool_bytes`, `total_data_root_bytes`,
+  `approx_bytes_per_event`, `available_space_bytes`, `low_space`, `warnings`,
+  and `measurement_complete`;
+- `diagnostics[]`, bounded path-free measurement diagnostics when sizing was
+  partial or unavailable;
+- `local_only: true`;
+- `read_only: true`;
+- `private: true` and `share_safe: false`.
+
+Status JSON is not share-safe: it avoids transcript content but includes local
+storage metadata and, for compatibility, existing absolute path fields. Low
+space is stable across CLI and MCP: `warning` below 512 MiB available and
+`critical` below 128 MiB available. Warnings note that imports and SQLite work
+can require temporary free space. Unsupported filesystem free-space probes are
+reported as `available_space_bytes: null` and `low_space: "unknown"`.
+`measurement_complete: false` means one or more filesystem entries could not be
+measured and reported byte totals are partial. v1 JSON may grow additive fields;
+unknown fields should be ignored by consumers.
 
 ## Sources
 
@@ -427,7 +445,26 @@ Reads local storage and returns findings:
 
 - `schema_version`;
 - `ok`;
+- `private: true` and `share_safe: false`;
 - `findings`.
+
+Without `--storage`, `storage` is `null`. With `ctx doctor --storage --json`,
+`storage` is a direct object containing
+`files`, `sqlite`, `external_provider_sources`, `thresholds`, and
+`temporary_space_note`; it is not a nested status envelope. `storage.sqlite` is
+`null` when the store is uninitialized or SQLite metrics cannot be collected.
+When present, `fts_derived_bytes_available` distinguishes unavailable `dbstat`
+from a measured `fts_derived_bytes: 0`. `external_provider_sources` is
+machine-typed and currently reports `bytes: null`, `measured: false`, and
+`reason: "external_provider_sources_not_measured_read_only"` because the storage
+doctor does not walk provider-history roots.
+`storage.sqlite.live_bytes` is total non-freelist allocated SQLite bytes,
+including FTS-derived/shadow storage. When `dbstat` is available,
+`primary_live_bytes` is the disjoint primary live estimate computed as
+`live_bytes - fts_derived_bytes`; otherwise it is `null`.
+`storage_optional_diagnostics[]` contains optional path-free notes that do not
+make `ok` false; `findings[]` contains integrity, permission, low-space, and
+required measurement failures.
 
 ## Provider Smoke
 

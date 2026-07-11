@@ -73,7 +73,14 @@ Run the same command without `--json` to inspect warnings, then run:
 
 ```bash
 ctx doctor --json
+ctx doctor --storage
 ```
+
+Use `ctx status` for a compact total storage footprint. Use
+`ctx doctor --storage` for read-only deep diagnostics when the data root grows
+unexpectedly or free space is low. The storage doctor reports SQLite logical,
+live, FTS-derived, and freelist/reclaimable bytes where supported, but never
+checkpoints, vacuums, optimizes, or deletes data.
 
 Check the command contract in [contracts/json.md](contracts/json.md), including
 whether the field is documented as nullable or compatibility-only.

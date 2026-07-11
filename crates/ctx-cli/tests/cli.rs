@@ -358,6 +358,22 @@ fn json_output(command: &mut Command) -> Value {
     serde_json::from_slice(&output).unwrap()
 }
 
+fn success_output(command: &mut Command) -> (String, String) {
+    let output = command.assert().success().get_output().clone();
+    (
+        String::from_utf8(output.stdout).unwrap(),
+        String::from_utf8(output.stderr).unwrap(),
+    )
+}
+
+fn failure_output_code(command: &mut Command, code: i32) -> (String, String) {
+    let output = command.assert().code(code).get_output().clone();
+    (
+        String::from_utf8(output.stdout).unwrap(),
+        String::from_utf8(output.stderr).unwrap(),
+    )
+}
+
 fn failure_stderr(command: &mut Command) -> String {
     let stderr = command.assert().failure().get_output().stderr.clone();
     String::from_utf8(stderr).unwrap()
@@ -973,6 +989,422 @@ fn import_custom_history_jsonl_format_is_searchable_and_idempotent() {
     assert_eq!(second["totals"]["imported_events"], 0);
     assert_eq!(second["totals"]["imported_edges"], 0);
     assert_eq!(second["totals"]["skipped"], 6);
+    assert_eq!(second["totals"]["zero_yield_anomaly_sources"], 0);
+    assert_eq!(
+        second["sources"][0]["health"]["classification"],
+        "all_skipped"
+    );
+}
+
+#[test]
+fn codex_zero_yield_anomaly_default_doctor_and_repair_flow() {
+    let temp = tempdir();
+    let secret_dir = temp.path().join("secret-zero-yield-sentinel-dir");
+    fs::create_dir_all(&secret_dir).unwrap();
+    let path = secret_dir.join("zero-yield.jsonl");
+    let sentinel = "secret-zero-yield-sentinel";
+    fs::write(&path, "{}\n").unwrap();
+
+    let (stdout, stderr) = success_output(ctx(&temp).args([
+        "import",
+        "--provider",
+        "codex",
+        "--path",
+        path.to_str().unwrap(),
+        "--json",
+        "--progress",
+        "none",
+    ]));
+    let report: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(report["totals"]["zero_yield_anomaly_sources"], 1);
+    assert_eq!(
+        report["sources"][0]["health"]["classification"],
+        "zero_yield_anomaly"
+    );
+    assert_eq!(report["sources"][0]["scanned_files"], 1);
+    assert_eq!(report["sources"][0]["scanned_bytes"], 3);
+    assert!(
+        stderr.contains("warning: import health detected zero-yield anomaly"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("ctx sources"), "{stderr}");
+    assert!(stderr.contains("explicit provider"), "{stderr}");
+    assert!(stderr.contains("ctx doctor"), "{stderr}");
+    assert!(!stderr.contains(sentinel), "{stderr}");
+    assert!(!stderr.contains(path.to_str().unwrap()), "{stderr}");
+
+    let doctor = json_output(ctx(&temp).args(["doctor", "--json", "--progress", "none"]));
+    assert_eq!(doctor["ok"], false);
+    assert_eq!(
+        doctor["import_health"]["ledger_backed_zero_yield_anomalies"],
+        1
+    );
+    assert_eq!(
+        doctor["import_health"]["coverage"],
+        "manifested_and_catalog_sources_only"
+    );
+    let doctor_text = doctor.to_string();
+    assert!(!doctor_text.contains(sentinel), "{doctor_text}");
+    assert!(
+        !doctor_text.contains(path.to_str().unwrap()),
+        "{doctor_text}"
+    );
+
+    fs::write(
+        &path,
+        concat!(
+            "{}\n",
+            "{\"timestamp\":\"2026-06-24T12:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"zero-yield-repair\",\"timestamp\":\"2026-06-24T12:00:00.000Z\",\"cwd\":\"/workspace\"}}\n",
+            "{\"timestamp\":\"2026-06-24T12:00:01.000Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"repair now has content\"}]}}\n"
+        ),
+    )
+    .unwrap();
+    let repaired = json_output(ctx(&temp).args([
+        "import",
+        "--provider",
+        "codex",
+        "--path",
+        path.to_str().unwrap(),
+        "--json",
+        "--progress",
+        "none",
+    ]));
+    assert_eq!(repaired["totals"]["imported_sessions"], 1);
+    assert_eq!(repaired["totals"]["imported_events"], 1);
+    assert_eq!(repaired["totals"]["zero_yield_anomaly_sources"], 0);
+    let search = json_output(ctx(&temp).args([
+        "search",
+        "repair now has content",
+        "--refresh",
+        "off",
+        "--json",
+    ]));
+    assert!(
+        !search["results"].as_array().unwrap().is_empty(),
+        "{search:#}"
+    );
+    let repeat = json_output(ctx(&temp).args([
+        "import",
+        "--provider",
+        "codex",
+        "--path",
+        path.to_str().unwrap(),
+        "--strict",
+        "--json",
+        "--progress",
+        "none",
+    ]));
+    assert_eq!(repeat["totals"]["zero_yield_anomaly_sources"], 0);
+    assert_eq!(
+        repeat["sources"][0]["health"]["classification"],
+        "unchanged"
+    );
+    let doctor = json_output(ctx(&temp).args(["doctor", "--json", "--progress", "none"]));
+    assert_eq!(doctor["ok"], true);
+    assert_eq!(
+        doctor["import_health"]["ledger_backed_zero_yield_anomalies"],
+        0
+    );
+}
+
+#[test]
+fn codex_zero_byte_explicit_file_is_empty_not_anomaly() {
+    let temp = tempdir();
+    let path = temp.path().join("zero-yield.jsonl");
+    fs::write(&path, "").unwrap();
+    let report = json_output(ctx(&temp).args([
+        "import",
+        "--provider",
+        "codex",
+        "--path",
+        path.to_str().unwrap(),
+        "--json",
+        "--progress",
+        "none",
+    ]));
+    assert_eq!(report["totals"]["zero_yield_anomaly_sources"], 0);
+    assert_eq!(report["sources"][0]["health"]["classification"], "empty");
+}
+
+#[test]
+fn codex_tree_zero_yield_catalog_anomaly_doctor_and_repair() {
+    let temp = tempdir();
+    let root = temp.path().join("codex-tree");
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("zero-yield.jsonl");
+    fs::write(&path, "{}\n").unwrap();
+    let report = json_output(ctx(&temp).args([
+        "import",
+        "--provider",
+        "codex",
+        "--path",
+        root.to_str().unwrap(),
+        "--json",
+        "--progress",
+        "none",
+    ]));
+    assert_eq!(report["totals"]["zero_yield_anomaly_sources"], 1);
+    let doctor = json_output(ctx(&temp).args(["doctor", "--json", "--progress", "none"]));
+    assert_eq!(
+        doctor["import_health"]["ledger_backed_zero_yield_anomalies"],
+        1
+    );
+
+    fs::write(&path, concat!(
+        "{}\n",
+        "{\"timestamp\":\"2026-06-24T12:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"tree-zero-yield-repair\",\"timestamp\":\"2026-06-24T12:00:00.000Z\",\"cwd\":\"/workspace\"}}\n",
+        "{\"timestamp\":\"2026-06-24T12:00:01.000Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"tree repair now has content\"}]}}\n"
+    )).unwrap();
+    let repaired = json_output(ctx(&temp).args([
+        "import",
+        "--provider",
+        "codex",
+        "--path",
+        root.to_str().unwrap(),
+        "--json",
+        "--progress",
+        "none",
+    ]));
+    assert_eq!(repaired["totals"]["zero_yield_anomaly_sources"], 0);
+    let search = json_output(ctx(&temp).args([
+        "search",
+        "tree repair now has content",
+        "--refresh",
+        "off",
+        "--json",
+    ]));
+    assert!(
+        !search["results"].as_array().unwrap().is_empty(),
+        "{search:#}"
+    );
+}
+
+#[test]
+fn codex_tree_mixed_valid_and_zero_yield_reports_partial_and_strict_fails() {
+    let temp = tempdir();
+    let root = temp.path().join("codex-tree-mixed");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("zero-yield.jsonl"), "{}\n").unwrap();
+    fs::write(root.join("valid.jsonl"), concat!(
+        "{}\n",
+        "{\"timestamp\":\"2026-06-24T12:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"tree-valid\",\"timestamp\":\"2026-06-24T12:00:00.000Z\",\"cwd\":\"/workspace\"}}\n",
+        "{\"timestamp\":\"2026-06-24T12:00:01.000Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"tree valid sibling content\"}]}}\n"
+    )).unwrap();
+    let report = json_output(ctx(&temp).args([
+        "import",
+        "--provider",
+        "codex",
+        "--path",
+        root.to_str().unwrap(),
+        "--json",
+        "--progress",
+        "none",
+    ]));
+    assert_eq!(report["totals"]["imported_sessions"], 1);
+    assert_eq!(report["totals"]["zero_yield_anomaly_sources"], 1);
+    assert_eq!(
+        report["sources"][0]["health"]["classification"],
+        "partial_success"
+    );
+    let search = json_output(ctx(&temp).args([
+        "search",
+        "tree valid sibling content",
+        "--refresh",
+        "off",
+        "--json",
+    ]));
+    assert!(
+        !search["results"].as_array().unwrap().is_empty(),
+        "{search:#}"
+    );
+
+    let stderr = failure_stderr(ctx(&temp).args([
+        "import",
+        "--provider",
+        "codex",
+        "--path",
+        root.to_str().unwrap(),
+        "--strict",
+        "--json",
+        "--progress",
+        "none",
+    ]));
+    assert!(stderr.contains("zero-yield anomaly"), "{stderr}");
+}
+
+#[test]
+fn codex_tree_zero_byte_catalog_file_is_empty_not_zero_yield() {
+    let temp = tempdir();
+    let root = temp.path().join("codex-tree-empty");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("empty.jsonl"), "").unwrap();
+    let (stdout, stderr) = success_output(ctx(&temp).args([
+        "import",
+        "--provider",
+        "codex",
+        "--path",
+        root.to_str().unwrap(),
+        "--strict",
+        "--json",
+        "--progress",
+        "none",
+    ]));
+    let report: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(report["totals"]["zero_yield_anomaly_sources"], 0);
+    assert!(!stderr.contains("zero-yield anomaly"), "{stderr}");
+    let doctor = json_output(ctx(&temp).args(["doctor", "--json", "--progress", "none"]));
+    assert_eq!(
+        doctor["import_health"]["ledger_backed_zero_yield_anomalies"],
+        0
+    );
+}
+
+#[test]
+fn codex_tree_malformed_recognized_session_is_not_zero_yield() {
+    let temp = tempdir();
+    let root = temp.path().join("codex-tree-malformed");
+    fs::create_dir_all(&root).unwrap();
+    fs::copy(
+        provider_history_fixture("codex-malformed-session.jsonl"),
+        root.join("malformed.jsonl"),
+    )
+    .unwrap();
+    let (stdout, stderr) = success_output(ctx(&temp).args([
+        "import",
+        "--provider",
+        "codex",
+        "--path",
+        root.to_str().unwrap(),
+        "--json",
+        "--progress",
+        "none",
+    ]));
+    let report: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(report["totals"]["zero_yield_anomaly_sources"], 0);
+    assert_eq!(
+        report["sources"][0]["health"]["classification"],
+        "partial_success"
+    );
+    assert_eq!(report["totals"]["failed"], 1);
+    assert!(!stderr.contains("zero-yield anomaly"), "{stderr}");
+    let doctor = json_output(ctx(&temp).args(["doctor", "--json", "--progress", "none"]));
+    assert_eq!(
+        doctor["import_health"]["ledger_backed_zero_yield_anomalies"],
+        0
+    );
+}
+
+#[test]
+fn codex_zero_yield_anomaly_strict_json_and_human_separate_streams() {
+    let temp = tempdir();
+    let secret_dir = temp.path().join("strict-secret-zero-yield-sentinel-dir");
+    fs::create_dir_all(&secret_dir).unwrap();
+    let path = secret_dir.join("zero-yield.jsonl");
+    fs::write(&path, "{}\n").unwrap();
+
+    let (stdout, stderr) = failure_output_code(
+        ctx(&temp).args([
+            "import",
+            "--provider",
+            "codex",
+            "--path",
+            path.to_str().unwrap(),
+            "--strict",
+            "--json",
+            "--progress",
+            "none",
+        ]),
+        1,
+    );
+    let report: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(report["totals"]["zero_yield_anomaly_sources"], 1);
+    assert_eq!(
+        report["sources"][0]["health"]["classification"],
+        "zero_yield_anomaly"
+    );
+    assert!(
+        stderr.contains("warning: import health detected zero-yield anomaly"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("ctx import --strict detected zero-yield anomaly"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(path.to_str().unwrap()), "{stderr}");
+    assert!(
+        !stderr.contains("strict-secret-zero-yield-sentinel-dir"),
+        "{stderr}"
+    );
+
+    let temp = tempdir();
+    let path = temp.path().join("zero-yield.jsonl");
+    fs::write(&path, "{}\n").unwrap();
+    let (stdout, stderr) = failure_output_code(
+        ctx(&temp).args([
+            "import",
+            "--provider",
+            "codex",
+            "--path",
+            path.to_str().unwrap(),
+            "--strict",
+            "--progress",
+            "none",
+        ]),
+        1,
+    );
+    assert!(stdout.contains("zero_yield_anomaly_sources: 1"), "{stdout}");
+    assert!(
+        stderr.contains("warning: import health detected zero-yield anomaly"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("ctx import --strict detected zero-yield anomaly"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn codex_zero_yield_anomaly_progress_json_stderr_is_structured() {
+    let temp = tempdir();
+    let path = temp.path().join("zero-yield.jsonl");
+    fs::write(&path, "{}\n").unwrap();
+    let (stdout, stderr) = failure_output_code(
+        ctx(&temp).args([
+            "import",
+            "--provider",
+            "codex",
+            "--path",
+            path.to_str().unwrap(),
+            "--strict",
+            "--json",
+            "--progress",
+            "json",
+        ]),
+        1,
+    );
+    serde_json::from_str::<Value>(&stdout).unwrap();
+    assert!(!stderr.trim().is_empty());
+    for line in stderr.lines() {
+        let event = serde_json::from_str::<Value>(line)
+            .unwrap_or_else(|err| panic!("stderr line was not JSON: {line}; {err}"));
+        for key in [
+            "type",
+            "operation",
+            "phase",
+            "message",
+            "completed_bytes",
+            "total_bytes",
+            "percent",
+            "elapsed_seconds",
+            "eta_seconds",
+            "completed_files",
+            "total_files",
+            "imported_events",
+            "done",
+        ] {
+            assert!(event.get(key).is_some(), "missing {key} in {event:#}");
+        }
+    }
 }
 
 #[test]
@@ -1473,6 +1905,45 @@ fn import_history_source_plugin_is_searchable_and_receives_cursor() {
 }
 
 #[test]
+fn source_only_history_source_plugin_import_is_unchanged_not_anomaly() {
+    let temp = tempdir();
+    let script = r#"
+import json, os
+observed = "2026-07-01T12:00:00Z"
+stream = os.environ["CTX_HISTORY_CURSOR_STREAM"]
+records = [
+  {"record_type":"manifest","schema_version":"ctx-history-jsonl-v1"},
+  {"record_type":"source","source_id":os.environ["CTX_HISTORY_SOURCE_ID"],"provider_key":os.environ["CTX_HISTORY_PROVIDER_KEY"],"source_format":os.environ["CTX_HISTORY_SOURCE_FORMAT"],"observed_at":observed,"cursor":{"after":{"stream":stream,"cursor":"source-only:1","observed_at":observed}}}
+]
+for record in records:
+    print(json.dumps(record, separators=(",", ":")))
+"#;
+    let plugin = write_raw_history_source_plugin(&temp, "sourceonly", script);
+
+    let report = json_output(
+        ctx(&temp)
+            .env("CTX_HISTORY_PLUGIN_PATH", &plugin.manifest_dir)
+            .args([
+                "import",
+                "--history-source",
+                "sourceonly/default",
+                "--json",
+                "--progress",
+                "none",
+            ]),
+    );
+    assert_eq!(report["totals"]["zero_yield_anomaly_sources"], 0);
+    assert_eq!(
+        report["sources"][0]["health"]["classification"],
+        "unchanged"
+    );
+    assert_eq!(
+        report["sources"][0]["health"]["reason_counts"]["plugin_cursor_only"],
+        1
+    );
+}
+
+#[test]
 fn import_all_runs_enabled_history_source_plugins_for_external_shapes() {
     let temp = tempdir();
     let plugin_root = temp.path().join("history-plugins");
@@ -1585,6 +2056,7 @@ fn import_all_skips_empty_gemini_source() {
         json_output(ctx(&temp).args(["import", "--all", "--json", "--progress", "none"]));
     assert_eq!(imported["totals"]["imported_sources"], 1);
     assert_eq!(imported["totals"]["failed_sources"], 0);
+    assert_eq!(imported["totals"]["zero_yield_anomaly_sources"], 0);
     assert!(imported["sources"]
         .as_array()
         .unwrap()
@@ -1700,6 +2172,15 @@ fn import_all_reports_source_failure_without_losing_successes() {
         .iter()
         .find(|source| source["provider"] == "opencode")
         .unwrap();
+    assert_eq!(opencode_failure["imported_sessions"], 0);
+    assert_eq!(opencode_failure["imported_events"], 0);
+    assert_eq!(opencode_failure["imported_edges"], 0);
+    assert_eq!(opencode_failure["skipped"], 0);
+    assert_eq!(opencode_failure["failed"], 1);
+    assert_eq!(opencode_failure["malformed_or_unsupported_count"], 1);
+    assert!(opencode_failure.get("scanned_files").is_some());
+    assert!(opencode_failure.get("scanned_bytes").is_some());
+    assert_eq!(opencode_failure["skipped_reasons"], json!({}));
     assert!(
         opencode_failure["error"]
             .as_str()
@@ -4206,6 +4687,30 @@ fn codex_cli_default_import_uses_catalog_state_for_incremental_catch_up() {
     assert_eq!(second["totals"]["imported_edges"], 0);
     assert_eq!(second["totals"]["skipped"], 0);
     assert_eq!(second["totals"]["failed"], 0);
+    assert_eq!(second["totals"]["zero_yield_anomaly_sources"], 0);
+    assert_eq!(
+        second["sources"][0]["health"]["classification"],
+        "unchanged"
+    );
+
+    let (stdout, stderr) = success_output(ctx(&temp).args([
+        "import",
+        "--provider",
+        "codex",
+        "--path",
+        &fixture,
+        "--strict",
+        "--json",
+        "--progress",
+        "none",
+    ]));
+    let strict: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(strict["totals"]["zero_yield_anomaly_sources"], 0);
+    assert_eq!(
+        strict["sources"][0]["health"]["classification"],
+        "unchanged"
+    );
+    assert!(!stderr.contains("zero-yield anomaly"), "{stderr}");
 }
 
 #[test]
@@ -5504,7 +6009,12 @@ fn codex_cli_reports_malformed_partial_import_progress() {
     assert_eq!(imported["totals"]["imported_sessions"], 1);
     assert_eq!(imported["totals"]["imported_events"], 2);
     assert_eq!(imported["totals"]["failed"], 1);
+    assert_eq!(imported["totals"]["zero_yield_anomaly_sources"], 0);
     assert_eq!(imported["sources"][0]["failed"], 1);
+    assert_eq!(
+        imported["sources"][0]["health"]["classification"],
+        "partial_success"
+    );
 
     let search = json_output(ctx(&temp).args(["search", "after malformed", "--json"]));
     assert!(!search["results"].as_array().unwrap().is_empty());
@@ -5521,7 +6031,12 @@ fn pi_cli_reports_malformed_partial_and_schema_failures() {
     assert_eq!(imported["totals"]["imported_sessions"], 1);
     assert_eq!(imported["totals"]["imported_events"], 2);
     assert_eq!(imported["totals"]["failed"], 2);
+    assert_eq!(imported["totals"]["zero_yield_anomaly_sources"], 0);
     assert_eq!(imported["sources"][0]["failed"], 2);
+    assert_eq!(
+        imported["sources"][0]["health"]["classification"],
+        "partial_success"
+    );
     assert_eq!(
         imported["sources"][0]["failures"].as_array().unwrap().len(),
         2

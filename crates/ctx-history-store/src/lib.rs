@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     ffi::CString,
     fs,
     os::raw::c_char,
@@ -20,6 +20,9 @@ use ctx_history_core::{
     Session, SessionEdge, SessionHistoryArchive, SessionStatus, Summary, SyncCursor, SyncMetadata,
     SyncState, VcsChange, VcsWorkspace, Visibility,
 };
+
+pub const SOURCE_IMPORT_ZERO_YIELD_ANOMALY_CODE: &str = "zero_yield_anomaly";
+pub const CATALOG_IMPORT_OUTCOME_UNATTRIBUTED_CODE: &str = "import_outcome_unattributed";
 use rusqlite::{
     ffi, limits::Limit, params, types::ValueRef, Connection, ErrorCode, OpenFlags,
     OptionalExtension, Transaction,
@@ -2456,6 +2459,28 @@ impl Store {
         Ok(changed)
     }
 
+    pub fn count_source_import_zero_yield_anomalies(&self) -> Result<usize> {
+        let count: i64 = self.conn.query_row(
+            r#"
+            SELECT
+              (SELECT COUNT(*)
+               FROM source_import_files
+               WHERE is_stale = 0
+                 AND indexed_status = 'failed'
+                 AND indexed_error = ?1)
+              +
+              (SELECT COUNT(*)
+               FROM catalog_sessions
+               WHERE is_stale = 0
+                 AND indexed_status = 'failed'
+                 AND indexed_error = ?1)
+            "#,
+            [SOURCE_IMPORT_ZERO_YIELD_ANOMALY_CODE],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as usize)
+    }
+
     pub fn catalog_session_count(&self) -> Result<usize> {
         self.conn
             .query_row(
@@ -2610,6 +2635,43 @@ impl Store {
             )
             .optional()
             .map_err(StoreError::from)
+    }
+
+    pub fn existing_external_session_ids(
+        &self,
+        provider: CaptureProvider,
+        external_session_ids: &[String],
+    ) -> Result<HashSet<String>> {
+        const CHUNK_SIZE: usize = 500;
+        let mut distinct = external_session_ids
+            .iter()
+            .filter(|id| !id.is_empty())
+            .cloned()
+            .collect::<Vec<_>>();
+        distinct.sort();
+        distinct.dedup();
+        let mut existing = HashSet::new();
+        for chunk in distinct.chunks(CHUNK_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT external_session_id FROM sessions WHERE provider = ? AND external_session_id IN ({placeholders})"
+            );
+            let provider_name = provider.as_str();
+            let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() + 1);
+            params.push(&provider_name);
+            for id in chunk {
+                params.push(id);
+            }
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0))?;
+            for row in rows {
+                existing.insert(row?);
+            }
+        }
+        Ok(existing)
     }
 
     pub fn sessions_for_record(&self, record_id: Uuid) -> Result<Vec<Session>> {
@@ -13649,6 +13711,103 @@ mod catalog_tests {
             )
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn source_import_zero_yield_anomaly_count_is_path_free_and_clears_on_indexed() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let file = SourceImportFile {
+            provider: CaptureProvider::Codex,
+            source_format: "codex_sessions".to_owned(),
+            source_root: "secret-root".to_owned(),
+            source_path: "secret-path".to_owned(),
+            file_size_bytes: 10,
+            file_modified_at_ms: 1,
+            observed_at_ms: 1,
+            metadata: serde_json::Value::Null,
+        };
+        store
+            .upsert_source_import_files(std::slice::from_ref(&file))
+            .unwrap();
+        let mut file2 = file.clone();
+        file2.source_path = "secret-path-2".to_owned();
+        store
+            .upsert_source_import_files(std::slice::from_ref(&file2))
+            .unwrap();
+        store
+            .mark_source_import_file_failed(
+                CaptureProvider::Codex,
+                &file.source_root,
+                &file.source_path,
+                SOURCE_IMPORT_ZERO_YIELD_ANOMALY_CODE,
+                2,
+            )
+            .unwrap();
+        store
+            .mark_source_import_file_failed(
+                CaptureProvider::Codex,
+                &file2.source_root,
+                &file2.source_path,
+                SOURCE_IMPORT_ZERO_YIELD_ANOMALY_CODE,
+                2,
+            )
+            .unwrap();
+        assert_eq!(store.count_source_import_zero_yield_anomalies().unwrap(), 2);
+        store
+            .mark_source_import_file_indexed(
+                CaptureProvider::Codex,
+                SourceImportFileIndexUpdate {
+                    source_root: &file.source_root,
+                    source_path: &file.source_path,
+                    file_size_bytes: file.file_size_bytes,
+                    file_modified_at_ms: file.file_modified_at_ms,
+                    indexed_at_ms: 3,
+                },
+            )
+            .unwrap();
+        assert_eq!(store.count_source_import_zero_yield_anomalies().unwrap(), 1);
+    }
+
+    #[test]
+    fn existing_external_session_ids_handles_empty_dedupe_chunks_and_provider_isolation() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        assert!(store
+            .existing_external_session_ids(CaptureProvider::Codex, &[])
+            .unwrap()
+            .is_empty());
+
+        for (provider, external_id) in [
+            ("codex", "codex-1"),
+            ("codex", "codex-499"),
+            ("codex", "codex-500"),
+            ("claude", "codex-1"),
+        ] {
+            store.conn.execute(
+                "INSERT INTO sessions (id, provider, external_session_id, agent_type, is_primary, status, fidelity, started_at_ms, created_at_ms, updated_at_ms, visibility, sync_state, sync_version, metadata_json) VALUES (?1, ?2, ?3, 'primary', 1, 'imported', 'imported', 0, 0, 0, 'local_only', 'local_only', 0, '{}')",
+                params![new_id().to_string(), provider, external_id],
+            ).unwrap();
+        }
+
+        let mut ids = (0..=1001)
+            .map(|idx| format!("codex-{idx}"))
+            .collect::<Vec<_>>();
+        ids.push("codex-1".to_owned());
+        ids.push("".to_owned());
+        let existing = store
+            .existing_external_session_ids(CaptureProvider::Codex, &ids)
+            .unwrap();
+        assert_eq!(existing.len(), 3);
+        assert!(existing.contains("codex-1"));
+        assert!(existing.contains("codex-499"));
+        assert!(existing.contains("codex-500"));
+
+        let claude = store
+            .existing_external_session_ids(CaptureProvider::Claude, &["codex-1".to_owned()])
+            .unwrap();
+        assert_eq!(claude.len(), 1);
+        assert!(claude.contains("codex-1"));
     }
 
     #[test]

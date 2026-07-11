@@ -241,6 +241,14 @@ pub struct ProviderImportSummary {
     pub imported_edges: usize,
     pub skipped_edges: usize,
     pub failures: Vec<ProviderImportFailure>,
+    #[serde(default)]
+    pub unchanged_sources: usize,
+    #[serde(default)]
+    pub zero_yield_anomalies: usize,
+    #[serde(default)]
+    pub empty_sources: usize,
+    #[serde(default)]
+    pub empty_files: usize,
     /// Human-readable diagnostics about what the adapter saw and skipped
     /// (e.g., schema detection results, deduplicated rows). Surfaced in
     /// `ctx import --json` output.
@@ -1689,6 +1697,10 @@ impl ProviderImportSummary {
         self.imported_edges += other.imported_edges;
         self.skipped_edges += other.skipped_edges;
         self.failures.extend(other.failures);
+        self.unchanged_sources += other.unchanged_sources;
+        self.zero_yield_anomalies += other.zero_yield_anomalies;
+        self.empty_sources += other.empty_sources;
+        self.empty_files += other.empty_files;
         self.notes.extend(other.notes);
     }
 }

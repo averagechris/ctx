@@ -19,6 +19,7 @@ mod config;
 mod docs;
 mod history_source_plugins;
 mod mcp;
+mod storage_status;
 
 use config::CONFIG_FILE;
 use ctx_history_capture::{
@@ -119,6 +120,8 @@ struct JsonArgs {
 struct DoctorArgs {
     #[arg(long)]
     json: bool,
+    #[arg(long, help = "Include read-only storage footprint diagnostics")]
+    storage: bool,
     #[arg(long, value_enum, default_value_t = ProgressArg::Auto)]
     progress: ProgressArg,
 }
@@ -1497,53 +1500,38 @@ fn setup_has_failed_sources(report: Option<&ImportReport>) -> bool {
 }
 
 fn run_status(args: JsonArgs, data_root: PathBuf) -> Result<()> {
-    let db_path = database_path(data_root.clone());
-    let initialized = db_path.exists();
-    let config_path = data_root.join(CONFIG_FILE);
-    let (records, sessions, events, sources, catalog_counts) = if initialized {
-        let store = Store::open(&db_path)?;
-        let counts = store.indexed_history_counts()?;
-        (
-            counts.items(),
-            counts.sessions,
-            counts.events,
-            store.capture_source_count()?,
-            store.catalog_session_counts()?,
-        )
-    } else {
-        (0, 0, 0, 0, Default::default())
-    };
+    let snapshot = storage_status::snapshot(&data_root, CONFIG_FILE)?;
 
     if args.json {
-        print_json(json!({
-            "schema_version": 1,
-            "initialized": initialized,
-            "data_root": data_root,
-            "database_path": db_path,
-            "config_path": config_path,
-            "indexed_items": records,
-            "indexed_sessions": sessions,
-            "indexed_events": events,
-            "indexed_sources": sources,
-            "cataloged_sessions": catalog_counts.total,
-            "indexed_catalog_sessions": catalog_counts.indexed,
-            "pending_catalog_sessions": catalog_counts.pending,
-            "failed_catalog_sessions": catalog_counts.failed,
-            "stale_catalog_sessions": catalog_counts.stale,
-            "local_only": true,
-        }))?;
+        print_json(storage_status::status_json(&snapshot))?;
     } else {
-        println!("data_root: {}", data_root.display());
-        println!("database_path: {}", db_path.display());
-        println!("config_path: {}", config_path.display());
-        println!("initialized: {initialized}");
-        println!("indexed_items: {records}");
-        println!("indexed_sources: {sources}");
-        println!("cataloged_sessions: {}", catalog_counts.total);
-        println!("indexed_catalog_sessions: {}", catalog_counts.indexed);
-        println!("pending_catalog_sessions: {}", catalog_counts.pending);
-        println!("failed_catalog_sessions: {}", catalog_counts.failed);
-        println!("stale_catalog_sessions: {}", catalog_counts.stale);
+        println!("data_root: {}", snapshot.data_root.display());
+        println!("database_path: {}", snapshot.db_path.display());
+        println!("config_path: {}", snapshot.config_path.display());
+        println!("initialized: {}", snapshot.initialized);
+        println!("indexed_items: {}", snapshot.counts.items);
+        println!("indexed_sources: {}", snapshot.counts.sources);
+        println!("cataloged_sessions: {}", snapshot.counts.catalog_total);
+        println!(
+            "indexed_catalog_sessions: {}",
+            snapshot.counts.catalog_indexed
+        );
+        println!(
+            "pending_catalog_sessions: {}",
+            snapshot.counts.catalog_pending
+        );
+        println!(
+            "failed_catalog_sessions: {}",
+            snapshot.counts.catalog_failed
+        );
+        println!("stale_catalog_sessions: {}", snapshot.counts.catalog_stale);
+        println!("{}", storage_status::human_total(&snapshot));
+        for warning in storage_status::warnings(&snapshot) {
+            println!("warning: {warning}");
+        }
+        for diagnostic in storage_status::diagnostic_messages_for_snapshot(&snapshot) {
+            println!("diagnostic: {diagnostic}");
+        }
         println!("local_only: true");
     }
     Ok(())
@@ -3575,7 +3563,7 @@ fn open_existing_store_read_only(db_path: &Path, command: &str) -> Result<Store>
     match Store::open_read_only(db_path) {
         Ok(store) => Ok(store),
         Err(StoreError::UnsupportedSchemaVersion(version)) => Err(anyhow!(
-            "ctx store schema version {version} is not supported by this ctx binary; run `ctx status` once to migrate before using `{command}`"
+            "ctx store schema version {version} is not supported by this ctx binary; run `ctx setup` or `ctx import` to migrate before using `{command}`"
         )),
         Err(err) => {
             Err(err).with_context(|| format!("open read-only ctx store {}", db_path.display()))
@@ -4329,9 +4317,19 @@ fn run_doctor(args: DoctorArgs, data_root: PathBuf) -> Result<()> {
         );
         findings.extend(store.validate()?);
     }
+    let storage = if args.storage {
+        Some(storage_status::snapshot_deep(&data_root, CONFIG_FILE)?)
+    } else {
+        None
+    };
+    let storage_findings = storage
+        .as_ref()
+        .map(storage_status::findings)
+        .unwrap_or_default();
+    let ok = findings.is_empty() && storage_findings.is_empty();
     progress.done(
         "done",
-        if findings.is_empty() {
+        if ok {
             "ctx doctor passed"
         } else {
             "ctx doctor found issues"
@@ -4339,17 +4337,36 @@ fn run_doctor(args: DoctorArgs, data_root: PathBuf) -> Result<()> {
         0,
     );
     if args.json {
+        let mut all_findings = findings.clone();
+        all_findings.extend(storage_findings);
         print_json(json!({
             "schema_version": 1,
-            "ok": findings.is_empty(),
+            "ok": ok,
             "progress": progress_mode_name(args.progress),
-            "findings": findings,
+            "private": true,
+            "share_safe": false,
+            "storage": storage.as_ref().map(storage_status::storage_json),
+            "storage_optional_diagnostics": storage.as_ref().map(storage_status::optional_diagnostic_messages).unwrap_or_default(),
+            "findings": all_findings,
         }))?;
-    } else if findings.is_empty() {
+    } else if ok {
         println!("ok");
+        if let Some(snapshot) = storage {
+            for line in storage_status::human_storage_lines(&snapshot) {
+                println!("{line}");
+            }
+        }
     } else {
         for finding in findings {
             println!("{finding}");
+        }
+        for finding in storage_findings {
+            println!("{finding}");
+        }
+        if let Some(snapshot) = storage {
+            for line in storage_status::human_storage_lines(&snapshot) {
+                println!("{line}");
+            }
         }
     }
     Ok(())

@@ -23,6 +23,7 @@ ctx setup --progress json --json
 ctx status
 ctx status --json
 ctx doctor
+ctx doctor --storage
 ctx doctor --json
 ```
 
@@ -35,8 +36,12 @@ ctx doctor --json
   fast inventory or troubleshooting, but it does not make history searchable.
 - `status` reports the ctx root, database path, config path, indexed item
   count, indexed source count, catalog session counters, initialization state,
-  and local-only marker.
-- `doctor` opens local storage and reports validation findings.
+  local storage footprint, available filesystem bytes when supported, and
+  local-only marker. It is read-only and points human output to
+  `ctx doctor --storage` for deep diagnostics.
+- `doctor` opens local storage and reports validation findings. Add `--storage`
+  for read-only SQLite/file footprint diagnostics; it never checkpoints,
+  vacuums, optimizes, or deletes data.
 
 Setup and health checks do not change shell startup files, install repository
 integrations, write into source repositories, call model APIs, or require API

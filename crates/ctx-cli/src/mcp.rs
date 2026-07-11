@@ -18,10 +18,10 @@ use uuid::Uuid;
 
 use super::{
     compact_json, config::CONFIG_FILE, discovered_plugin_sources_json, discovered_sources,
-    event_window, event_window_json, indexed_history_item_count, mark_share_safe,
-    raw_sql_result_json, search_filters, search_has_intent, session_transcript_json, sources_json,
-    OutputFormat, ProviderArg, RefreshArg, SearchDto, SearchFilterInput, SearchIntentInput,
-    SearchRefreshReport, SourceIdentityFilterArgs, TranscriptMode, MAX_SEARCH_LIMIT,
+    event_window, event_window_json, mark_share_safe, raw_sql_result_json, search_filters,
+    search_has_intent, session_transcript_json, sources_json, storage_status, OutputFormat,
+    ProviderArg, RefreshArg, SearchDto, SearchFilterInput, SearchIntentInput, SearchRefreshReport,
+    SourceIdentityFilterArgs, TranscriptMode, MAX_SEARCH_LIMIT,
 };
 
 const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
@@ -263,49 +263,10 @@ fn handle_tools_call(params: Value, data_root: &Path) -> Result<Value, Value> {
 }
 
 fn tool_status(data_root: &Path) -> Result<Value> {
-    let db_path = database_path(data_root.to_path_buf());
-    let initialized = db_path.exists();
-    let (
-        indexed_items,
-        indexed_sources,
-        cataloged_sessions,
-        indexed_catalog_sessions,
-        pending_catalog_sessions,
-        failed_catalog_sessions,
-        stale_catalog_sessions,
-    ) = if initialized {
-        let store = Store::open_read_only(&db_path)
-            .with_context(|| format!("open read-only ctx store {}", db_path.display()))?;
-        let catalog_counts = store.catalog_session_counts()?;
-        (
-            indexed_history_item_count(&store)?,
-            store.capture_source_count()?,
-            catalog_counts.total,
-            catalog_counts.indexed,
-            catalog_counts.pending,
-            catalog_counts.failed,
-            catalog_counts.stale,
-        )
-    } else {
-        (0, 0, 0, 0, 0, 0, 0)
-    };
-
-    Ok(json!({
-        "schema_version": 1,
-        "initialized": initialized,
-        "data_root": data_root,
-        "database_path": db_path,
-        "config_path": data_root.join(CONFIG_FILE),
-        "indexed_items": indexed_items,
-        "indexed_sources": indexed_sources,
-        "cataloged_sessions": cataloged_sessions,
-        "indexed_catalog_sessions": indexed_catalog_sessions,
-        "pending_catalog_sessions": pending_catalog_sessions,
-        "failed_catalog_sessions": failed_catalog_sessions,
-        "stale_catalog_sessions": stale_catalog_sessions,
-        "local_only": true,
-        "read_only": true,
-    }))
+    Ok(storage_status::status_json(&storage_status::snapshot(
+        data_root,
+        CONFIG_FILE,
+    )?))
 }
 
 fn tool_sources(data_root: &Path) -> Result<Value> {

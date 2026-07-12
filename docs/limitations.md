@@ -68,8 +68,8 @@ shipped.
   not leak in compact projections. Compact also excludes provider-session IDs,
   source IDs/metadata/existence, cwd, provider/source cursors, raw payload, and
   suggested commands. Compact is smaller, not share-safe.
-- Source/status/locate/raw-SQL extraction from the CLI remains outstanding for
-  the broader reusable query-service project.
+- Source/status/locate/raw-SQL DTO construction is shared through the reusable
+  read-only query-service layer; transport-specific rendering remains in CLI/MCP.
 - `--max-snippet-bytes`/`--max-event-bytes` and `--max-page-bytes` bound item
   projection text and admitted item JSON bytes, not the total response envelope.
   JSON records are admitted whole; ctx does not emit partial JSON items. A

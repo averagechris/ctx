@@ -8,8 +8,10 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Args, Subcommand};
 use ctx_history_core::{database_path, CtxIdPrefix, EventType, SearchMatchMode};
 use ctx_history_query::{
-    BytePolicy, FieldSet, QueryService, TranscriptMode as QueryTranscriptMode, DEFAULT_ITEM_BYTES,
-    DEFAULT_PAGE_BYTES, MAX_ITEM_BYTES, MAX_PAGE_BYTES, MAX_SHOW_LIMIT,
+    raw_sql_result_json, sources_json as query_sources_json, status_json as query_status_json,
+    status_snapshot as query_status_snapshot, BytePolicy, FieldSet, QueryService,
+    TranscriptMode as QueryTranscriptMode, DEFAULT_ITEM_BYTES, DEFAULT_PAGE_BYTES, MAX_ITEM_BYTES,
+    MAX_PAGE_BYTES, MAX_SHOW_LIMIT,
 };
 use ctx_history_store::{
     IdPrefixResolution, RawSqlOptions, Store, RAW_SQL_DEFAULT_MAX_COLUMNS,
@@ -21,13 +23,12 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::{
-    command_from_argv, compact_json, config::CONFIG_FILE, discovered_plugin_sources_json,
-    discovered_sources, event_page_json, event_window, event_window_json, mark_share_safe,
-    raw_sql_result_json, search_filters, search_has_intent, search_next_argv, search_page_json,
-    show_session_next_argv, sources_json, storage_status, FieldArg, OutputFormat, ProviderArg,
-    RefreshArg, SearchArgs, SearchFilterInput, SearchIntentInput, SearchMatchArg,
-    SearchRefreshReport, ShowSessionArgs, SourceIdentityFilterArgs, TranscriptMode,
-    MAX_SEARCH_LIMIT,
+    command_from_argv, compact_json, config::CONFIG_FILE, discovered_sources, event_page_json,
+    event_window, event_window_json, mark_share_safe, plugin_failure_projections,
+    plugin_source_projections, search_filters, search_has_intent, search_next_argv,
+    search_page_json, show_session_next_argv, FieldArg, OutputFormat, ProviderArg, RefreshArg,
+    SearchArgs, SearchFilterInput, SearchIntentInput, SearchMatchArg, SearchRefreshReport,
+    ShowSessionArgs, SourceIdentityFilterArgs, TranscriptMode, MAX_SEARCH_LIMIT,
 };
 
 const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
@@ -290,21 +291,20 @@ fn handle_tools_call(params: Value, data_root: &Path) -> Result<Value, Value> {
 }
 
 fn tool_status(data_root: &Path) -> Result<Value> {
-    Ok(storage_status::status_json(&storage_status::snapshot(
-        data_root,
-        CONFIG_FILE,
-    )?))
+    Ok(query_status_json(&query_status_snapshot(data_root, CONFIG_FILE).map_err(|_| {
+        anyhow!("read-only store is unavailable; run `ctx setup` or `ctx import` to migrate writable storage if needed")
+    })?))
 }
 
 fn tool_sources(data_root: &Path) -> Result<Value> {
     let sources = discovered_sources();
-    let mut source_values = sources_json(&sources);
-    source_values.extend(discovered_plugin_sources_json(data_root)?);
-    Ok(json!({
-        "schema_version": 1,
-        "sources": source_values,
-        "read_only": true,
-    }))
+    let plugin_discovery = super::discover_history_source_plugins_with_diagnostics(data_root, &[])?;
+    Ok(query_sources_json(
+        &sources,
+        &plugin_source_projections(&plugin_discovery.sources),
+        &plugin_failure_projections(&plugin_discovery.failures),
+        true,
+    ))
 }
 
 fn tool_search(arguments: &Value, data_root: &Path) -> Result<Value> {
@@ -473,7 +473,7 @@ fn tool_sql(arguments: &Value, data_root: &Path) -> Result<Value> {
         .map(|value| u64::try_from(value).map_err(|_| anyhow!("timeout_ms is too large")))
         .transpose()?
         .unwrap_or_else(|| duration_millis_u64(RAW_SQL_DEFAULT_TIMEOUT));
-    let result = store.raw_sql_query(
+    let result = QueryService::new(&store).raw_sql(
         &sql,
         RawSqlOptions {
             max_rows,

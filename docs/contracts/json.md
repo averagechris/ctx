@@ -218,8 +218,9 @@ payloads, but it can still include absolute paths, token-shaped strings, command
 output, and other private transcript content. Treat `safe_preview` output as
 private unless a user separately reviews and redacts it.
 
-`ctx show session` is the #195 paged-query slice of #187 (status, sources,
-locate, and raw SQL are not yet query-owned). It returns additive query-owned v1
+`ctx show session` is the #195 paged-query slice of #187. Status, sources,
+locate, bounded raw SQL, search, and session/event windows now share the
+transport-neutral read-only query layer. Show returns additive query-owned v1
 typed projections with `fields: "full"|"compact"`. Compact session output
 contains only ctx session ID, provider, agent type, status, primary flag, and
 start/end times; compact events contain only ctx event ID, sequence, event type,
@@ -396,8 +397,10 @@ suggested commands. Full remains private and may include local paths, source
 metadata, snippets, and citations. The query-owned full projection includes
 compatibility aliases and `suggested_next_commands[]`; compact does not.
 
-This pagination/query service is the paged slice of the broader #187 extraction.
-Status, sources, locate, and raw SQL remain CLI/MCP-specific for now.
+This pagination service is one part of the broader #187 extraction. Status,
+sources, locate, and bounded raw SQL use the same transport-neutral read-only
+query layer; CLI and MCP retain only their transport-specific envelopes and
+rendering.
 
 Continuation snapshot fingerprints are conservative SHA-256 digests over physical
 SQLite state: selected PRAGMAs plus stable samples of the main DB, WAL, and SHM

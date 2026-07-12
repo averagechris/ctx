@@ -5,6 +5,7 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use ctx_history_core::database_path;
+use ctx_history_query::StatusSnapshotV1 as QueryStatusSnapshot;
 use ctx_history_store::Store;
 use serde_json::{json, Value};
 
@@ -70,10 +71,6 @@ pub struct SqliteStorage {
     pub live_bytes: u64,
     pub fts_derived_bytes: Option<u64>,
     pub primary_live_bytes: Option<u64>,
-}
-
-pub fn snapshot(data_root: &Path, config_file: &str) -> Result<StorageSnapshot> {
-    snapshot_with_options(data_root, config_file, false)
 }
 
 pub fn snapshot_deep(data_root: &Path, config_file: &str) -> Result<StorageSnapshot> {
@@ -144,48 +141,6 @@ fn snapshot_with_options(
     Ok(snap)
 }
 
-pub fn status_json(s: &StorageSnapshot) -> Value {
-    let bytes_per_event = if s.counts.events > 0 {
-        Some(s.files.total_data_root_bytes / s.counts.events as u64)
-    } else {
-        None
-    };
-    json!({
-        "schema_version": 1,
-        "initialized": s.initialized,
-        "data_root": s.data_root,
-        "database_path": s.db_path,
-        "config_path": s.config_path,
-        "indexed_items": s.counts.items,
-        "indexed_sessions": s.counts.sessions,
-        "indexed_events": s.counts.events,
-        "indexed_sources": s.counts.sources,
-        "cataloged_sessions": s.counts.catalog_total,
-        "indexed_catalog_sessions": s.counts.catalog_indexed,
-        "pending_catalog_sessions": s.counts.catalog_pending,
-        "failed_catalog_sessions": s.counts.catalog_failed,
-        "stale_catalog_sessions": s.counts.catalog_stale,
-        "storage": {
-            "main_db_bytes": s.files.main_db_bytes,
-            "wal_bytes": s.files.wal_bytes,
-            "shm_bytes": s.files.shm_bytes,
-            "objects_bytes": s.files.objects_bytes,
-            "spool_bytes": s.files.spool_bytes,
-            "total_data_root_bytes": s.files.total_data_root_bytes,
-            "approx_bytes_per_event": bytes_per_event,
-            "available_space_bytes": s.available_space_bytes,
-            "low_space": low_space(s.available_space_bytes),
-            "warnings": warnings(s),
-            "measurement_complete": s.measurement_complete,
-        },
-        "local_only": true,
-        "read_only": true,
-        "private": true,
-        "share_safe": false,
-        "diagnostics": diagnostic_messages(&s.diagnostics),
-    })
-}
-
 pub fn storage_json(s: &StorageSnapshot) -> Value {
     json!({
         "files": storage_files_json(s),
@@ -205,6 +160,22 @@ pub fn storage_json(s: &StorageSnapshot) -> Value {
 
 pub fn human_total(s: &StorageSnapshot) -> String {
     format!("storage_total: {} bytes (db {}, wal {}, objects {}, spool {}); run `ctx doctor --storage` for details", s.files.total_data_root_bytes, s.files.main_db_bytes, s.files.wal_bytes, s.files.objects_bytes, s.files.spool_bytes)
+}
+
+pub fn human_total_query(s: &QueryStatusSnapshot) -> String {
+    format!("storage_total: {} bytes (db {}, wal {}, objects {}, spool {}); run `ctx doctor --storage` for details", s.files.total_data_root_bytes, s.files.main_db_bytes, s.files.wal_bytes, s.files.objects_bytes, s.files.spool_bytes)
+}
+
+pub fn warnings_query(s: &QueryStatusSnapshot) -> Vec<String> {
+    match s.available_space_bytes {
+        Some(v) if v < LOW_SPACE_CRITICAL_BYTES => vec![format!(
+            "critical low free space: {v} bytes available; imports can need temporary space and may fail"
+        )],
+        Some(v) if v < LOW_SPACE_WARNING_BYTES => vec![format!(
+            "low free space: {v} bytes available; imports can need temporary space"
+        )],
+        _ => Vec::new(),
+    }
 }
 
 pub fn warnings(s: &StorageSnapshot) -> Vec<String> {
@@ -317,17 +288,6 @@ fn sqlite_json(s: &StorageSnapshot) -> Option<Value> {
             "freelist_count": m.freelist_count,
         })
     })
-}
-
-pub fn diagnostic_messages_for_snapshot(s: &StorageSnapshot) -> Vec<String> {
-    diagnostic_messages(&s.diagnostics)
-}
-
-fn diagnostic_messages(diagnostics: &[StorageDiagnostic]) -> Vec<String> {
-    diagnostics
-        .iter()
-        .map(|diagnostic| diagnostic.message.clone())
-        .collect()
 }
 
 trait DiagnosticSink {

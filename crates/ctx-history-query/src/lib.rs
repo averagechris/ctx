@@ -5,19 +5,25 @@
 //! projections, with structurally distinct full and compact variants.
 
 use chrono::{DateTime, Utc};
+use ctx_history_capture::{ProviderImportSupport, ProviderSource, ProviderSourceStatus};
 use ctx_history_core::{
-    AgentType, CaptureProvider, CaptureSource, CaptureSourceKind, ContextCitationType,
-    ContextLinks, Event, EventRole, EventType, Fidelity, RedactionState, SearchMatchMode,
-    SearchQueryPlan, Session, SessionStatus, Visibility,
+    database_path, AgentType, CaptureProvider, CaptureSource, CaptureSourceKind,
+    ContextCitationType, ContextLinks, Event, EventRole, EventType, Fidelity, ProviderRawRetention,
+    RedactionState, SearchMatchMode, SearchQueryPlan, Session, SessionStatus, Visibility,
 };
 use ctx_history_search::{
     search_packet, search_packet_terms, validate_query_request, PacketOptions, SearchFilters,
     SearchPacketResult, SearchResultMode, SearchResultScope, SEARCH_PACKET_SCHEMA_VERSION,
 };
-use ctx_history_store::{SelectedEventMode, Store};
+use ctx_history_store::{RawSqlOptions, RawSqlResult, RawSqlValue, SelectedEventMode, Store};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+};
 use uuid::Uuid;
 
 pub const QUERY_DTO_SCHEMA_VERSION: u32 = 1;
@@ -31,6 +37,8 @@ pub const MAX_PAGE_BYTES: usize = 16 * 1024 * 1024;
 /// Compatibility name retained for callers that used the scaffold constant.
 pub const MAX_SNIPPET_BYTES: usize = MAX_ITEM_BYTES;
 const MAX_TOKEN_BYTES: usize = 4096;
+pub const LOW_SPACE_WARNING_BYTES: u64 = 512 * 1024 * 1024;
+pub const LOW_SPACE_CRITICAL_BYTES: u64 = 128 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum QueryError {
@@ -73,6 +81,191 @@ pub enum QueryError {
 }
 
 pub type Result<T> = std::result::Result<T, QueryError>;
+
+#[derive(Debug, Clone, Default)]
+pub struct StatusSnapshotV1 {
+    pub initialized: bool,
+    pub data_root: PathBuf,
+    pub db_path: PathBuf,
+    pub config_path: PathBuf,
+    pub counts: StatusCountsV1,
+    pub files: StatusFilesV1,
+    pub available_space_bytes: Option<u64>,
+    pub diagnostics: Vec<String>,
+    pub measurement_complete: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct StatusCountsV1 {
+    pub items: usize,
+    pub sessions: usize,
+    pub events: usize,
+    pub sources: usize,
+    pub catalog_total: usize,
+    pub catalog_indexed: usize,
+    pub catalog_pending: usize,
+    pub catalog_failed: usize,
+    pub catalog_stale: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct StatusFilesV1 {
+    pub main_db_bytes: u64,
+    pub wal_bytes: u64,
+    pub shm_bytes: u64,
+    pub objects_bytes: u64,
+    pub spool_bytes: u64,
+    pub total_data_root_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct HistorySourcePluginSourceProjection {
+    pub plugin_name: String,
+    pub plugin_display_name: Option<String>,
+    pub plugin_version: Option<String>,
+    pub manifest_path: PathBuf,
+    pub id: String,
+    pub display_name: Option<String>,
+    pub provider_key: String,
+    pub source_id: String,
+    pub source_format: String,
+    pub enabled: bool,
+    pub refresh: &'static str,
+}
+
+#[derive(Debug, Clone)]
+pub struct HistorySourcePluginFailureProjection {
+    pub manifest_path: PathBuf,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LocateSessionV1 {
+    pub schema_version: u32,
+    pub target: &'static str,
+    pub item_type: &'static str,
+    pub ctx_session_id: Uuid,
+    pub provider: CaptureProvider,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_ctx_session_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_ctx_session_id: Option<Uuid>,
+    pub agent_type: AgentType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    pub status: SessionStatus,
+    pub started_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<Value>,
+    pub resume: Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LocateEventV1 {
+    pub schema_version: u32,
+    pub target: &'static str,
+    pub item_type: &'static str,
+    pub ctx_event_id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ctx_session_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<CaptureProvider>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_session_id: Option<String>,
+    pub sequence: u64,
+    pub event_type: EventType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<EventRole>,
+    pub occurred_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume: Option<Value>,
+}
+
+pub fn status_snapshot(data_root: &Path, config_file: &str) -> Result<StatusSnapshotV1> {
+    let db_path = database_path(data_root.to_path_buf());
+    let mut snap = StatusSnapshotV1 {
+        initialized: db_path.exists(),
+        data_root: data_root.to_path_buf(),
+        db_path: db_path.clone(),
+        config_path: data_root.join(config_file),
+        ..Default::default()
+    };
+    snap.files.main_db_bytes = file_len(&db_path);
+    snap.files.wal_bytes = file_len(db_path.with_extension("sqlite-wal"));
+    snap.files.shm_bytes = file_len(db_path.with_extension("sqlite-shm"));
+    let root_size = sized_tree(data_root, &mut snap.diagnostics);
+    snap.files.total_data_root_bytes = root_size.total_bytes;
+    snap.measurement_complete = root_size.complete;
+    snap.files.objects_bytes = root_size.child_bytes(&data_root.join("objects"));
+    snap.files.spool_bytes = root_size.child_bytes(&data_root.join("spool"));
+    snap.available_space_bytes = available_space_bytes(data_root)
+        .or_else(|| data_root.parent().and_then(available_space_bytes));
+    if snap.initialized {
+        let store = Store::open_read_only(&db_path)?;
+        let c = store.indexed_history_counts()?;
+        snap.counts.items = c.items();
+        snap.counts.sessions = c.sessions;
+        snap.counts.events = c.events;
+        snap.counts.sources = store.capture_source_count()?;
+        let c = store.catalog_session_counts()?;
+        snap.counts.catalog_total = c.total;
+        snap.counts.catalog_indexed = c.indexed;
+        snap.counts.catalog_pending = c.pending;
+        snap.counts.catalog_failed = c.failed;
+        snap.counts.catalog_stale = c.stale;
+    }
+    Ok(snap)
+}
+
+pub fn status_json(s: &StatusSnapshotV1) -> Value {
+    let bytes_per_event = if s.counts.events > 0 {
+        Some(s.files.total_data_root_bytes / s.counts.events as u64)
+    } else {
+        None
+    };
+    json!({
+        "schema_version": 1,
+        "initialized": s.initialized,
+        "data_root": s.data_root,
+        "database_path": s.db_path,
+        "config_path": s.config_path,
+        "indexed_items": s.counts.items,
+        "indexed_sessions": s.counts.sessions,
+        "indexed_events": s.counts.events,
+        "indexed_sources": s.counts.sources,
+        "cataloged_sessions": s.counts.catalog_total,
+        "indexed_catalog_sessions": s.counts.catalog_indexed,
+        "pending_catalog_sessions": s.counts.catalog_pending,
+        "failed_catalog_sessions": s.counts.catalog_failed,
+        "stale_catalog_sessions": s.counts.catalog_stale,
+        "storage": {
+            "main_db_bytes": s.files.main_db_bytes,
+            "wal_bytes": s.files.wal_bytes,
+            "shm_bytes": s.files.shm_bytes,
+            "objects_bytes": s.files.objects_bytes,
+            "spool_bytes": s.files.spool_bytes,
+            "total_data_root_bytes": s.files.total_data_root_bytes,
+            "approx_bytes_per_event": bytes_per_event,
+            "available_space_bytes": s.available_space_bytes,
+            "low_space": low_space(s.available_space_bytes),
+            "warnings": status_warnings(s.available_space_bytes),
+            "measurement_complete": s.measurement_complete,
+        },
+        "local_only": true,
+        "read_only": true,
+        "private": true,
+        "share_safe": false,
+        "diagnostics": s.diagnostics,
+    })
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -525,6 +718,73 @@ impl<'a> QueryService<'a> {
         Self { store }
     }
 
+    pub fn raw_sql(&self, sql: &str, options: RawSqlOptions) -> Result<RawSqlResult> {
+        Ok(self.store.raw_sql_query(sql, options)?)
+    }
+
+    pub fn locate_session(&self, session: &Session) -> Result<LocateSessionV1> {
+        let source = session
+            .capture_source_id
+            .map(|id| {
+                self.store
+                    .get_capture_source(id)
+                    .map(|source| source_location_json(&source))
+            })
+            .transpose()?;
+        Ok(LocateSessionV1 {
+            schema_version: QUERY_DTO_SCHEMA_VERSION,
+            target: "session",
+            item_type: "session_location",
+            ctx_session_id: session.id,
+            provider: session.provider,
+            provider_session_id: session.external_session_id.clone(),
+            parent_ctx_session_id: session.parent_session_id,
+            root_ctx_session_id: session.root_session_id,
+            agent_type: session.agent_type,
+            role: session.role_hint.clone(),
+            status: session.status,
+            started_at: session.started_at,
+            ended_at: session.ended_at,
+            source,
+            resume: provider_resume_json(session.provider, session.external_session_id.as_deref()),
+        })
+    }
+
+    pub fn locate_event(&self, event: &Event) -> Result<LocateEventV1> {
+        let session = event
+            .session_id
+            .map(|id| self.store.get_session(id))
+            .transpose()?;
+        let source = event
+            .capture_source_id
+            .map(|id| {
+                self.store
+                    .get_capture_source(id)
+                    .map(|source| source_location_json(&source))
+            })
+            .transpose()?;
+        Ok(LocateEventV1 {
+            schema_version: QUERY_DTO_SCHEMA_VERSION,
+            target: "event",
+            item_type: "event_location",
+            ctx_event_id: event.id,
+            ctx_session_id: event.session_id,
+            provider: session.as_ref().map(|session| session.provider),
+            provider_session_id: session
+                .as_ref()
+                .and_then(|session| session.external_session_id.clone()),
+            sequence: event.seq,
+            event_type: event.event_type,
+            role: event.role,
+            occurred_at: event.occurred_at,
+            source,
+            cursor: event_cursor(event),
+            resume: session.as_ref().map(|session| {
+                provider_resume_json(session.provider, session.external_session_id.as_deref())
+            }),
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn session_events(
         &self,
@@ -850,6 +1110,132 @@ impl<'a> QueryService<'a> {
             },
             fields,
         })
+    }
+}
+
+pub fn sources_response_json<I>(sources: I, read_only: bool) -> Value
+where
+    I: IntoIterator<Item = Value>,
+{
+    let mut value = json!({
+        "schema_version": QUERY_DTO_SCHEMA_VERSION,
+        "sources": sources.into_iter().collect::<Vec<_>>(),
+    });
+    if read_only {
+        value
+            .as_object_mut()
+            .expect("object")
+            .insert("read_only".to_owned(), Value::Bool(true));
+    }
+    value
+}
+
+pub fn sources_json(
+    native_sources: &[ProviderSource],
+    plugin_sources: &[HistorySourcePluginSourceProjection],
+    plugin_failures: &[HistorySourcePluginFailureProjection],
+    read_only: bool,
+) -> Value {
+    let mut rows = native_sources_json(native_sources);
+    rows.extend(plugin_sources_json(plugin_sources));
+    rows.extend(plugin_manifest_failures_json(plugin_failures));
+    sources_response_json(rows, read_only)
+}
+
+pub fn native_sources_json(sources: &[ProviderSource]) -> Vec<Value> {
+    sources.iter().map(native_source_json).collect()
+}
+
+fn native_source_json(source: &ProviderSource) -> Value {
+    json!({
+        "provider": source.provider.as_str(),
+        "path": source.path,
+        "exists": source.exists,
+        "source_format": source.source_format,
+        "status": provider_source_status_json(source.status),
+        "import_support": import_support_json(source.import_support),
+        "native_import": source.import_support.is_auto_importable(),
+        "importable": source.status == ProviderSourceStatus::Available && source.import_support.is_importable(),
+        "raw_retention": raw_retention_json(source.raw_retention),
+        "unsupported_reason": source.unsupported_reason,
+    })
+}
+
+pub fn plugin_sources_json(sources: &[HistorySourcePluginSourceProjection]) -> Vec<Value> {
+    sources.iter().map(|source| json!({
+        "provider": CaptureProvider::Custom.as_str(), "kind": "history_source_plugin", "plugin": source.plugin_name,
+        "plugin_display_name": source.plugin_display_name, "plugin_version": source.plugin_version,
+        "history_source": format!("{}/{}", source.plugin_name, source.id), "history_source_id": source.id,
+        "display_name": source.display_name, "provider_key": source.provider_key, "source_id": source.source_id,
+        "source_format": source.source_format, "manifest_path": source.manifest_path, "enabled": source.enabled,
+        "refresh": source.refresh, "status": "available", "import_support": "history_source_plugin", "native_import": false,
+        "importable": true, "raw_retention": "metadata_only", "unsupported_reason": null,
+    })).collect()
+}
+
+pub fn plugin_manifest_failures_json(
+    failures: &[HistorySourcePluginFailureProjection],
+) -> Vec<Value> {
+    failures.iter().map(|failure| json!({
+        "provider": CaptureProvider::Custom.as_str(), "kind": "history_source_plugin", "plugin": null,
+        "plugin_display_name": null, "plugin_version": null, "history_source": null, "history_source_id": null,
+        "display_name": null, "provider_key": null, "source_id": null, "source_format": null,
+        "manifest_path": failure.manifest_path, "enabled": false, "refresh": null, "status": "invalid",
+        "import_support": "history_source_plugin", "native_import": false, "importable": false,
+        "raw_retention": "metadata_only", "unsupported_reason": failure.error, "error": failure.error,
+    })).collect()
+}
+
+fn provider_source_status_json(status: ProviderSourceStatus) -> &'static str {
+    status.as_str()
+}
+fn import_support_json(support: ProviderImportSupport) -> &'static str {
+    match support {
+        ProviderImportSupport::Native => "native",
+        ProviderImportSupport::Preview => "preview",
+        ProviderImportSupport::Unsupported => "unsupported",
+    }
+}
+fn raw_retention_json(retention: ProviderRawRetention) -> &'static str {
+    match retention {
+        ProviderRawRetention::None => "none",
+        ProviderRawRetention::PathReference => "path_reference",
+        ProviderRawRetention::MetadataOnly => "metadata_only",
+        ProviderRawRetention::LocalBlob => "local_blob",
+        ProviderRawRetention::Withheld => "withheld",
+    }
+}
+
+pub fn raw_sql_result_json(result: &RawSqlResult) -> Value {
+    compact_json_value(json!({
+        "schema_version": QUERY_DTO_SCHEMA_VERSION, "item_type": "sql_result", "read_only": true,
+        "columns": result.columns.iter().map(|column| column.name.clone()).collect::<Vec<_>>(),
+        "rows": result.rows.iter().map(|row| row.iter().map(raw_sql_value_json).collect::<Vec<_>>()).collect::<Vec<_>>(),
+        "returned_rows": result.returned_rows,
+        "truncated": { "rows": result.truncated.rows, "values": result.truncated.values },
+        "limits": { "max_rows": result.limits.max_rows, "max_columns": result.limits.max_columns, "max_value_bytes": result.limits.max_value_bytes, "max_sql_bytes": result.limits.max_sql_bytes, "timeout_ms": result.limits.timeout_ms },
+        "elapsed_ms": result.elapsed.as_millis(),
+    }))
+}
+
+pub fn raw_sql_value_json(value: &RawSqlValue) -> Value {
+    match value {
+        RawSqlValue::Null => Value::Null,
+        RawSqlValue::Integer(value) => json!(value),
+        RawSqlValue::Real(value) => serde_json::Number::from_f64(*value)
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
+        RawSqlValue::Text {
+            value,
+            bytes,
+            truncated,
+        } if *truncated => json!({"type":"text","value":value,"bytes":bytes,"truncated":true}),
+        RawSqlValue::Text { value, .. } => Value::String(value.clone()),
+        RawSqlValue::Blob {
+            bytes,
+            preview_hex,
+            truncated,
+        } => json!({"type":"blob","bytes":bytes,"preview_hex":preview_hex,"truncated":truncated}),
     }
 }
 
@@ -1579,6 +1965,229 @@ fn hex_nibble(value: u8) -> Result<u8> {
     }
 }
 
+fn source_location_json(source: &CaptureSource) -> Value {
+    let path = source.descriptor.raw_source_path.clone();
+    compact_json_value(
+        json!({"source_id": source.id,"provider": source.descriptor.provider,"provider_session_id": source.descriptor.external_session_id,"path": path,"exists": path.as_deref().map(|path| Path::new(path).exists()),"cwd": source.descriptor.cwd,"started_at": source.started_at,"ended_at": source.ended_at,"source_format": source_format(&source.sync.metadata),"cursor": source_cursor(&source.sync.metadata)}),
+    )
+}
+
+fn source_format(metadata: &Value) -> Option<String> {
+    [
+        "/source_format",
+        "/format",
+        "/provider/source_format",
+        "/source/source_format",
+    ]
+    .iter()
+    .find_map(|pointer| {
+        metadata
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    })
+}
+fn source_cursor(metadata: &Value) -> Option<String> {
+    metadata
+        .pointer("/cursor/after/cursor")
+        .and_then(Value::as_str)
+        .or_else(|| metadata.pointer("/cursor").and_then(Value::as_str))
+        .map(str::to_owned)
+}
+fn provider_resume_json(provider: CaptureProvider, provider_session_id: Option<&str>) -> Value {
+    let (command, argv) = match (provider, provider_session_id) {
+        (CaptureProvider::Codex, Some(session_id)) => (
+            Some(format!("codex resume {}", shell_quote_arg(session_id))),
+            Some(vec![
+                "codex".to_owned(),
+                "resume".to_owned(),
+                session_id.to_owned(),
+            ]),
+        ),
+        _ => (None, None),
+    };
+    compact_json_value(json!({ "available": command.is_some(), "command": command, "argv": argv }))
+}
+fn compact_json_value(mut value: Value) -> Value {
+    prune_null_json_value(&mut value);
+    value
+}
+fn prune_null_json_value(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.retain(|_, nested| {
+                prune_null_json_value(nested);
+                !nested.is_null()
+            });
+        }
+        Value::Array(items) => items.iter_mut().for_each(prune_null_json_value),
+        _ => {}
+    }
+}
+fn file_len(path: impl AsRef<Path>) -> u64 {
+    fs::symlink_metadata(path)
+        .ok()
+        .filter(|m| m.file_type().is_file())
+        .map(|m| m.len())
+        .unwrap_or(0)
+}
+#[derive(Default)]
+struct TreeSize {
+    total_bytes: u64,
+    children: Vec<(PathBuf, u64)>,
+    complete: bool,
+    omitted: usize,
+}
+
+impl TreeSize {
+    fn child_bytes(&self, path: &Path) -> u64 {
+        self.children
+            .iter()
+            .find_map(|(child, bytes)| (child == path).then_some(*bytes))
+            .unwrap_or(0)
+    }
+}
+
+fn sized_tree(path: &Path, diagnostics: &mut Vec<String>) -> TreeSize {
+    let mut tree = TreeSize {
+        complete: true,
+        ..Default::default()
+    };
+    let Ok(entries) = fs::read_dir(path) else {
+        if path.exists() {
+            tree.complete = false;
+            push_measurement_diag(
+                diagnostics,
+                &mut tree.omitted,
+                "could not read data-root directory",
+            );
+        }
+        return tree;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            tree.complete = false;
+            push_measurement_diag(
+                diagnostics,
+                &mut tree.omitted,
+                "could not read a data-root entry",
+            );
+            continue;
+        };
+        let child_path = entry.path();
+        let bytes = dir_size(
+            &child_path,
+            diagnostics,
+            &mut tree.complete,
+            &mut tree.omitted,
+        );
+        tree.total_bytes = tree.total_bytes.saturating_add(bytes);
+        tree.children.push((child_path, bytes));
+    }
+    if tree.omitted > 0 {
+        diagnostics.push(format!("measurement diagnostics omitted: {}", tree.omitted));
+    }
+    tree
+}
+
+fn dir_size(
+    path: &Path,
+    diagnostics: &mut Vec<String>,
+    complete: &mut bool,
+    omitted: &mut usize,
+) -> u64 {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(_) => {
+            *complete = false;
+            push_measurement_diag(diagnostics, omitted, "could not measure data-root entry");
+            return 0;
+        }
+    };
+    if meta.file_type().is_symlink() {
+        return 0;
+    }
+    if meta.is_file() {
+        return meta.len();
+    }
+    let mut total = 0u64;
+    let rd = match fs::read_dir(path) {
+        Ok(rd) => rd,
+        Err(_) => {
+            *complete = false;
+            push_measurement_diag(
+                diagnostics,
+                omitted,
+                "could not read data-root directory entry",
+            );
+            return 0;
+        }
+    };
+    for entry in rd {
+        match entry {
+            Ok(entry) => {
+                total =
+                    total.saturating_add(dir_size(&entry.path(), diagnostics, complete, omitted))
+            }
+            Err(_) => {
+                *complete = false;
+                push_measurement_diag(
+                    diagnostics,
+                    omitted,
+                    "could not read data-root directory entry",
+                );
+            }
+        }
+    }
+    total
+}
+
+fn push_measurement_diag(diagnostics: &mut Vec<String>, omitted: &mut usize, message: &str) {
+    const CAP: usize = 20;
+    if diagnostics.len() < CAP {
+        diagnostics.push(message.to_owned());
+    } else {
+        *omitted += 1;
+    }
+}
+fn low_space(v: Option<u64>) -> &'static str {
+    match v {
+        Some(x) if x < LOW_SPACE_CRITICAL_BYTES => "critical",
+        Some(x) if x < LOW_SPACE_WARNING_BYTES => "warning",
+        Some(_) => "ok",
+        None => "unknown",
+    }
+}
+fn status_warnings(v: Option<u64>) -> Vec<String> {
+    match v { Some(x) if x < LOW_SPACE_CRITICAL_BYTES => vec![format!("critical low free space: {x} bytes available; imports can need temporary space and may fail")], Some(x) if x < LOW_SPACE_WARNING_BYTES => vec![format!("low free space: {x} bytes available; imports can need temporary space")], _ => Vec::new() }
+}
+
+#[cfg(unix)]
+fn available_space_bytes(path: &Path) -> Option<u64> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+    fn statvfs_field_to_u64<T>(value: T) -> Option<u64>
+    where
+        T: TryInto<u64>,
+    {
+        value.try_into().ok()
+    }
+    let path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    let rc = unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    let stat = unsafe { stat.assume_init() };
+    let available_blocks = statvfs_field_to_u64(stat.f_bavail)?;
+    let fragment_size = statvfs_field_to_u64(stat.f_frsize)?;
+    Some(available_blocks.saturating_mul(fragment_size))
+}
+#[cfg(not(unix))]
+fn available_space_bytes(_path: &Path) -> Option<u64> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1588,6 +2197,183 @@ mod tests {
         DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .unwrap()
             .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn status_snapshot_reports_absent_store_without_initializing() {
+        let temp = tempfile::tempdir().unwrap();
+        let snap = status_snapshot(temp.path(), "config.json").unwrap();
+        assert!(!snap.initialized);
+        assert_eq!(snap.counts.items, 0);
+        assert!(!snap.db_path.exists());
+        let value = status_json(&snap);
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["initialized"], false);
+        assert_eq!(value["read_only"], true);
+        assert_eq!(value["share_safe"], false);
+        assert!(value["storage"]
+            .as_object()
+            .unwrap()
+            .contains_key("approx_bytes_per_event"));
+        assert!(value["storage"]
+            .as_object()
+            .unwrap()
+            .contains_key("available_space_bytes"));
+        assert!(value["storage"]["approx_bytes_per_event"].is_null());
+    }
+
+    #[test]
+    fn status_snapshot_uses_single_traversal_child_totals() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("objects")).unwrap();
+        fs::create_dir(temp.path().join("spool")).unwrap();
+        fs::write(temp.path().join("objects").join("a"), [0u8; 3]).unwrap();
+        fs::write(temp.path().join("spool").join("b"), [0u8; 5]).unwrap();
+        fs::write(temp.path().join("c"), [0u8; 7]).unwrap();
+        let snap = status_snapshot(temp.path(), "config.json").unwrap();
+        assert_eq!(snap.files.objects_bytes, 3);
+        assert_eq!(snap.files.spool_bytes, 5);
+        assert_eq!(snap.files.total_data_root_bytes, 15);
+        assert!(snap.measurement_complete);
+    }
+
+    #[test]
+    fn sources_response_preserves_caller_projected_sources_and_read_only_flag() {
+        let source = json!({"provider": "codex", "status": "available", "path": "/tmp/codex"});
+        let value = sources_response_json([source.clone()], true);
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["read_only"], true);
+        assert_eq!(value["sources"].as_array().unwrap(), &[source]);
+
+        let cli_value = sources_response_json(Vec::<Value>::new(), false);
+        assert!(cli_value.get("read_only").is_none());
+    }
+
+    #[test]
+    fn source_rows_project_native_plugin_and_failure_shapes() {
+        let native = ProviderSource {
+            provider: CaptureProvider::Codex,
+            path: PathBuf::from("/tmp/codex"),
+            exists: true,
+            source_format: "codex_session_jsonl_tree",
+            source_kind: ctx_history_capture::ProviderSourceKind::NativeHistory,
+            import_support: ProviderImportSupport::Native,
+            catalog_support: ctx_history_capture::ProviderCatalogSupport::None,
+            status: ProviderSourceStatus::Available,
+            raw_retention: ProviderRawRetention::PathReference,
+            redaction_boundary: ctx_history_core::ProviderRedactionBoundary::ManualReview,
+            unsupported_reason: None,
+        };
+        let plugin = HistorySourcePluginSourceProjection {
+            plugin_name: "plug".into(),
+            plugin_display_name: Some("Plug".into()),
+            plugin_version: Some("1".into()),
+            manifest_path: PathBuf::from("/tmp/manifest.json"),
+            id: "src".into(),
+            display_name: Some("Source".into()),
+            provider_key: "agent".into(),
+            source_id: "sid".into(),
+            source_format: "fmt".into(),
+            enabled: true,
+            refresh: "auto",
+        };
+        let failure = HistorySourcePluginFailureProjection {
+            manifest_path: PathBuf::from("/bad.json"),
+            error: "bad manifest".into(),
+        };
+        let value = sources_json(&[native], &[plugin], &[failure], true);
+        let rows = value["sources"].as_array().unwrap();
+        assert_eq!(rows[0]["provider"], "codex");
+        assert_eq!(rows[0]["native_import"], true);
+        assert_eq!(rows[1]["history_source"], "plug/src");
+        assert_eq!(rows[1]["refresh"], "auto");
+        assert_eq!(rows[2]["status"], "invalid");
+        assert_eq!(rows[2]["error"], "bad manifest");
+    }
+
+    #[test]
+    fn raw_sql_values_project_scalars_and_truncation() {
+        assert_eq!(raw_sql_value_json(&RawSqlValue::Null), Value::Null);
+        assert_eq!(raw_sql_value_json(&RawSqlValue::Integer(7)), json!(7));
+        assert_eq!(
+            raw_sql_value_json(&RawSqlValue::Text {
+                value: "abc".into(),
+                bytes: 10,
+                truncated: true
+            }),
+            json!({"type":"text","value":"abc","bytes":10,"truncated":true})
+        );
+        assert_eq!(
+            raw_sql_value_json(&RawSqlValue::Blob {
+                bytes: 4,
+                preview_hex: "ffee".into(),
+                truncated: false
+            }),
+            json!({"type":"blob","bytes":4,"preview_hex":"ffee","truncated":false})
+        );
+    }
+
+    #[test]
+    fn locate_dtos_serialize_with_omitted_optional_fields() {
+        let dto = LocateSessionV1 {
+            schema_version: 1,
+            target: "session",
+            item_type: "session_location",
+            ctx_session_id: Uuid::nil(),
+            provider: CaptureProvider::Codex,
+            provider_session_id: Some("s1".into()),
+            parent_ctx_session_id: None,
+            root_ctx_session_id: None,
+            agent_type: AgentType::Primary,
+            role: None,
+            status: SessionStatus::Imported,
+            started_at: fixed_time(),
+            ended_at: None,
+            source: None,
+            resume: json!({"available": true, "command": "codex resume s1", "argv": ["codex", "resume", "s1"]}),
+        };
+        let value = serde_json::to_value(dto).unwrap();
+        assert_eq!(value["target"], "session");
+        assert!(value.get("role").is_none());
+        assert_eq!(value["resume"]["argv"][2], "s1");
+
+        let event = LocateEventV1 {
+            schema_version: 1,
+            target: "event",
+            item_type: "event_location",
+            ctx_event_id: Uuid::nil(),
+            ctx_session_id: None,
+            provider: None,
+            provider_session_id: None,
+            sequence: 3,
+            event_type: EventType::Message,
+            role: None,
+            occurred_at: fixed_time(),
+            source: None,
+            cursor: Some("cur".into()),
+            resume: None,
+        };
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["sequence"], 3);
+        assert!(value.get("provider").is_none());
+        assert_eq!(value["cursor"], "cur");
+    }
+
+    #[test]
+    fn locate_event_distinguishes_absent_relationships_from_store_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("work.sqlite");
+        Store::open(&path).unwrap();
+        let store = Store::open_read_only(&path).unwrap();
+        let mut ev = event(Uuid::nil(), 9, EventType::Message, None, "body");
+        ev.session_id = None;
+        ev.capture_source_id = None;
+        let dto = QueryService::new(&store).locate_event(&ev).unwrap();
+        assert!(dto.provider.is_none());
+        assert!(dto.source.is_none());
+
+        ev.capture_source_id = Some(Uuid::from_u128(999));
+        assert!(QueryService::new(&store).locate_event(&ev).is_err());
     }
 
     fn sync() -> SyncMetadata {

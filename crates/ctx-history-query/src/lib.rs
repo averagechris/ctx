@@ -877,17 +877,14 @@ impl<'a> QueryService<'a> {
                 .capture_source_id
                 .and_then(|source_id| source_cache.get(&source_id))
                 .and_then(Option::as_ref);
-            let (full, compact) = project_event(
+            let projection = project_event(
                 event,
                 byte_policy.per_item_bytes,
                 session.provider,
                 session.external_session_id.as_deref(),
                 event_source,
+                fields,
             );
-            let projection = match fields {
-                FieldSet::Full => EventProjectionV1::Full(Box::new(full)),
-                FieldSet::Compact => EventProjectionV1::Compact(compact),
-            };
             // The page budget applies to the exact selected projection. Full
             // records are intentionally larger than compact records, so using
             // the compact shape here would make --max-page-bytes misleading.
@@ -1017,18 +1014,15 @@ impl<'a> QueryService<'a> {
         let mut item_text_truncated = 0usize;
         let mut page_budget_exhausted = false;
         for result in packet.results.iter().skip(offset).take(page_size) {
-            let (full, compact) = project_search_result(
+            let projection = project_search_result(
                 self.store,
                 result,
                 byte_policy.per_item_bytes,
                 query,
                 terms,
                 &options,
+                fields,
             );
-            let projection = match fields {
-                FieldSet::Full => SearchResultProjectionV1::Full(Box::new(full)),
-                FieldSet::Compact => SearchResultProjectionV1::Compact(compact),
-            };
             let item_bytes = serde_json::to_vec(&projection)?.len();
             let next_bytes = compact_json_bytes
                 .checked_add(item_bytes)
@@ -1379,46 +1373,48 @@ fn project_event(
     provider: CaptureProvider,
     provider_session_id: Option<&str>,
     source: Option<&SourceFullV1>,
-) -> (EventFullV1, EventCompactV1) {
+    fields: FieldSet,
+) -> EventProjectionV1 {
     let preview = event_projection_text(event);
     let (text, text_truncation) = truncate_utf8_bytes(&preview, cap);
-    let compact = EventCompactV1 {
-        ctx_event_id: event.id,
-        seq: event.seq,
-        event_type: event.event_type,
-        role: event.role,
-        occurred_at: event.occurred_at,
-        text: text.clone(),
-        text_truncation: text_truncation.clone(),
-    };
-    let full = EventFullV1 {
-        item_id: event.id,
-        item_type: "event",
-        ctx_event_id: event.id,
-        seq: event.seq,
-        sequence: event.seq,
-        history_record_id: event.history_record_id,
-        ctx_session_id: event.session_id,
-        run_id: event.run_id,
-        capture_source_id: event.capture_source_id,
-        source_id: event.capture_source_id,
-        source_path: source.and_then(|value| value.path.clone()),
-        source_exists: source.and_then(|value| value.exists),
-        event_type: event.event_type,
-        role: event.role,
-        occurred_at: event.occurred_at,
-        preview: text.clone(),
-        text,
-        text_truncation,
-        redaction_state: event.redaction_state,
-        visibility: event.sync.visibility,
-        fidelity: event.sync.fidelity,
-        provider,
-        provider_session_id: provider_session_id.map(str::to_owned),
-        source: source.cloned(),
-        cursor: event_cursor(event),
-    };
-    (full, compact)
+    match fields {
+        FieldSet::Compact => EventProjectionV1::Compact(EventCompactV1 {
+            ctx_event_id: event.id,
+            seq: event.seq,
+            event_type: event.event_type,
+            role: event.role,
+            occurred_at: event.occurred_at,
+            text,
+            text_truncation,
+        }),
+        FieldSet::Full => EventProjectionV1::Full(Box::new(EventFullV1 {
+            item_id: event.id,
+            item_type: "event",
+            ctx_event_id: event.id,
+            seq: event.seq,
+            sequence: event.seq,
+            history_record_id: event.history_record_id,
+            ctx_session_id: event.session_id,
+            run_id: event.run_id,
+            capture_source_id: event.capture_source_id,
+            source_id: event.capture_source_id,
+            source_path: source.and_then(|value| value.path.clone()),
+            source_exists: source.and_then(|value| value.exists),
+            event_type: event.event_type,
+            role: event.role,
+            occurred_at: event.occurred_at,
+            preview: text.clone(),
+            text,
+            text_truncation,
+            redaction_state: event.redaction_state,
+            visibility: event.sync.visibility,
+            fidelity: event.sync.fidelity,
+            provider,
+            provider_session_id: provider_session_id.map(str::to_owned),
+            source: source.cloned(),
+            cursor: event_cursor(event),
+        })),
+    }
 }
 
 fn event_cursor(event: &Event) -> Option<String> {
@@ -1510,84 +1506,91 @@ fn project_search_result(
     query: &str,
     terms: &[String],
     options: &PacketOptions,
-) -> (SearchResultFullV1, SearchResultCompactV1) {
+    fields: FieldSet,
+) -> SearchResultProjectionV1 {
     let (snippet, snippet_truncation) = truncate_utf8_bytes(&result.snippet, cap);
-    let compact = SearchResultCompactV1 {
-        item_id: result.record_id,
-        ctx_session_id: result.session_id,
-        ctx_event_id: result.event_id,
-        event_seq: result.event_seq,
-        title: result.title.clone(),
-        snippet: snippet.clone(),
-        snippet_truncation: snippet_truncation.clone(),
-        rank: result.rank,
-        result_scope: result.result_scope,
-        more_matches_in_session: result.more_matches_in_session,
-        session_importance: result.session_importance,
-        timestamp: result.timestamp,
-        why_matched: result.why_matched.clone(),
-        visibility: result.visibility,
-    };
-    let full = SearchResultFullV1 {
-        item_id: result.record_id,
-        item_type: search_result_item_type(store, result),
-        ctx_session_id: result.session_id,
-        ctx_event_id: result.event_id,
-        session_id: result.session_id,
-        event_id: result.event_id,
-        event_seq: result.event_seq,
-        title: result.title.clone(),
-        snippet,
-        snippet_truncation,
-        rank: result.rank,
-        result_scope: result.result_scope,
-        more_matches_in_session: result.more_matches_in_session,
-        session_importance: result.session_importance,
-        provider: result.provider,
-        provider_session_id: result.provider_session_id.clone(),
-        history_source: result.history_source.clone(),
-        history_source_plugin: result.history_source_plugin.clone(),
-        provider_key: result.provider_key.clone(),
-        source_id: result.source_id.clone(),
-        source_format: result.source_format.clone(),
-        timestamp: result.timestamp,
-        cwd: result.cwd.clone(),
-        source_path: result.raw_source_path.clone(),
-        source_exists: result.raw_source_exists,
-        source_cursor: result.cursor.clone(),
-        cursor: result.cursor.clone(),
-        why_matched: result.why_matched.clone(),
-        citations: result
-            .citations
-            .iter()
-            .map(|citation| SearchCitationV1 {
-                citation_type: citation.citation_type,
-                id: citation.id,
-                item_id: citation.id,
-                item_type: citation_item_type(citation.citation_type),
-                label: citation.label.clone(),
-                time: citation.time,
-                provider: citation.provider,
-                ctx_session_id: if citation.citation_type == ContextCitationType::Session {
-                    Some(citation.id)
-                } else {
-                    citation.session_id
-                },
-                session_id: citation.session_id,
-                ctx_event_id: (citation.citation_type == ContextCitationType::Event)
-                    .then_some(citation.id),
-                event_seq: citation.event_seq,
-                source_path: citation.raw_source_path.clone(),
-                source_exists: citation.raw_source_exists,
-                source_cursor: citation.cursor.clone(),
-                cursor: citation.cursor.clone(),
-            })
-            .collect(),
-        links: result.links.clone(),
-        suggested_next_commands: suggested_next_commands(result, query, terms, options.match_mode),
-        visibility: result.visibility,
-    };
-    (full, compact)
+    match fields {
+        FieldSet::Compact => SearchResultProjectionV1::Compact(SearchResultCompactV1 {
+            item_id: result.record_id,
+            ctx_session_id: result.session_id,
+            ctx_event_id: result.event_id,
+            event_seq: result.event_seq,
+            title: result.title.clone(),
+            snippet,
+            snippet_truncation,
+            rank: result.rank,
+            result_scope: result.result_scope,
+            more_matches_in_session: result.more_matches_in_session,
+            session_importance: result.session_importance,
+            timestamp: result.timestamp,
+            why_matched: result.why_matched.clone(),
+            visibility: result.visibility,
+        }),
+        FieldSet::Full => SearchResultProjectionV1::Full(Box::new(SearchResultFullV1 {
+            item_id: result.record_id,
+            item_type: search_result_item_type(store, result),
+            ctx_session_id: result.session_id,
+            ctx_event_id: result.event_id,
+            session_id: result.session_id,
+            event_id: result.event_id,
+            event_seq: result.event_seq,
+            title: result.title.clone(),
+            snippet,
+            snippet_truncation,
+            rank: result.rank,
+            result_scope: result.result_scope,
+            more_matches_in_session: result.more_matches_in_session,
+            session_importance: result.session_importance,
+            provider: result.provider,
+            provider_session_id: result.provider_session_id.clone(),
+            history_source: result.history_source.clone(),
+            history_source_plugin: result.history_source_plugin.clone(),
+            provider_key: result.provider_key.clone(),
+            source_id: result.source_id.clone(),
+            source_format: result.source_format.clone(),
+            timestamp: result.timestamp,
+            cwd: result.cwd.clone(),
+            source_path: result.raw_source_path.clone(),
+            source_exists: result.raw_source_exists,
+            source_cursor: result.cursor.clone(),
+            cursor: result.cursor.clone(),
+            why_matched: result.why_matched.clone(),
+            citations: result
+                .citations
+                .iter()
+                .map(|citation| SearchCitationV1 {
+                    citation_type: citation.citation_type,
+                    id: citation.id,
+                    item_id: citation.id,
+                    item_type: citation_item_type(citation.citation_type),
+                    label: citation.label.clone(),
+                    time: citation.time,
+                    provider: citation.provider,
+                    ctx_session_id: if citation.citation_type == ContextCitationType::Session {
+                        Some(citation.id)
+                    } else {
+                        citation.session_id
+                    },
+                    session_id: citation.session_id,
+                    ctx_event_id: (citation.citation_type == ContextCitationType::Event)
+                        .then_some(citation.id),
+                    event_seq: citation.event_seq,
+                    source_path: citation.raw_source_path.clone(),
+                    source_exists: citation.raw_source_exists,
+                    source_cursor: citation.cursor.clone(),
+                    cursor: citation.cursor.clone(),
+                })
+                .collect(),
+            links: result.links.clone(),
+            suggested_next_commands: suggested_next_commands(
+                result,
+                query,
+                terms,
+                options.match_mode,
+            ),
+            visibility: result.visibility,
+        })),
+    }
 }
 
 fn search_result_item_type(store: &Store, result: &SearchPacketResult) -> String {
@@ -2191,7 +2194,31 @@ fn available_space_bytes(_path: &Path) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ctx_history_core::{EntityTimestamps, HistoryRecord, SyncMetadata, SyncState};
+    use ctx_history_core::{
+        ContextCitation, EntityTimestamps, HistoryRecord, SyncMetadata, SyncState,
+    };
+    use std::time::{Duration, Instant};
+
+    trait EventProjectionTestExt {
+        fn full_for_test(self) -> EventFullV1;
+        fn compact_for_test(self) -> EventCompactV1;
+    }
+
+    impl EventProjectionTestExt for EventProjectionV1 {
+        fn full_for_test(self) -> EventFullV1 {
+            match self {
+                EventProjectionV1::Full(value) => *value,
+                EventProjectionV1::Compact(_) => panic!("expected full event projection"),
+            }
+        }
+
+        fn compact_for_test(self) -> EventCompactV1 {
+            match self {
+                EventProjectionV1::Compact(value) => value,
+                EventProjectionV1::Full(_) => panic!("expected compact event projection"),
+            }
+        }
+    }
 
     fn fixed_time() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
@@ -2530,6 +2557,556 @@ mod tests {
             .collect()
     }
 
+    fn reference_project_event_pair(
+        event: &Event,
+        cap: usize,
+        provider: CaptureProvider,
+        provider_session_id: Option<&str>,
+        source: Option<&SourceFullV1>,
+    ) -> (EventFullV1, EventCompactV1) {
+        let preview = event_projection_text(event);
+        let (text, text_truncation) = truncate_utf8_bytes(&preview, cap);
+        let compact = EventCompactV1 {
+            ctx_event_id: event.id,
+            seq: event.seq,
+            event_type: event.event_type,
+            role: event.role,
+            occurred_at: event.occurred_at,
+            text: text.clone(),
+            text_truncation: text_truncation.clone(),
+        };
+        let full = EventFullV1 {
+            item_id: event.id,
+            item_type: "event",
+            ctx_event_id: event.id,
+            seq: event.seq,
+            sequence: event.seq,
+            history_record_id: event.history_record_id,
+            ctx_session_id: event.session_id,
+            run_id: event.run_id,
+            capture_source_id: event.capture_source_id,
+            source_id: event.capture_source_id,
+            source_path: source.and_then(|value| value.path.clone()),
+            source_exists: source.and_then(|value| value.exists),
+            event_type: event.event_type,
+            role: event.role,
+            occurred_at: event.occurred_at,
+            preview: text.clone(),
+            text,
+            text_truncation,
+            redaction_state: event.redaction_state,
+            visibility: event.sync.visibility,
+            fidelity: event.sync.fidelity,
+            provider,
+            provider_session_id: provider_session_id.map(str::to_owned),
+            source: source.cloned(),
+            cursor: event_cursor(event),
+        };
+        (full, compact)
+    }
+
+    #[inline(never)]
+    fn eager_event_compact_for_measurement(event: &Event, cap: usize) -> EventProjectionV1 {
+        let (full, compact) = reference_project_event_pair(
+            std::hint::black_box(event),
+            std::hint::black_box(cap),
+            CaptureProvider::Codex,
+            Some("provider-session"),
+            None,
+        );
+        std::hint::black_box(full);
+        EventProjectionV1::Compact(compact)
+    }
+
+    #[inline(never)]
+    fn selected_event_compact_for_measurement(event: &Event, cap: usize) -> EventProjectionV1 {
+        std::hint::black_box(project_event(
+            std::hint::black_box(event),
+            std::hint::black_box(cap),
+            CaptureProvider::Codex,
+            Some("provider-session"),
+            None,
+            FieldSet::Compact,
+        ))
+    }
+
+    fn search_result(i: usize, text: &str) -> SearchPacketResult {
+        let session_id = Uuid::from_u128(90_000 + i as u128);
+        let event_id = Uuid::from_u128(100_000 + i as u128);
+        let shape = i % 4;
+        let snippet = if i % 5 == 0 {
+            format!("short snippet {i} λ")
+        } else {
+            format!("{text} -- snippet {i} -- {}", "λ".repeat(128))
+        };
+        SearchPacketResult {
+            // Synthetic distribution: 25% event shortcut, 25% session scope,
+            // 25% generic/fallback store lookup by event id, 25% absent indexed-item fallback.
+            record_id: match shape {
+                0 => event_id,
+                1 => session_id,
+                2 => event_id,
+                _ => Uuid::from_u128(200_000 + i as u128),
+            },
+            session_id: (i % 6 != 0).then_some(session_id),
+            event_id: (shape != 1).then_some(event_id),
+            event_seq: (i % 7 != 0).then_some(i as u64),
+            title: format!("synthetic title {i} 😃"),
+            snippet,
+            rank: 1.0 / (i as f32 + 1.0),
+            result_scope: if shape == 1 {
+                SearchResultScope::Session
+            } else {
+                SearchResultScope::Event
+            },
+            more_matches_in_session: i % 7,
+            session_importance: (i % 11) as f32,
+            provider: Some(CaptureProvider::Codex),
+            provider_session_id: (i % 3 != 0).then(|| format!("provider-session-{i}")),
+            history_source: (i % 4 != 0).then(|| "jsonl".to_owned()),
+            history_source_plugin: (i % 4 != 0).then(|| "synthetic-plugin".to_owned()),
+            provider_key: (i % 5 != 0).then(|| "codex/default".to_owned()),
+            source_id: (i % 3 != 1).then(|| format!("source-{i}")),
+            source_format: (i % 3 != 1).then(|| "ctx-history-jsonl-v1".to_owned()),
+            timestamp: (i % 8 != 0).then(fixed_time),
+            cwd: (i % 3 != 2).then(|| format!("/tmp/synthetic/{i}")),
+            raw_source_path: (i % 3 != 2).then(|| format!("/tmp/synthetic/{i}/transcript.jsonl")),
+            raw_source_exists: Some(i % 2 == 0),
+            cursor: (i % 4 != 2).then(|| format!("cursor-{i}:{}", "界".repeat(16))),
+            why_matched: vec!["title".into(), "snippet".into(), format!("term-{i}")],
+            citations: vec![
+                ContextCitation {
+                    citation_type: ContextCitationType::Session,
+                    id: session_id,
+                    label: "session citation".into(),
+                    time: fixed_time(),
+                    provider: Some(CaptureProvider::Codex),
+                    session_id: Some(session_id),
+                    event_seq: None,
+                    raw_source_path: Some("/tmp/session.jsonl".into()),
+                    raw_source_exists: Some(true),
+                    cursor: Some("session-cursor".into()),
+                },
+                ContextCitation {
+                    citation_type: ContextCitationType::Event,
+                    id: event_id,
+                    label: "event citation".into(),
+                    time: fixed_time(),
+                    provider: Some(CaptureProvider::Codex),
+                    session_id: Some(session_id),
+                    event_seq: Some(i as u64),
+                    raw_source_path: Some("/tmp/event.jsonl".into()),
+                    raw_source_exists: Some(false),
+                    cursor: Some("event-cursor".into()),
+                },
+            ],
+            links: ContextLinks::default(),
+            visibility: Visibility::LocalOnly,
+        }
+    }
+
+    fn reference_project_search_result_pair(
+        store: &Store,
+        result: &SearchPacketResult,
+        cap: usize,
+        query: &str,
+        terms: &[String],
+        options: &PacketOptions,
+    ) -> (SearchResultFullV1, SearchResultCompactV1) {
+        let (snippet, snippet_truncation) = truncate_utf8_bytes(&result.snippet, cap);
+        let compact = SearchResultCompactV1 {
+            item_id: result.record_id,
+            ctx_session_id: result.session_id,
+            ctx_event_id: result.event_id,
+            event_seq: result.event_seq,
+            title: result.title.clone(),
+            snippet: snippet.clone(),
+            snippet_truncation: snippet_truncation.clone(),
+            rank: result.rank,
+            result_scope: result.result_scope,
+            more_matches_in_session: result.more_matches_in_session,
+            session_importance: result.session_importance,
+            timestamp: result.timestamp,
+            why_matched: result.why_matched.clone(),
+            visibility: result.visibility,
+        };
+        let full = SearchResultFullV1 {
+            item_id: result.record_id,
+            item_type: search_result_item_type(store, result),
+            ctx_session_id: result.session_id,
+            ctx_event_id: result.event_id,
+            session_id: result.session_id,
+            event_id: result.event_id,
+            event_seq: result.event_seq,
+            title: result.title.clone(),
+            snippet,
+            snippet_truncation,
+            rank: result.rank,
+            result_scope: result.result_scope,
+            more_matches_in_session: result.more_matches_in_session,
+            session_importance: result.session_importance,
+            provider: result.provider,
+            provider_session_id: result.provider_session_id.clone(),
+            history_source: result.history_source.clone(),
+            history_source_plugin: result.history_source_plugin.clone(),
+            provider_key: result.provider_key.clone(),
+            source_id: result.source_id.clone(),
+            source_format: result.source_format.clone(),
+            timestamp: result.timestamp,
+            cwd: result.cwd.clone(),
+            source_path: result.raw_source_path.clone(),
+            source_exists: result.raw_source_exists,
+            source_cursor: result.cursor.clone(),
+            cursor: result.cursor.clone(),
+            why_matched: result.why_matched.clone(),
+            citations: result
+                .citations
+                .iter()
+                .map(|citation| SearchCitationV1 {
+                    citation_type: citation.citation_type,
+                    id: citation.id,
+                    item_id: citation.id,
+                    item_type: citation_item_type(citation.citation_type),
+                    label: citation.label.clone(),
+                    time: citation.time,
+                    provider: citation.provider,
+                    ctx_session_id: if citation.citation_type == ContextCitationType::Session {
+                        Some(citation.id)
+                    } else {
+                        citation.session_id
+                    },
+                    session_id: citation.session_id,
+                    ctx_event_id: (citation.citation_type == ContextCitationType::Event)
+                        .then_some(citation.id),
+                    event_seq: citation.event_seq,
+                    source_path: citation.raw_source_path.clone(),
+                    source_exists: citation.raw_source_exists,
+                    source_cursor: citation.cursor.clone(),
+                    cursor: citation.cursor.clone(),
+                })
+                .collect(),
+            links: result.links.clone(),
+            suggested_next_commands: suggested_next_commands(
+                result,
+                query,
+                terms,
+                options.match_mode,
+            ),
+            visibility: result.visibility,
+        };
+        (full, compact)
+    }
+
+    #[inline(never)]
+    fn eager_search_compact_for_measurement(
+        store: &Store,
+        result: &SearchPacketResult,
+        cap: usize,
+    ) -> SearchResultProjectionV1 {
+        let terms = ["alpha".to_owned(), "beta".to_owned()];
+        let options = PacketOptions::default();
+        let (full, compact) = reference_project_search_result_pair(
+            std::hint::black_box(store),
+            std::hint::black_box(result),
+            std::hint::black_box(cap),
+            "query",
+            &terms,
+            &options,
+        );
+        std::hint::black_box(full);
+        SearchResultProjectionV1::Compact(compact)
+    }
+
+    #[inline(never)]
+    fn selected_search_compact_for_measurement(
+        store: &Store,
+        result: &SearchPacketResult,
+        cap: usize,
+    ) -> SearchResultProjectionV1 {
+        std::hint::black_box(project_search_result(
+            std::hint::black_box(store),
+            std::hint::black_box(result),
+            std::hint::black_box(cap),
+            "query",
+            &["alpha".into(), "beta".into()],
+            &PacketOptions::default(),
+            FieldSet::Compact,
+        ))
+    }
+
+    #[inline(never)]
+    fn release_benchmark_build() -> bool {
+        !cfg!(debug_assertions)
+    }
+
+    #[test]
+    fn selected_only_projections_match_reference_serialization() {
+        let source = SourceFullV1 {
+            source_id: Uuid::from_u128(7),
+            kind: CaptureSourceKind::ProviderImport,
+            provider: CaptureProvider::Codex,
+            provider_session_id: Some("provider-session".into()),
+            cwd: Some("/tmp/ctx".into()),
+            path: Some("/tmp/ctx/transcript.jsonl".into()),
+            exists: Some(true),
+            started_at: fixed_time(),
+            ended_at: None,
+            source_format: Some("ctx-history-jsonl-v1".into()),
+            cursor: Some("source-cursor".into()),
+            source_cursor: Some("source-cursor".into()),
+        };
+        let mut ev = event(
+            Uuid::from_u128(42),
+            10,
+            EventType::Message,
+            Some(EventRole::Assistant),
+            "short λ",
+        );
+        ev.capture_source_id = Some(source.source_id);
+        ev.payload = json!({"body": {"text": "🙂x", "cursor": "event-cursor"}});
+        for (cap, fields) in [
+            (5, FieldSet::Full),
+            (5, FieldSet::Compact),
+            (64, FieldSet::Full),
+            (64, FieldSet::Compact),
+        ] {
+            let (old_full, old_compact) = reference_project_event_pair(
+                &ev,
+                cap,
+                CaptureProvider::Codex,
+                Some("provider-session"),
+                Some(&source),
+            );
+            let old = match fields {
+                FieldSet::Full => EventProjectionV1::Full(Box::new(old_full)),
+                FieldSet::Compact => EventProjectionV1::Compact(old_compact),
+            };
+            let selected = project_event(
+                &ev,
+                cap,
+                CaptureProvider::Codex,
+                Some("provider-session"),
+                Some(&source),
+                fields,
+            );
+            assert_eq!(
+                serde_json::to_value(old).unwrap(),
+                serde_json::to_value(selected).unwrap()
+            );
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("work.sqlite");
+        let store_rw = Store::open(&path).unwrap();
+        let session = session(Uuid::from_u128(90_001));
+        store_rw.upsert_session(&session).unwrap();
+        let stored_event = event(
+            session.id,
+            3,
+            EventType::Message,
+            Some(EventRole::User),
+            "stored event",
+        );
+        store_rw.upsert_event(&stored_event).unwrap();
+        drop(store_rw);
+        let store = Store::open_read_only(&path).unwrap();
+        let cases = vec![
+            search_result(0, "short λ"),
+            search_result(1, &"long🙂".repeat(1_000)),
+            search_result(2, &"fallback界".repeat(800)),
+            search_result(3, "absent optional"),
+        ];
+        let terms = ["alpha".to_owned(), "beta".to_owned()];
+        let options = PacketOptions::default();
+        for result in &cases {
+            for (cap, fields) in [
+                (12, FieldSet::Full),
+                (12, FieldSet::Compact),
+                (MAX_ITEM_BYTES, FieldSet::Full),
+                (MAX_ITEM_BYTES, FieldSet::Compact),
+            ] {
+                let (old_full, old_compact) = reference_project_search_result_pair(
+                    &store, result, cap, "query", &terms, &options,
+                );
+                let old = match fields {
+                    FieldSet::Full => SearchResultProjectionV1::Full(Box::new(old_full)),
+                    FieldSet::Compact => SearchResultProjectionV1::Compact(old_compact),
+                };
+                let selected =
+                    project_search_result(&store, result, cap, "query", &terms, &options, fields);
+                assert_eq!(
+                    serde_json::to_value(old).unwrap(),
+                    serde_json::to_value(selected).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "release-mode synthetic benchmark; run manually with --release -- --ignored --nocapture"]
+    fn compact_projection_selected_only_benchmark() {
+        if !release_benchmark_build() {
+            panic!("compact projection benchmark must be run with --release");
+        }
+        const ROWS: usize = 2_000;
+        const REPS: usize = 80;
+        const CAP: usize = 4_096;
+        let threshold = 0.90_f64; // candidate p95 must be at least 10% faster than eager.
+        let long = format!(
+            "{}{}{}",
+            "ASCII ".repeat(256),
+            "Здравствуйте 🌍 ".repeat(128),
+            "終".repeat(256)
+        );
+        let mut events = (0..ROWS).map(|i| {
+            let mut ev = event(Uuid::from_u128(42), i as u64, EventType::Message, Some(if i % 2 == 0 { EventRole::User } else { EventRole::Assistant }), &format!("{long} event {i}"));
+            ev.payload = json!({"body": {"text": format!("{long} body {i}"), "cursor": format!("event-cursor-{i}")}});
+            ev
+        }).collect::<Vec<_>>();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("work.sqlite");
+        let store_rw = Store::open(&path).unwrap();
+        // Populate the temp store for full-projection fallback lookup paths:
+        // event shortcut (25%), session scope (25%), event lookup by record_id
+        // (25%), and absent generic indexed-item fallback (25%).
+        for i in 0..ROWS {
+            let session_id = Uuid::from_u128(90_000 + i as u128);
+            let event_id = Uuid::from_u128(100_000 + i as u128);
+            let mut s = session(session_id);
+            s.external_session_id = Some(format!("provider-session-{i}"));
+            store_rw.upsert_session(&s).unwrap();
+            let mut ev = event(
+                session_id,
+                i as u64,
+                EventType::Message,
+                Some(EventRole::User),
+                &long,
+            );
+            ev.id = event_id;
+            store_rw.upsert_event(&ev).unwrap();
+        }
+        drop(store_rw);
+        let store = Store::open_read_only(&path).unwrap();
+        let results = (0..ROWS)
+            .map(|i| search_result(i, &long))
+            .collect::<Vec<_>>();
+
+        let base_event_json =
+            serde_json::to_vec(&eager_event_compact_for_measurement(&events[0], CAP)).unwrap();
+        let cand_event_json = serde_json::to_vec(&project_event(
+            &events[0],
+            CAP,
+            CaptureProvider::Codex,
+            Some("provider-session"),
+            None,
+            FieldSet::Compact,
+        ))
+        .unwrap();
+        assert_eq!(base_event_json, cand_event_json);
+        let base_search_json = serde_json::to_vec(&eager_search_compact_for_measurement(
+            &store,
+            &results[0],
+            CAP,
+        ))
+        .unwrap();
+        let cand_search_json = serde_json::to_vec(&project_search_result(
+            &store,
+            &results[0],
+            CAP,
+            "query",
+            &["alpha".into(), "beta".into()],
+            &PacketOptions::default(),
+            FieldSet::Compact,
+        ))
+        .unwrap();
+        assert_eq!(base_search_json, cand_search_json);
+
+        for ev in events.iter().take(128) {
+            std::hint::black_box(eager_event_compact_for_measurement(ev, CAP));
+            std::hint::black_box(selected_event_compact_for_measurement(ev, CAP));
+        }
+        for result in results.iter().take(128) {
+            std::hint::black_box(eager_search_compact_for_measurement(&store, result, CAP));
+            std::hint::black_box(selected_search_compact_for_measurement(&store, result, CAP));
+        }
+
+        fn run_pair(
+            mut eager: impl FnMut(),
+            mut candidate: impl FnMut(),
+        ) -> (Vec<Duration>, Vec<Duration>) {
+            let mut eager_times = Vec::with_capacity(REPS);
+            let mut candidate_times = Vec::with_capacity(REPS);
+            for i in 0..REPS {
+                if i % 2 == 0 {
+                    let start = Instant::now();
+                    eager();
+                    eager_times.push(start.elapsed());
+                    let start = Instant::now();
+                    candidate();
+                    candidate_times.push(start.elapsed());
+                } else {
+                    let start = Instant::now();
+                    candidate();
+                    candidate_times.push(start.elapsed());
+                    let start = Instant::now();
+                    eager();
+                    eager_times.push(start.elapsed());
+                }
+            }
+            eager_times.sort();
+            candidate_times.sort();
+            (eager_times, candidate_times)
+        }
+
+        fn project_all_events_eager(events: &[Event]) {
+            for ev in events {
+                std::hint::black_box(eager_event_compact_for_measurement(ev, CAP));
+            }
+        }
+        fn project_all_events_candidate(events: &[Event]) {
+            for ev in events {
+                std::hint::black_box(selected_event_compact_for_measurement(ev, CAP));
+            }
+        }
+        fn project_all_search_eager(store: &Store, results: &[SearchPacketResult]) {
+            for result in results {
+                std::hint::black_box(eager_search_compact_for_measurement(store, result, CAP));
+            }
+        }
+        fn project_all_search_candidate(store: &Store, results: &[SearchPacketResult]) {
+            for result in results {
+                std::hint::black_box(selected_search_compact_for_measurement(store, result, CAP));
+            }
+        }
+
+        let (event_eager, event_candidate) = run_pair(
+            || project_all_events_eager(&events),
+            || project_all_events_candidate(&events),
+        );
+        let (search_eager, search_candidate) = run_pair(
+            || project_all_search_eager(&store, &results),
+            || project_all_search_candidate(&store, &results),
+        );
+        let p50 = |v: &[Duration]| v[v.len() / 2].as_secs_f64() * 1000.0;
+        let p95 = |v: &[Duration]| v[v.len() * 95 / 100].as_secs_f64() * 1000.0;
+        println!("compact projection benchmark threshold: candidate p95/eager p95 <= {threshold:.2}; rows={ROWS}; reps={REPS}; cap={CAP}; release={}", !cfg!(debug_assertions));
+        println!(
+            "search shape distribution: event-shortcut=25%, session-scope=25%, event-store-lookup=25%, absent-indexed-item-fallback=25%; short-snippet=20%; optional fields mixed present/absent"
+        );
+        for (name, eager, candidate) in [
+            ("event", &event_eager, &event_candidate),
+            ("search", &search_eager, &search_candidate),
+        ] {
+            let ratio = p95(candidate) / p95(eager);
+            println!("{name}: eager p50={:.3}ms p95={:.3}ms; candidate p50={:.3}ms p95={:.3}ms; p95_ratio={ratio:.3}", p50(eager), p95(eager), p50(candidate), p95(candidate));
+            assert!(
+                ratio <= threshold,
+                "{name} candidate p95 ratio {ratio:.3} exceeded threshold {threshold:.2}"
+            );
+        }
+        events.clear();
+    }
+
     #[test]
     fn utf8_byte_caps_cover_zero_one_two_and_emoji() {
         for (cap, expected) in [(0, ""), (1, "a"), (2, "ab"), (3, "…")] {
@@ -2671,13 +3248,28 @@ mod tests {
         );
         raw.redaction_state = RedactionState::Raw;
         raw.dedupe_key = Some("private-dedupe".to_owned());
-        let (full, compact) = project_event(
+        let full = match project_event(
             &raw,
             DEFAULT_ITEM_BYTES,
             CaptureProvider::Codex,
             Some("provider-session"),
             None,
-        );
+            FieldSet::Full,
+        ) {
+            EventProjectionV1::Full(value) => *value,
+            EventProjectionV1::Compact(_) => unreachable!(),
+        };
+        let compact = match project_event(
+            &raw,
+            DEFAULT_ITEM_BYTES,
+            CaptureProvider::Codex,
+            Some("provider-session"),
+            None,
+            FieldSet::Compact,
+        ) {
+            EventProjectionV1::Compact(value) => value,
+            EventProjectionV1::Full(_) => unreachable!(),
+        };
         assert_eq!(full.text, "raw event payload withheld");
         assert_eq!(compact.text, "raw event payload withheld");
         raw.redaction_state = RedactionState::Withheld;
@@ -2688,8 +3280,9 @@ mod tests {
                 CaptureProvider::Codex,
                 Some("provider-session"),
                 None,
+                FieldSet::Full,
             )
-            .0
+            .full_for_test()
             .text,
             "raw event payload withheld"
         );
@@ -2711,13 +3304,22 @@ mod tests {
 
         raw.redaction_state = RedactionState::LocalPreview;
         raw.payload = serde_json::json!({"text": "🙂".repeat(2_000)});
-        let long = project_event(&raw, 10, CaptureProvider::Codex, None, None).0;
+        let long = project_event(&raw, 10, CaptureProvider::Codex, None, None, FieldSet::Full)
+            .full_for_test();
         assert_eq!(long.text_truncation.original_bytes, 8_000);
         assert_eq!(long.text_truncation.returned_bytes, 7);
         assert!(long.text_truncation.truncated);
 
         raw.payload = serde_json::json!({"api_key": "must-never-be-a-text-fallback"});
-        let unknown = project_event(&raw, DEFAULT_ITEM_BYTES, CaptureProvider::Codex, None, None).1;
+        let unknown = project_event(
+            &raw,
+            DEFAULT_ITEM_BYTES,
+            CaptureProvider::Codex,
+            None,
+            None,
+            FieldSet::Compact,
+        )
+        .compact_for_test();
         assert!(unknown.text.is_empty());
         assert!(!serde_json::to_string(&unknown)
             .unwrap()
@@ -2922,13 +3524,15 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("work.sqlite");
         let (session, raw_events) = transcript_fixture(&path);
-        let (first_full, _) = project_event(
+        let first_full = project_event(
             &raw_events[0],
             DEFAULT_ITEM_BYTES,
             CaptureProvider::Codex,
             Some("provider-session"),
             None,
-        );
+            FieldSet::Full,
+        )
+        .full_for_test();
         let exact = serde_json::to_vec(&EventProjectionV1::Full(Box::new(first_full)))
             .unwrap()
             .len();

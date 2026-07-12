@@ -1844,6 +1844,26 @@ impl Store {
         Ok(count as usize)
     }
 
+    pub fn latest_indexed_source_at_ms(&self) -> Result<Option<i64>> {
+        let indexed_at: Option<i64> = self.conn.query_row(
+            "SELECT MAX(indexed_at_ms) FROM (
+                SELECT indexed_at_ms AS indexed_at_ms FROM source_import_files WHERE indexed_at_ms IS NOT NULL
+                UNION ALL SELECT updated_at_ms AS indexed_at_ms FROM history_records
+                UNION ALL SELECT updated_at_ms AS indexed_at_ms FROM sessions
+            )",
+            [],
+            |row| row.get(0),
+        )?;
+        if indexed_at.is_some() {
+            return Ok(indexed_at);
+        }
+        Ok(self
+            .conn
+            .query_row("SELECT MAX(occurred_at_ms) FROM events", [], |row| {
+                row.get(0)
+            })?)
+    }
+
     pub fn capture_source_by_external_session(
         &self,
         provider: CaptureProvider,
@@ -14347,6 +14367,66 @@ mod catalog_tests {
             .unwrap();
         assert_eq!(source_count, 3);
         assert_eq!(catalog_count, 3);
+    }
+
+    #[test]
+    fn latest_indexed_source_at_uses_manifest_and_session_before_event_fallback() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        store
+            .conn
+            .execute(
+                r#"
+                INSERT INTO source_import_files
+                (provider, source_format, source_root, source_path, file_size_bytes,
+                 file_modified_at_ms, observed_at_ms, indexed_at_ms, indexed_status)
+                VALUES ('pi', 'pi_sessions_jsonl', '/tmp/pi', '/tmp/pi/sessions.jsonl',
+                        1, 2, 3, 9000, 'indexed')
+                "#,
+                [],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                r#"
+                INSERT INTO sessions
+                (id, provider, external_session_id, agent_type, is_primary, status,
+                 fidelity, started_at_ms, created_at_ms, updated_at_ms, visibility,
+                 sync_state, sync_version, metadata_json)
+                VALUES (?1, 'pi', 's1', 'primary', 1, 'completed', 'imported',
+                        1, 1, 8000, 'local_only', 'local_only', 0, '{}')
+                "#,
+                params![new_id().to_string()],
+            )
+            .unwrap();
+        assert_eq!(store.latest_indexed_source_at_ms().unwrap(), Some(9000));
+
+        store
+            .conn
+            .execute("DELETE FROM source_import_files", [])
+            .unwrap();
+        assert_eq!(store.latest_indexed_source_at_ms().unwrap(), Some(8000));
+    }
+
+    #[test]
+    fn latest_indexed_source_at_falls_back_to_event_only_store() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        store
+            .conn
+            .execute(
+                r#"
+                INSERT INTO events
+                (id, seq, event_type, occurred_at_ms, payload_json, visibility,
+                 redaction_state, fidelity, sync_state, sync_version, metadata_json)
+                VALUES (?1, 1, 'message', 7000, '{}', 'local_only', 'safe_preview',
+                        'imported', 'local_only', 0, '{}')
+                "#,
+                params![new_id().to_string()],
+            )
+            .unwrap();
+        assert_eq!(store.latest_indexed_source_at_ms().unwrap(), Some(7000));
     }
 
     #[test]

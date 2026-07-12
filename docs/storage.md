@@ -155,16 +155,43 @@ maps are internal performance caches: search never reads them, writes fall
 back to the previous slower path if they are missing, and a rebuild recreates
 them.
 
-Downgrading a v1000 store back to an older (v15-chain) ctx binary is
-unsupported and at your own risk. Because the v1000 migration changes no
-indexed data, it can be reversed externally. Back up the database first,
-make sure no running instance of ctx has the store open, then run both
-drops and the version reset as one transaction:
+The fork's second schema change (version 1001) adds two covering indexes for
+bounded pagination — `idx_sessions_provider_external_session_started` and
+`idx_events_session_seq_id` — and nothing else. It runs on the first writable
+open after upgrading, upgrades v1000 stores in place, and touches neither the
+rowid maps nor the FTS projections; there is no rebuild and no reimport.
+Read-only commands require exactly v1001 and direct older stores to run one
+writable command first.
+
+Downgrading a fork-versioned store back to an older ctx binary is
+unsupported and at your own risk. Because neither fork migration changes
+indexed data, both can be reversed externally. Back up the database first,
+make sure no running instance of ctx has the store open, then run the drops
+and the version reset as one transaction.
+
+To step a v1001 store back to v1000 (for a fork binary whose chain ends at
+v1000):
 
 ```bash
 cp ~/.ctx/work.sqlite ~/.ctx/work.sqlite.bak
 sqlite3 ~/.ctx/work.sqlite <<'SQL'
 BEGIN IMMEDIATE;
+DROP INDEX IF EXISTS idx_sessions_provider_external_session_started;
+DROP INDEX IF EXISTS idx_events_session_seq_id;
+PRAGMA user_version = 1000;
+COMMIT;
+SQL
+```
+
+To go all the way back to a v15-chain binary, also drop the map tables and
+reset the version to 15 in the same transaction:
+
+```bash
+cp ~/.ctx/work.sqlite ~/.ctx/work.sqlite.bak
+sqlite3 ~/.ctx/work.sqlite <<'SQL'
+BEGIN IMMEDIATE;
+DROP INDEX IF EXISTS idx_sessions_provider_external_session_started;
+DROP INDEX IF EXISTS idx_events_session_seq_id;
 DROP TABLE IF EXISTS record_search_rowids;
 DROP TABLE IF EXISTS event_search_rowids;
 PRAGMA user_version = 15;
@@ -174,8 +201,8 @@ SQL
 
 Dropping the map tables is required, not optional: leaving them behind with
 a v15 version invites stale map contents if the store is later re-upgraded.
-Re-upgrading afterwards is safe — the newer binary just runs the v1000
-migration again with empty maps.
+Re-upgrading afterwards is safe — the newer binary just runs the fork
+migrations again (empty maps, recreated indexes).
 
 Remove a source from future imports:
 

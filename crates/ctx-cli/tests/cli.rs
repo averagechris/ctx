@@ -4,8 +4,9 @@ use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use std::{
     fs,
-    io::Write,
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
+    process::{Command as StdCommand, Stdio},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tempfile::{Builder, TempDir};
@@ -80,6 +81,180 @@ fn write_match_fixture(temp: &TempDir) -> String {
 
 fn import_match_fixture(temp: &TempDir) {
     let fixture = write_match_fixture(temp);
+    json_output(ctx(temp).args([
+        "import",
+        "--format",
+        "ctx-history-jsonl-v1",
+        "--path",
+        &fixture,
+        "--json",
+        "--progress",
+        "none",
+    ]));
+}
+
+fn write_pagination_fixture(temp: &TempDir, event_count: usize) -> String {
+    let path = temp.path().join("pagination-fixture.jsonl");
+    let mut lines = vec![
+        r#"{"record_type":"manifest","schema_version":"ctx-history-jsonl-v1"}"#.to_string(),
+        r#"{"record_type":"source","source_id":"page-source","provider_key":"page-agent","source_format":"page-jsonl","raw_source_path":"/tmp/page.jsonl","fingerprint":"sha256:page","observed_at":"2026-06-23T12:00:10Z"}"#.to_string(),
+        r#"{"record_type":"session","source_id":"page-source","session_id":"page-session","native_session_id":"native-page-session","cwd":"/workspace/page","started_at":"2026-06-23T12:00:00Z","agent_type":"primary","is_primary":true,"status":"completed"}"#.to_string(),
+    ];
+    for i in 0..event_count {
+        lines.push(format!(
+            r#"{{"record_type":"event","source_id":"page-source","session_id":"page-session","event_index":{i},"event_id":"evt-{i}","native_cursor":"line:{i}","event_type":"message","role":"user","occurred_at":"2026-06-23T12:00:{:02}Z","payload":{{"text":"needle pagination event {i} 😀"}},"preview":"needle pagination event {i} 😀"}}"#,
+            i + 1
+        ));
+    }
+    for i in 0..event_count {
+        lines.push(format!(
+            r#"{{"record_type":"source","source_id":"page-search-source-{i}","provider_key":"page-agent","source_format":"page-jsonl","raw_source_path":"/tmp/page-search-{i}.jsonl","fingerprint":"sha256:page-search-{i}","observed_at":"2026-06-23T12:01:00Z"}}"#
+        ));
+        lines.push(format!(
+            r#"{{"record_type":"session","source_id":"page-search-source-{i}","session_id":"page-search-session-{i}","native_session_id":"native-page-search-{i}","cwd":"/workspace/page","started_at":"2026-06-23T12:01:{:02}Z","agent_type":"primary","is_primary":true,"status":"completed"}}"#,
+            i + 1
+        ));
+        lines.push(format!(
+            r#"{{"record_type":"event","source_id":"page-search-source-{i}","session_id":"page-search-session-{i}","event_index":0,"event_id":"search-evt-{i}","native_cursor":"search:{i}","event_type":"message","role":"user","occurred_at":"2026-06-23T12:02:{:02}Z","payload":{{"text":"needle pagination distinct session {i} 😀"}},"preview":"needle pagination distinct session {i} 😀"}}"#,
+            i + 1
+        ));
+    }
+    fs::write(&path, lines.join("\n")).unwrap();
+    path.display().to_string()
+}
+
+fn import_pagination_fixture(temp: &TempDir, event_count: usize) {
+    let fixture = write_pagination_fixture(temp, event_count);
+    json_output(ctx(temp).args([
+        "import",
+        "--format",
+        "ctx-history-jsonl-v1",
+        "--path",
+        &fixture,
+        "--json",
+        "--progress",
+        "none",
+    ]));
+}
+
+fn import_distinct_search_fixtures(temp: &TempDir, count: usize) {
+    for index in 0..count {
+        let path = temp.path().join(format!("distinct-search-{index}.jsonl"));
+        fs::write(
+            &path,
+            [
+                r#"{"record_type":"manifest","schema_version":"ctx-history-jsonl-v1"}"#.to_owned(),
+                format!(r#"{{"record_type":"source","source_id":"distinct-source-{index}","provider_key":"page-agent","source_format":"page-jsonl","observed_at":"2026-06-23T12:00:00Z"}}"#),
+                format!(r#"{{"record_type":"session","source_id":"distinct-source-{index}","session_id":"distinct-session-{index}","started_at":"2026-06-23T12:00:00Z","agent_type":"primary","is_primary":true,"status":"completed"}}"#),
+                format!(r#"{{"record_type":"event","source_id":"distinct-source-{index}","session_id":"distinct-session-{index}","event_index":0,"event_id":"distinct-event-{index}","event_type":"message","role":"user","occurred_at":"2026-06-23T12:00:01Z","payload":{{"text":"pagingneedle repeated payload search {index} 😀"}},"preview":"pagingneedle repeated payload search {index} 😀"}}"#),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        json_output(ctx(temp).args([
+            "import",
+            "--format",
+            "ctx-history-jsonl-v1",
+            "--path",
+            path.to_str().unwrap(),
+            "--json",
+            "--progress",
+            "none",
+        ]));
+    }
+}
+
+fn assert_no_keys(value: &Value, forbidden: &[&str]) {
+    match value {
+        Value::Object(object) => {
+            for key in forbidden {
+                assert!(
+                    !object.contains_key(*key),
+                    "compact projection leaked key {key}: {value:#}"
+                );
+            }
+            for child in object.values() {
+                assert_no_keys(child, forbidden);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                assert_no_keys(item, forbidden);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn write_large_paged_fixture(temp: &TempDir, event_count: usize) -> String {
+    assert!(event_count <= 200);
+    let path = temp.path().join("large-paged-fixture.jsonl");
+    let long_text = format!("needle-large {}", "😀payload".repeat(8_000));
+    let mut lines = vec![
+        r#"{"record_type":"manifest","schema_version":"ctx-history-jsonl-v1"}"#.to_owned(),
+        r#"{"record_type":"source","source_id":"large-source","provider_key":"large-agent","source_format":"large-jsonl","observed_at":"2026-06-23T12:00:00Z"}"#.to_owned(),
+        r#"{"record_type":"session","source_id":"large-source","session_id":"large-session","started_at":"2026-06-23T12:00:00Z","agent_type":"primary","is_primary":true,"status":"completed"}"#.to_owned(),
+    ];
+    for index in 0..event_count {
+        lines.push(
+            serde_json::to_string(&json!({
+                "record_type": "event",
+                "source_id": "large-source",
+                "session_id": "large-session",
+                "event_index": index,
+                "event_id": format!("large-event-{index}"),
+                "event_type": "message",
+                "role": "user",
+                "occurred_at": "2026-06-23T12:00:01Z",
+                "payload": {"text": format!("{long_text} {index}")},
+                "preview": format!("{long_text} {index}"),
+            }))
+            .unwrap(),
+        );
+        lines.push(
+            serde_json::to_string(&json!({
+                "record_type": "source",
+                "source_id": format!("large-search-source-{index}"),
+                "provider_key": "large-agent",
+                "source_format": "large-jsonl",
+                "observed_at": "2026-06-23T12:01:00Z",
+            }))
+            .unwrap(),
+        );
+        lines.push(
+            serde_json::to_string(&json!({
+                "record_type": "session",
+                "source_id": format!("large-search-source-{index}"),
+                "session_id": format!("large-search-session-{index}"),
+                "started_at": "2026-06-23T12:01:01Z",
+                "agent_type": "primary",
+                "is_primary": true,
+                "status": "completed",
+            }))
+            .unwrap(),
+        );
+        lines.push(
+            serde_json::to_string(&json!({
+                "record_type": "event",
+                "source_id": format!("large-search-source-{index}"),
+                "session_id": format!("large-search-session-{index}"),
+                "event_index": 0,
+                "event_id": format!("large-search-event-{index}"),
+                "event_type": "message",
+                "role": "user",
+                "occurred_at": "2026-06-23T12:02:01Z",
+                "payload": {"text": format!("{long_text} search {index}")},
+                "preview": format!("{long_text} search {index}"),
+            }))
+            .unwrap(),
+        );
+    }
+    fs::write(&path, lines.join("\n")).unwrap();
+    path.display().to_string()
+}
+
+fn import_large_paged_fixture(temp: &TempDir, event_count: usize) {
+    let fixture = write_large_paged_fixture(temp, event_count);
     json_output(ctx(temp).args([
         "import",
         "--format",
@@ -635,8 +810,8 @@ fn assert_search_provider_oracle_with_scope(
             assert!(result["more_matches_in_session"].is_number());
             assert_session_suggested_next_commands(result);
         } else {
-            assert_eq!(result.get("session_importance"), None);
-            assert_eq!(result.get("more_matches_in_session"), None);
+            assert!(result["session_importance"].is_number());
+            assert!(result["more_matches_in_session"].is_number());
             assert_event_suggested_next_commands(result);
         }
         assert!(result["why_matched"]
@@ -1636,6 +1811,18 @@ fn search_match_modes_terms_json_and_no_result_suggestion_are_explicit() {
         1,
         "{repeated:#}"
     );
+
+    let deduplicated_query = json_output(ctx(&temp).args([
+        "search",
+        "alpha",
+        "--term",
+        "ALPHA",
+        "--events",
+        "--refresh",
+        "off",
+        "--json",
+    ]));
+    assert_eq!(deduplicated_query["query"], "alpha");
 
     let punctuation = json_output(ctx(&temp).args([
         "search",
@@ -3404,10 +3591,10 @@ fn read_only_commands_direct_old_schemas_to_a_writable_migration() {
 
 #[test]
 fn read_only_commands_reject_foreign_schemas_without_impossible_migration_advice() {
-    // 16 sits in the unreviewed upstream gap; 1001 is newer than this
+    // 16 sits in the unreviewed upstream gap; 1002 is newer than this
     // binary. Neither can be migrated by it, so the guidance must say
     // upgrade/restore rather than suggesting a migration command.
-    for version in [16i64, 1001] {
+    for version in [16i64, 1002] {
         let temp = tempdir();
         let db_path = write_bare_store_with_user_version(&temp, version);
         let before = fs::read(&db_path).unwrap();
@@ -3441,7 +3628,7 @@ fn read_only_commands_reject_foreign_schemas_without_impossible_migration_advice
 #[test]
 fn mcp_status_reports_version_guidance_for_foreign_schema() {
     let temp = tempdir();
-    write_bare_store_with_user_version(&temp, 1001);
+    write_bare_store_with_user_version(&temp, 1002);
     let responses = mcp_roundtrip(
         &temp,
         &[
@@ -3473,7 +3660,7 @@ fn mcp_status_reports_version_guidance_for_foreign_schema() {
     assert_eq!(result["isError"], true);
     let error = result["structuredContent"]["error"].as_str().unwrap();
     assert!(
-        error.contains("schema version 1001 is newer than or incompatible with this ctx binary"),
+        error.contains("schema version 1002 is newer than or incompatible with this ctx binary"),
         "{error}"
     );
     assert!(error.contains("upgrade ctx"), "{error}");
@@ -3482,7 +3669,7 @@ fn mcp_status_reports_version_guidance_for_foreign_schema() {
 
 #[test]
 fn mcp_non_status_tools_report_version_guidance_without_mutating() {
-    for version in [15i64, 16, 1001] {
+    for version in [15i64, 16, 1002] {
         let temp = tempdir();
         let db_path = write_bare_store_with_user_version(&temp, version);
         let bytes_before = fs::read(&db_path).unwrap();
@@ -3689,6 +3876,1099 @@ fn provider_session_lookup_requires_explicit_provider_flags_in_help() {
 }
 
 #[test]
+fn show_session_paginates_json_human_jsonl_and_is_read_only() {
+    let temp = tempdir();
+    import_pagination_fixture(&temp, 5);
+    let search = json_output(ctx(&temp).args(["search", "event 4", "--refresh", "off", "--json"]));
+    let ctx_session_id = search["results"][0]["ctx_session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let db_path = temp.path().join("work.sqlite");
+    let before = fs::metadata(&db_path).unwrap().modified().unwrap();
+
+    let first = json_output(ctx(&temp).args([
+        "show",
+        "session",
+        &ctx_session_id,
+        "--mode",
+        "log",
+        "--limit",
+        "2",
+        "--format",
+        "json",
+    ]));
+    assert_eq!(first["events"].as_array().unwrap().len(), 2);
+    assert_eq!(first["pagination"]["has_more"], true, "{first:#}");
+    assert!(first["pagination"]["cursor"].is_string());
+    assert_eq!(first["total_events"], 5);
+    assert_eq!(first["omitted_events"], 3);
+    let token = first["pagination"]["cursor"].as_str().unwrap();
+    let after = fs::metadata(&db_path).unwrap().modified().unwrap();
+    assert_eq!(
+        before, after,
+        "show must open the store read-only without migrating/writing"
+    );
+
+    let second = json_output(ctx(&temp).args([
+        "show",
+        "session",
+        &ctx_session_id,
+        "--mode",
+        "log",
+        "--limit",
+        "2",
+        "--format",
+        "json",
+        "--continue",
+        token,
+    ]));
+    assert_eq!(second["events"].as_array().unwrap().len(), 2);
+    assert_eq!(second["pagination"]["has_more"], true);
+    let final_token = second["pagination"]["cursor"].as_str().unwrap();
+    let final_page = json_output(ctx(&temp).args([
+        "show",
+        "session",
+        &ctx_session_id,
+        "--mode",
+        "log",
+        "--limit",
+        "2",
+        "--format",
+        "json",
+        "--continue",
+        final_token,
+    ]));
+    assert_eq!(final_page["events"].as_array().unwrap().len(), 1);
+    assert_eq!(final_page["pagination"]["has_more"], false);
+    assert!(final_page["pagination"]["cursor"].is_null());
+    assert!(final_page["next"].is_null());
+    assert!(final_page["next_command"].is_null());
+    assert!(final_page["next_argv"].is_null());
+
+    let (human, _) = success_output(ctx(&temp).args([
+        "show",
+        "session",
+        &ctx_session_id,
+        "--mode",
+        "log",
+        "--limit",
+        "2",
+    ]));
+    assert!(
+        human.contains("events omitted; continue with --continue"),
+        "{human}"
+    );
+
+    let (jsonl, _) = success_output(ctx(&temp).args([
+        "show",
+        "session",
+        &ctx_session_id,
+        "--mode",
+        "log",
+        "--limit",
+        "2",
+        "--format",
+        "jsonl",
+    ]));
+    let records = jsonl
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record["record_type"] == "completion")
+            .count(),
+        1
+    );
+    assert!(records[..records.len() - 1]
+        .iter()
+        .all(|record| record["record_type"] == "event"));
+    assert!(records[..records.len() - 1].iter().all(|record| {
+        record["item_type"] == "session_transcript_event"
+            && record["mode"] == "log"
+            && record["ctx_session_id"] == ctx_session_id
+            && record["provider"].is_string()
+            && record["event"]["item_type"] == "event"
+    }));
+    assert_eq!(records.last().unwrap()["record_type"], "completion");
+    assert_eq!(records.last().unwrap()["has_more"], true);
+    assert_eq!(records.last().unwrap()["returned"], records.len() - 1);
+    assert!(records.last().unwrap()["next_argv"].is_array());
+}
+
+#[test]
+fn search_jsonl_and_repeated_term_continuation_are_stable() {
+    let temp = tempdir();
+    import_pagination_fixture(&temp, 5);
+    let first = json_output(ctx(&temp).args([
+        "search",
+        "pagingneedle",
+        "--term",
+        "pagination",
+        "--events",
+        "--limit",
+        "2",
+        "--refresh",
+        "off",
+        "--json",
+    ]));
+    assert!(first["results"].as_array().unwrap().len() <= 2, "{first:#}");
+
+    let (jsonl, _) = success_output(ctx(&temp).args([
+        "search",
+        "needle",
+        "--term",
+        "pagination",
+        "--events",
+        "--limit",
+        "2",
+        "--refresh",
+        "off",
+        "--format",
+        "jsonl",
+    ]));
+    let records = jsonl
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record["record_type"] == "completion")
+            .count(),
+        1
+    );
+    assert!(records[..records.len() - 1]
+        .iter()
+        .all(|record| record["record_type"] == "result"));
+    assert!(records[..records.len() - 1]
+        .iter()
+        .all(|record| record["result"]["item_type"].is_string()));
+    assert_eq!(records.last().unwrap()["record_type"], "completion");
+    assert!(records.last().unwrap()["has_more"].is_boolean());
+    assert_eq!(records.last().unwrap()["returned"], records.len() - 1);
+}
+
+#[cfg(unix)]
+fn assert_paged_ndjson_broken_pipe_is_success(temp: &TempDir, args: &[&str]) {
+    let mut child = StdCommand::new(assert_cmd::cargo::cargo_bin("ctx"))
+        .args(args)
+        .env("CTX_DATA_ROOT", temp.path())
+        .env("HOME", temp.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut first = String::new();
+    reader.read_line(&mut first).unwrap();
+    assert!(!first.is_empty(), "child produced no NDJSON record");
+    serde_json::from_str::<Value>(&first).unwrap();
+    drop(reader);
+
+    let status = child.wait().unwrap();
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(status.success(), "broken pipe status {status}: {stderr}");
+    assert!(stderr.is_empty(), "broken pipe wrote stderr: {stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn paged_search_and_show_session_ndjson_handle_real_broken_pipes() {
+    let temp = tempdir();
+    import_large_paged_fixture(&temp, 80);
+
+    assert_paged_ndjson_broken_pipe_is_success(
+        &temp,
+        &[
+            "search",
+            "needle-large",
+            "--events",
+            "--limit",
+            "80",
+            "--max-snippet-bytes",
+            "65536",
+            "--max-page-bytes",
+            "8388608",
+            "--refresh",
+            "off",
+            "--format",
+            "jsonl",
+        ],
+    );
+
+    let conn = Connection::open(temp.path().join("work.sqlite")).unwrap();
+    let session_id: String = conn
+        .query_row(
+            "SELECT session_id FROM events WHERE session_id IS NOT NULL GROUP BY session_id ORDER BY COUNT(*) DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_paged_ndjson_broken_pipe_is_success(
+        &temp,
+        &[
+            "show",
+            "session",
+            &session_id,
+            "--mode",
+            "log",
+            "--limit",
+            "80",
+            "--max-event-bytes",
+            "65536",
+            "--max-page-bytes",
+            "8388608",
+            "--format",
+            "jsonl",
+        ],
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_output_fifo_broken_pipe_is_not_swallowed() {
+    let temp = tempdir();
+    import_large_paged_fixture(&temp, 80);
+    let conn = Connection::open(temp.path().join("work.sqlite")).unwrap();
+    let session_id: String = conn
+        .query_row(
+            "SELECT session_id FROM events WHERE session_id IS NOT NULL GROUP BY session_id ORDER BY COUNT(*) DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(conn);
+    let fifo = temp.path().join("transcript.fifo");
+    assert!(StdCommand::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap()
+        .success());
+    let reader_path = fifo.clone();
+    let reader = std::thread::spawn(move || {
+        let mut file = fs::File::open(reader_path).unwrap();
+        let mut byte = [0_u8; 1];
+        file.read_exact(&mut byte).unwrap();
+    });
+    let output = StdCommand::new(assert_cmd::cargo::cargo_bin("ctx"))
+        .args([
+            "show",
+            "session",
+            &session_id,
+            "--mode",
+            "log",
+            "--limit",
+            "80",
+            "--max-event-bytes",
+            "65536",
+            "--max-page-bytes",
+            "8388608",
+            "--format",
+            "jsonl",
+            "--out",
+            fifo.to_str().unwrap(),
+        ])
+        .env("CTX_DATA_ROOT", temp.path())
+        .env("HOME", temp.path())
+        .output()
+        .unwrap();
+    reader.join().unwrap();
+    assert!(
+        !output.status.success(),
+        "explicit FIFO error was swallowed"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Broken pipe"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn paged_ndjson_errors_are_structured_and_nonzero() {
+    let temp = tempdir();
+    import_pagination_fixture(&temp, 2);
+    import_distinct_search_fixtures(&temp, 3);
+    let (stdout, _) = failure_output(ctx(&temp).args([
+        "search",
+        "pagingneedle",
+        "--refresh",
+        "off",
+        "--format",
+        "jsonl",
+        "--continue",
+        "not-hex",
+    ]));
+    let records = stdout
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 1, "{records:#?}");
+    assert_eq!(records[0]["record_type"], "error");
+    assert_eq!(records[0]["kind"], "invalid_continuation");
+
+    let first = json_output(ctx(&temp).args([
+        "search",
+        "pagingneedle",
+        "--events",
+        "--limit",
+        "1",
+        "--refresh",
+        "off",
+        "--json",
+    ]));
+    let search_token = first["next"].as_str().unwrap();
+    let conn = Connection::open(temp.path().join("work.sqlite")).unwrap();
+    let session_id: String = conn
+        .query_row(
+            "SELECT session_id FROM events WHERE session_id IS NOT NULL GROUP BY session_id ORDER BY COUNT(*) DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(conn);
+    let show_first = json_output(ctx(&temp).args([
+        "show",
+        "session",
+        &session_id,
+        "--mode",
+        "log",
+        "--limit",
+        "1",
+        "--format",
+        "json",
+    ]));
+    let show_token = show_first["next"].as_str().unwrap();
+    for (args, kind) in [
+        (
+            vec![
+                "show",
+                "session",
+                &session_id,
+                "--mode",
+                "log",
+                "--limit",
+                "1",
+                "--format",
+                "jsonl",
+                "--continue",
+                search_token,
+            ],
+            "continuation_kind_mismatch",
+        ),
+        (
+            vec![
+                "search",
+                "pagingneedle",
+                "--events",
+                "--limit",
+                "1",
+                "--fields",
+                "compact",
+                "--refresh",
+                "off",
+                "--format",
+                "jsonl",
+                "--continue",
+                search_token,
+            ],
+            "continuation_request_mismatch",
+        ),
+        (
+            vec![
+                "search",
+                "pagingneedle",
+                "--events",
+                "--limit",
+                "1",
+                "--refresh",
+                "off",
+                "--format",
+                "jsonl",
+                "--continue",
+                show_token,
+            ],
+            "continuation_kind_mismatch",
+        ),
+    ] {
+        let (stdout, _) = failure_output(ctx(&temp).args(args));
+        let record: Value = serde_json::from_str(stdout.trim()).unwrap();
+        assert_eq!(record["record_type"], "error");
+        assert_eq!(record["kind"], kind);
+    }
+
+    for (args, kind) in [
+        (
+            vec![
+                "search",
+                "pagingneedle",
+                "--since",
+                "not-a-time",
+                "--refresh",
+                "off",
+                "--format",
+                "jsonl",
+            ],
+            "invalid_filters",
+        ),
+        (
+            vec!["show", "session", "ffffffff", "--format", "jsonl"],
+            "session_lookup_error",
+        ),
+        (
+            vec!["show", "event", "ffffffff", "--format", "jsonl"],
+            "event_lookup_error",
+        ),
+    ] {
+        let (stdout, _) = failure_output(ctx(&temp).args(args));
+        let record: Value = serde_json::from_str(stdout.trim()).unwrap();
+        assert_eq!(record["record_type"], "error");
+        assert_eq!(record["kind"], kind);
+    }
+
+    let missing = tempdir();
+    let (stdout, _) =
+        failure_output(ctx(&missing).args(["show", "session", "ffffffff", "--format", "jsonl"]));
+    let record: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(record["kind"], "store_error");
+}
+
+#[test]
+fn repeated_terms_are_bounded_for_cli_and_mcp_and_declared_in_schema() {
+    let fresh = tempdir();
+    let mut pre_refresh = ctx(&fresh);
+    pre_refresh.args(["search", "needle", "--format", "jsonl"]);
+    for _ in 0..=ctx_history_search::MAX_QUERY_CLAUSES {
+        pre_refresh.args(["--term", "duplicate"]);
+    }
+    let output = pre_refresh.assert().failure().get_output().stdout.clone();
+    let error: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(error["kind"], "invalid_query");
+    assert!(
+        !fresh.path().join("work.sqlite").exists(),
+        "invalid query must fail before refresh or store initialization"
+    );
+
+    let temp = tempdir();
+    import_pagination_fixture(&temp, 1);
+    let mut command = ctx(&temp);
+    command.args(["search", "needle", "--refresh", "off", "--format", "jsonl"]);
+    for _ in 0..=ctx_history_search::MAX_QUERY_CLAUSES {
+        command.args(["--term", "duplicate"]);
+    }
+    let output = command.assert().failure().get_output().stdout.clone();
+    let error: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(error["kind"], "invalid_query");
+
+    let too_many = vec!["duplicate"; ctx_history_search::MAX_QUERY_CLAUSES + 1];
+    let responses = mcp_roundtrip(
+        &temp,
+        &[
+            json!({"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ctx-test","version":"0"}}}),
+            json!({"jsonrpc":"2.0","id":"list","method":"tools/list","params":{}}),
+            json!({"jsonrpc":"2.0","id":"search","method":"tools/call","params":{"name":"search","arguments":{"query":"needle","terms":too_many}}}),
+        ],
+    );
+    let search_tool = responses[1]["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "search")
+        .unwrap();
+    assert_eq!(
+        search_tool["inputSchema"]["properties"]["terms"]["maxItems"],
+        ctx_history_search::MAX_QUERY_CLAUSES
+    );
+    assert_eq!(responses[2]["result"]["isError"], true);
+}
+
+#[test]
+fn search_pages_preserve_exact_order_options_and_final_metadata() {
+    let temp = tempdir();
+    import_distinct_search_fixtures(&temp, 6);
+    let common = [
+        "pagingneedle",
+        "--term",
+        "payload",
+        "--term",
+        "search",
+        "--match",
+        "any",
+        "--events",
+        "--role",
+        "user",
+        "--exclude-tool-noise",
+        "--since",
+        "30d",
+        "--fields",
+        "compact",
+        "--max-snippet-bytes",
+        "7",
+        "--max-page-bytes",
+        "1048576",
+        "--refresh",
+        "off",
+        "--json",
+    ];
+    let mut expected_args = vec!["search"];
+    expected_args.extend(common);
+    expected_args.extend(["--limit", "200"]);
+    let expected = json_output(ctx(&temp).args(expected_args));
+    let expected_ids = expected["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|result| result["item_id"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert!(expected_ids.len() > 2, "{expected:#}");
+
+    let mut first_args = vec!["search"];
+    first_args.extend(common);
+    first_args.extend(["--limit", "2"]);
+    let mut page = json_output(ctx(&temp).args(first_args));
+    let mut actual_ids = Vec::new();
+    let mut page_count = 0;
+    loop {
+        page_count += 1;
+        let offset = page["pagination"]["offset"].as_u64().unwrap() as usize;
+        let results = page["results"].as_array().unwrap();
+        assert_eq!(page["pagination"]["returned_items"], results.len());
+        assert_eq!(page["omitted"]["before"], offset);
+        actual_ids.extend(
+            results
+                .iter()
+                .map(|result| result["item_id"].as_str().unwrap().to_owned()),
+        );
+        if !page["pagination"]["has_more"].as_bool().unwrap() {
+            assert!(page["pagination"]["cursor"].is_null());
+            assert!(page["next"].is_null());
+            assert!(page["next_command"].is_null());
+            assert!(page["next_argv"].is_null());
+            break;
+        }
+        let argv = page["next_argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(argv[0], "ctx");
+        assert!(argv.windows(2).any(|pair| pair == ["--refresh", "off"]));
+        assert_eq!(argv.iter().filter(|arg| *arg == "--term").count(), 2);
+        let since_index = argv.iter().position(|arg| arg == "--since").unwrap();
+        assert_ne!(argv[since_index + 1], "30d");
+        assert!(argv[since_index + 1].contains('T'));
+        for preserved in [
+            "--events",
+            "--role",
+            "--exclude-tool-noise",
+            "--fields",
+            "--max-snippet-bytes",
+            "--max-page-bytes",
+        ] {
+            assert!(argv.iter().any(|arg| arg == preserved), "{argv:?}");
+        }
+        page = json_output(ctx(&temp).args(&argv[1..]));
+    }
+    assert!(page_count > 1);
+    assert_eq!(actual_ids, expected_ids, "pagination changed rank/order");
+    let unique = actual_ids.iter().collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(unique.len(), actual_ids.len(), "duplicate paged result");
+}
+
+#[test]
+fn compact_search_show_and_mcp_structurally_exclude_private_provenance() {
+    let temp = tempdir();
+    import_pagination_fixture(&temp, 3);
+    let forbidden = [
+        "provider_session_id",
+        "history_record_id",
+        "run_id",
+        "capture_source_id",
+        "history_source",
+        "history_source_plugin",
+        "provider_key",
+        "source_id",
+        "source_format",
+        "source_path",
+        "source_exists",
+        "source_cursor",
+        "cwd",
+        "citations",
+        "payload",
+        "suggested_next_commands",
+    ];
+    let search = json_output(ctx(&temp).args([
+        "search",
+        "needle",
+        "--events",
+        "--fields",
+        "compact",
+        "--refresh",
+        "off",
+        "--json",
+    ]));
+    assert_no_keys(&search["context"], &forbidden);
+    assert_no_keys(&search["results"], &forbidden);
+    let session_id = search["results"][0]["ctx_session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let show = json_output(ctx(&temp).args([
+        "show",
+        "session",
+        &session_id,
+        "--mode",
+        "log",
+        "--fields",
+        "compact",
+        "--format",
+        "json",
+    ]));
+    assert_no_keys(&show, &forbidden);
+    assert!(show.get("source").is_none());
+    let (show_jsonl, show_jsonl_stderr) = success_output(ctx(&temp).args([
+        "show",
+        "session",
+        &session_id,
+        "--mode",
+        "log",
+        "--fields",
+        "compact",
+        "--format",
+        "jsonl",
+    ]));
+    assert!(show_jsonl_stderr.is_empty(), "{show_jsonl_stderr}");
+    for record in show_jsonl
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+    {
+        assert_no_keys(&record, &forbidden);
+    }
+
+    let responses = mcp_roundtrip(
+        &temp,
+        &[
+            json!({"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ctx-test","version":"0"}}}),
+            json!({"jsonrpc":"2.0","id":"search","method":"tools/call","params":{"name":"search","arguments":{"query":"needle","events":true,"fields":"compact","limit":2}}}),
+            json!({"jsonrpc":"2.0","id":"show","method":"tools/call","params":{"name":"show_session","arguments":{"ctx_session_id":session_id,"mode":"log","fields":"compact","limit":2}}}),
+        ],
+    );
+    let mcp_search = &responses[1]["result"]["structuredContent"];
+    let mcp_show = &responses[2]["result"]["structuredContent"];
+    assert_no_keys(&mcp_search["context"], &forbidden);
+    assert_no_keys(&mcp_search["results"], &forbidden);
+    assert_no_keys(mcp_show, &forbidden);
+}
+
+#[test]
+fn mcp_search_and_show_pagination_match_cli_query_pages() {
+    let temp = tempdir();
+    import_distinct_search_fixtures(&temp, 4);
+    let cli_search = json_output(ctx(&temp).args([
+        "search",
+        "pagingneedle",
+        "--events",
+        "--fields",
+        "compact",
+        "--limit",
+        "2",
+        "--max-snippet-bytes",
+        "32",
+        "--refresh",
+        "off",
+        "--json",
+    ]));
+    let responses = mcp_roundtrip(
+        &temp,
+        &[
+            json!({"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ctx-test","version":"0"}}}),
+            json!({"jsonrpc":"2.0","id":"search","method":"tools/call","params":{"name":"search","arguments":{"query":"pagingneedle","events":true,"fields":"compact","limit":2,"max_snippet_bytes":32}}}),
+        ],
+    );
+    let mcp_search = &responses[1]["result"]["structuredContent"];
+    assert_eq!(mcp_search["results"], cli_search["results"]);
+    assert_eq!(mcp_search["pagination"], cli_search["pagination"]);
+    assert_eq!(mcp_search["omitted"], cli_search["omitted"]);
+    assert_eq!(mcp_search["bytes"], cli_search["bytes"]);
+    let token = mcp_search["next"].as_str().unwrap();
+    let second = mcp_roundtrip(
+        &temp,
+        &[
+            json!({"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ctx-test","version":"0"}}}),
+            json!({"jsonrpc":"2.0","id":"search","method":"tools/call","params":{"name":"search","arguments":{"query":"pagingneedle","events":true,"fields":"compact","limit":2,"max_snippet_bytes":32,"continue":token}}}),
+        ],
+    );
+    let second_page = &second[1]["result"]["structuredContent"];
+    assert_eq!(second_page["pagination"]["offset"], 2);
+    let first_ids = mcp_search["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value["item_id"].as_str().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(second_page["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|value| !first_ids.contains(value["item_id"].as_str().unwrap())));
+
+    let session_id = cli_search["results"][0]["ctx_session_id"].as_str().unwrap();
+    let cli_show = json_output(ctx(&temp).args([
+        "show",
+        "session",
+        session_id,
+        "--mode",
+        "log",
+        "--fields",
+        "compact",
+        "--limit",
+        "2",
+        "--max-event-bytes",
+        "32",
+        "--format",
+        "json",
+    ]));
+    let show = mcp_roundtrip(
+        &temp,
+        &[
+            json!({"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ctx-test","version":"0"}}}),
+            json!({"jsonrpc":"2.0","id":"show","method":"tools/call","params":{"name":"show_session","arguments":{"ctx_session_id":session_id,"mode":"log","fields":"compact","limit":2,"max_event_bytes":32}}}),
+        ],
+    );
+    let mcp_show = &show[1]["result"]["structuredContent"];
+    assert_eq!(mcp_show["events"], cli_show["events"]);
+    assert_eq!(mcp_show["pagination"], cli_show["pagination"]);
+    assert_eq!(mcp_show["bytes"], cli_show["bytes"]);
+}
+
+#[test]
+fn mcp_relative_since_continuation_returns_replayable_canonical_arguments() {
+    let temp = tempdir();
+    import_distinct_search_fixtures(&temp, 4);
+    let first = mcp_roundtrip(
+        &temp,
+        &[
+            json!({"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ctx-test","version":"0"}}}),
+            json!({"jsonrpc":"2.0","id":"search","method":"tools/call","params":{"name":"search","arguments":{"query":"pagingneedle","events":true,"limit":1,"since":"30d"}}}),
+        ],
+    );
+    let page = &first[1]["result"]["structuredContent"];
+    let next_arguments = page["next_arguments"].clone();
+    let frozen_since = next_arguments["since"].as_str().unwrap();
+    assert!(frozen_since.contains('T') && frozen_since.ends_with("+00:00"));
+    assert_ne!(frozen_since, "30d");
+
+    let second = mcp_roundtrip(
+        &temp,
+        &[
+            json!({"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ctx-test","version":"0"}}}),
+            json!({"jsonrpc":"2.0","id":"search","method":"tools/call","params":{"name":"search","arguments":next_arguments}}),
+        ],
+    );
+    assert_ne!(second[1]["result"]["isError"], true, "{second:#?}");
+    assert_eq!(
+        second[1]["result"]["structuredContent"]["pagination"]["offset"],
+        1
+    );
+}
+
+#[test]
+fn byte_caps_are_utf8_safe_and_too_small_pages_fail_without_looping() {
+    let temp = tempdir();
+    import_pagination_fixture(&temp, 2);
+    let search = json_output(ctx(&temp).args([
+        "search",
+        "needle",
+        "--events",
+        "--limit",
+        "1",
+        "--max-snippet-bytes",
+        "2",
+        "--refresh",
+        "off",
+        "--json",
+    ]));
+    let snippet = search["results"][0]["snippet"].as_str().unwrap();
+    assert!(snippet.len() <= 2);
+    assert_eq!(
+        search["results"][0]["snippet_truncation"]["returned_bytes"],
+        snippet.len()
+    );
+
+    let session_id = search["results"][0]["ctx_session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for cap in [0_usize, 1, 2, 3, 4] {
+        let show = json_output(ctx(&temp).args([
+            "show",
+            "session",
+            &session_id,
+            "--mode",
+            "log",
+            "--limit",
+            "1",
+            "--max-event-bytes",
+            &cap.to_string(),
+            "--format",
+            "json",
+        ]));
+        let text = show["events"][0]["text"].as_str().unwrap();
+        assert!(text.len() <= cap, "cap={cap} text={text:?}");
+        assert!(std::str::from_utf8(text.as_bytes()).is_ok());
+        assert_eq!(
+            show["events"][0]["text_truncation"]["returned_bytes"],
+            text.len()
+        );
+    }
+
+    for args in [
+        vec![
+            "search",
+            "needle",
+            "--events",
+            "--refresh",
+            "off",
+            "--max-page-bytes",
+            "0",
+            "--format",
+            "jsonl",
+        ],
+        vec![
+            "show",
+            "session",
+            &session_id,
+            "--mode",
+            "log",
+            "--max-page-bytes",
+            "0",
+            "--format",
+            "jsonl",
+        ],
+    ] {
+        let (stdout, _) = failure_output(ctx(&temp).args(args));
+        let records = stdout
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 1, "{records:#?}");
+        assert_eq!(records[0]["record_type"], "error");
+        assert_eq!(records[0]["kind"], "item_exceeds_page_budget");
+    }
+}
+
+#[test]
+fn emitted_full_item_bytes_match_cli_json_jsonl_and_mcp_boundaries() {
+    let temp = tempdir();
+    import_pagination_fixture(&temp, 3);
+
+    let search = json_output(ctx(&temp).args([
+        "search",
+        "needle",
+        "--events",
+        "--limit",
+        "1",
+        "--refresh",
+        "off",
+        "--json",
+    ]));
+    let search_item_bytes = serde_json::to_vec(&search["results"][0]).unwrap().len();
+    assert_eq!(
+        search["bytes"]["item_json_bytes"].as_u64().unwrap() as usize,
+        search_item_bytes
+    );
+    let exact_search = json_output(ctx(&temp).args([
+        "search",
+        "needle",
+        "--events",
+        "--limit",
+        "2",
+        "--max-page-bytes",
+        &search_item_bytes.to_string(),
+        "--refresh",
+        "off",
+        "--json",
+    ]));
+    assert_eq!(exact_search["results"].as_array().unwrap().len(), 1);
+    assert_eq!(exact_search["bytes"]["item_json_bytes"], search_item_bytes);
+
+    let session_id = search["results"][0]["ctx_session_id"].as_str().unwrap();
+    let show = json_output(ctx(&temp).args([
+        "show", "session", session_id, "--mode", "log", "--limit", "1", "--format", "json",
+    ]));
+    let event_bytes = serde_json::to_vec(&show["events"][0]).unwrap().len();
+    assert_eq!(
+        show["bytes"]["item_json_bytes"].as_u64().unwrap() as usize,
+        event_bytes
+    );
+
+    let (jsonl, _) = success_output(ctx(&temp).args([
+        "show", "session", session_id, "--mode", "log", "--limit", "1", "--format", "jsonl",
+    ]));
+    let records = jsonl
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(records[0]["event"], show["events"][0]);
+    assert_eq!(
+        records.last().unwrap()["bytes"]["item_json_bytes"],
+        event_bytes
+    );
+
+    let mcp = mcp_roundtrip(
+        &temp,
+        &[
+            json!({"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ctx-test","version":"0"}}}),
+            json!({"jsonrpc":"2.0","id":"show","method":"tools/call","params":{"name":"show_session","arguments":{"ctx_session_id":session_id,"mode":"log","limit":1,"max_page_bytes":event_bytes}}}),
+        ],
+    );
+    let mcp_show = &mcp[1]["result"]["structuredContent"];
+    assert_eq!(mcp_show["events"][0], show["events"][0]);
+    assert_eq!(mcp_show["bytes"]["item_json_bytes"], event_bytes);
+
+    for args in [
+        vec![
+            "search",
+            "needle",
+            "--events",
+            "--max-page-bytes",
+            &(search_item_bytes - 1).to_string(),
+            "--refresh",
+            "off",
+            "--format",
+            "jsonl",
+        ],
+        vec![
+            "show",
+            "session",
+            session_id,
+            "--mode",
+            "log",
+            "--max-page-bytes",
+            &(event_bytes - 1).to_string(),
+            "--format",
+            "jsonl",
+        ],
+    ] {
+        let (stdout, _) = failure_output(ctx(&temp).args(args));
+        let error: Value = serde_json::from_str(stdout.trim()).unwrap();
+        assert_eq!(error["kind"], "item_exceeds_page_budget");
+    }
+}
+
+#[test]
+fn provider_session_resolution_is_bounded_and_rejects_ambiguity() {
+    let temp = tempdir();
+    ctx(&temp)
+        .args(["setup", "--catalog-only", "--progress", "none"])
+        .assert()
+        .success();
+    let conn = Connection::open(temp.path().join("work.sqlite")).unwrap();
+    for (index, id) in [
+        "10000000-0000-0000-0000-000000000001",
+        "10000000-0000-0000-0000-000000000002",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        conn.execute(
+            "INSERT INTO sessions (id, provider, external_session_id, agent_type, is_primary, status, fidelity, started_at_ms, created_at_ms, updated_at_ms) VALUES (?1, 'codex', 'duplicate-native', 'primary', 1, 'completed', 'imported', ?2, ?2, ?2)",
+            params![id, index as i64],
+        )
+        .unwrap();
+    }
+    drop(conn);
+    let output = ctx(&temp)
+        .args([
+            "show",
+            "session",
+            "--provider",
+            "codex",
+            "--provider-session",
+            "duplicate-native",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    let stderr = String::from_utf8(output).unwrap();
+    assert!(stderr.contains("multiple codex sessions"), "{stderr}");
+    assert!(!stderr.contains("10000000-0000"), "{stderr}");
+}
+
+#[test]
+fn read_only_paged_commands_reject_v15_without_migrating() {
+    let temp = tempdir();
+    import_pagination_fixture(&temp, 1);
+    let db = temp.path().join("work.sqlite");
+    let conn = Connection::open(&db).unwrap();
+    let session_id: String = conn
+        .query_row("SELECT id FROM sessions LIMIT 1", [], |row| row.get(0))
+        .unwrap();
+    let event_id: String = conn
+        .query_row("SELECT id FROM events LIMIT 1", [], |row| row.get(0))
+        .unwrap();
+    conn.execute_batch(
+        "DROP INDEX idx_events_session_seq_id;
+         DROP INDEX idx_sessions_provider_external_session_started;
+         PRAGMA user_version = 15;",
+    )
+    .unwrap();
+    drop(conn);
+
+    for args in [
+        vec!["search", "needle", "--refresh", "off", "--json"],
+        vec!["show", "session", &session_id, "--format", "json"],
+        vec!["locate", "session", &session_id, "--json"],
+        vec!["locate", "event", &event_id, "--json"],
+    ] {
+        ctx(&temp)
+            .args(args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("schema version 15"));
+    }
+    let responses = mcp_roundtrip(
+        &temp,
+        &[
+            json!({"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ctx-test","version":"0"}}}),
+            json!({"jsonrpc":"2.0","id":"search","method":"tools/call","params":{"name":"search","arguments":{"query":"needle"}}}),
+        ],
+    );
+    assert_eq!(responses[1]["result"]["isError"], true);
+    assert!(responses[1]["result"]["structuredContent"]["error"]
+        .as_str()
+        .unwrap()
+        .contains("schema version"));
+    let conn = Connection::open(&db).unwrap();
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 15);
+    let index_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN ('idx_events_session_seq_id','idx_sessions_provider_external_session_started')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(index_count, 0);
+}
+
+#[test]
 fn removed_public_commands_are_rejected() {
     let temp = tempdir();
     let root_output = ctx(&temp)
@@ -3782,11 +5062,22 @@ fn fresh_home_search_mvp_flow() {
     let ctx_event_id = first_result["ctx_event_id"].as_str().unwrap().to_owned();
     let ctx_session_id = first_result["ctx_session_id"].as_str().unwrap().to_owned();
     assert!(first_result["provider_session_id"].is_string());
+    assert_eq!(first_result["session_id"], ctx_session_id);
+    assert_eq!(first_result["event_id"], ctx_event_id);
+    assert!(first_result["links"].is_object());
     assert!(first_result["source_path"].is_string());
     assert!(first_result["cursor"].is_string());
     assert_session_suggested_next_commands(first_result);
     assert!(first_result["citations"][0]["ctx_event_id"].is_string());
     assert!(first_result["citations"][0]["ctx_session_id"].is_string());
+    assert_eq!(
+        first_result["citations"][0]["item_id"],
+        first_result["citations"][0]["id"]
+    );
+    assert_eq!(
+        first_result["citations"][0]["session_id"],
+        first_result["citations"][0]["ctx_session_id"]
+    );
 
     let term_search = json_output(ctx(&temp).args([
         "search",
@@ -3963,6 +5254,27 @@ fn fresh_home_search_mvp_flow() {
     assert_eq!(show_session["session"]["item_type"], "session");
     assert_eq!(show_session["session"]["item_id"], ctx_session_id);
     assert_eq!(show_session["mode"], "lite");
+    assert_eq!(show_session["provider"], "codex");
+    assert!(show_session["provider_session_id"].is_string());
+    assert_eq!(show_session["session"]["id"], ctx_session_id);
+    assert_eq!(
+        show_session["session"]["external_session_id"],
+        show_session["provider_session_id"]
+    );
+    assert_eq!(
+        show_session["session"]["role"],
+        show_session["session"]["role_hint"]
+    );
+    for key in ["source_id", "source_path", "source_exists"] {
+        assert!(
+            show_session["session"].get(key).is_some(),
+            "missing session {key}"
+        );
+        assert!(
+            show_session["events"][0].get(key).is_some(),
+            "missing event {key}"
+        );
+    }
 
     let braced_session_id = format!("{{{ctx_session_id}}}");
     let show_session_braced =
@@ -4323,6 +5635,67 @@ fn status_read_only_does_not_change_existing_store_mtime_and_doctor_storage_is_s
     assert!(human.contains("sqlite: live"));
     assert!(human.contains("free_space:"));
     assert!(!human.contains("{\"files\""));
+}
+
+#[test]
+fn locate_is_read_only_for_database_wal_and_shm() {
+    let temp = tempdir();
+    import_pagination_fixture(&temp, 2);
+    let db = temp.path().join("work.sqlite");
+    let conn = Connection::open(&db).unwrap();
+    let session_id: String = conn
+        .query_row("SELECT id FROM sessions LIMIT 1", [], |row| row.get(0))
+        .unwrap();
+    let event_id: String = conn
+        .query_row("SELECT id FROM events LIMIT 1", [], |row| row.get(0))
+        .unwrap();
+    drop(conn);
+
+    for args in [
+        vec!["locate", "session", &session_id, "--json"],
+        vec!["locate", "event", &event_id, "--json"],
+    ] {
+        ctx(&temp).args(args).assert().success();
+    }
+    let paths = [
+        db,
+        temp.path().join("work.sqlite-wal"),
+        temp.path().join("work.sqlite-shm"),
+    ];
+    let before = paths
+        .iter()
+        .map(|path| {
+            path.exists()
+                .then(|| fs::metadata(path).unwrap().modified().unwrap())
+        })
+        .collect::<Vec<_>>();
+    std::thread::sleep(Duration::from_millis(1100));
+    for args in [
+        vec!["locate", "session", &session_id, "--json"],
+        vec!["locate", "event", &event_id, "--json"],
+    ] {
+        ctx(&temp).args(args).assert().success();
+    }
+    let after = paths
+        .iter()
+        .map(|path| {
+            path.exists()
+                .then(|| fs::metadata(path).unwrap().modified().unwrap())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(before[0], after[0], "locate must not mutate the main DB");
+    assert_eq!(before[1], after[1], "locate must not mutate WAL contents");
+    assert_eq!(
+        before[2].is_some(),
+        after[2].is_some(),
+        "locate must not create or remove SHM"
+    );
+    // SQLite WAL readers may update transient reader marks in an existing SHM
+    // file even on a read-only connection. Record and bound that exception:
+    // the SHM mtime may advance, but it must not move backwards.
+    if let (Some(before), Some(after)) = (before[2], after[2]) {
+        assert!(after >= before, "SHM mtime moved backwards");
+    }
 }
 
 #[test]

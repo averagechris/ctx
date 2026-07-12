@@ -1,3 +1,4 @@
+use std::io::{Read, Seek, SeekFrom};
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     ffi::CString,
@@ -132,12 +133,13 @@ impl IdPrefixAmbiguity {
 /// Current schema version. The ported upstream migration chain is v1–v15;
 /// this fork's first schema divergence jumps to 1000 (docs/fork-plan.md,
 /// decision 9) so fork migrations can never collide with upstream's chain.
-/// v1000 is reserved by the landed rowid-map migration; the next fork
-/// migration is 1001.
+/// v1000 is the landed rowid-map migration; v1001 adds the bounded
+/// pagination keyset indexes ([`V1001_INDEXES_SQL`]). The next fork
+/// migration is 1002.
 ///
-/// Any binary whose chain ends at v15 refuses to *open* a v1000 store, both
-/// read-only (exact-version check in [`Store::open_read_only`]) and
-/// read-write (the greater-than guard in [`Store::migrate`]). That
+/// Any binary whose chain ends at v15 refuses to *open* a fork-versioned
+/// store, both read-only (exact-version check in [`Store::open_read_only`])
+/// and read-write (the greater-than guard in [`Store::migrate`]). That
 /// rejection is a load-bearing part of the FTS rowid-map invariants (see
 /// [`SearchRowidMapSpec`]): no older binary can newly open the store and
 /// change the search projections without maintaining the maps. The gate is
@@ -145,24 +147,30 @@ impl IdPrefixAmbiguity {
 /// open connection can keep writing until it restarts, which is why release
 /// guidance says to restart long-lived ctx processes after upgrading and
 /// why map entries are verified before every point delete.
-const SCHEMA_VERSION: i64 = 1000;
+const SCHEMA_VERSION: i64 = 1001;
+/// First schema version of this fork's migration chain (the v1000 rowid-map
+/// migration). Writable opens migrate every reviewed version at or above
+/// this up to [`SCHEMA_VERSION`]; the fork chain has no gaps.
+const FORK_SCHEMA_VERSION_MIN: i64 = 1000;
 /// Last schema version of the ported upstream chain. A `user_version`
-/// strictly between this and [`SCHEMA_VERSION`] could only come from a newer
-/// upstream schema this fork has not reviewed; it is rejected instead of
-/// migrated blind.
+/// strictly between this and [`FORK_SCHEMA_VERSION_MIN`] could only come
+/// from a newer upstream schema this fork has not reviewed; it is rejected
+/// instead of migrated blind.
 const UPSTREAM_SCHEMA_VERSION_MAX: i64 = 15;
 
 /// True when a writable open of this binary can migrate the given on-disk
 /// schema version to the current one: everything at or below the ported
-/// upstream chain (≤ v15) migrates. Versions in the (15, 1000) gap and
-/// versions above [`SCHEMA_VERSION`] belong to other (newer or unreviewed)
-/// binaries and are rejected rather than migrated; callers should steer
-/// users toward upgrading ctx or restoring a matching database instead of
-/// suggesting an impossible migration.
+/// upstream chain (≤ v15) migrates, and so does every reviewed fork version
+/// (currently exactly v1000, which upgrades in place to v1001 without
+/// touching the rowid maps or FTS projections). Versions in the (15, 1000)
+/// gap and versions above [`SCHEMA_VERSION`] belong to other (newer or
+/// unreviewed) binaries and are rejected rather than migrated; callers
+/// should steer users toward upgrading ctx or restoring a matching database
+/// instead of suggesting an impossible migration.
 pub fn schema_version_is_migratable(user_version: i64) -> bool {
     user_version <= UPSTREAM_SCHEMA_VERSION_MAX
+        || (FORK_SCHEMA_VERSION_MIN..SCHEMA_VERSION).contains(&user_version)
 }
-
 const BUSY_TIMEOUT: Duration = Duration::from_millis(30_000);
 /// Page budget for the degraded no-FTS record fallback scan in
 /// [`Store::search_records_plan_page`]. With the per-call page size of
@@ -190,6 +198,20 @@ pub const RAW_SQL_DEFAULT_MAX_SQL_BYTES: usize = 64 * 1024;
 pub const RAW_SQL_MAX_SQL_BYTES_CAP: usize = 1_048_576;
 pub const RAW_SQL_DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const RAW_SQL_MAX_TIMEOUT: Duration = Duration::from_secs(60);
+/// Hard bound for every event window/page read performed by the store.
+pub const MAX_BOUNDED_EVENT_READ: usize = 10_000;
+
+/// Store-owned transcript selection, kept independent of presentation crates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectedEventMode {
+    /// Message events whose role is user, assistant, or system.
+    Full,
+    /// User messages plus the final assistant message before the next user or
+    /// session end. Tool, system, and non-message events do not participate.
+    Lite,
+    /// Every event in key order.
+    Log,
+}
 
 /// The closed set of FTS5 search projection tables. `event_search` and
 /// `artifact_search` are optional (older stores may lack them); every
@@ -1167,6 +1189,15 @@ CREATE INDEX IF NOT EXISTS idx_local_workspaces_vcs_workspace_id ON local_worksp
 CREATE INDEX IF NOT EXISTS idx_audit_log_source_id ON audit_log(source_id);
 "#;
 
+/// Fork schema v1001: covering keyset indexes for bounded pagination.
+/// `idx_sessions_provider_external_session_started` serves newest-first
+/// external-session lookups; `idx_events_session_seq_id` serves `(seq, id)`
+/// keyset pages within a session.
+const V1001_INDEXES_SQL: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_sessions_provider_external_session_started ON sessions(provider, external_session_id, started_at_ms DESC, id);
+CREATE INDEX IF NOT EXISTS idx_events_session_seq_id ON events(session_id, seq, id);
+"#;
+
 // `safe_preview_text` is legacy schema naming. It stores local searchable
 // preview text and must not be interpreted as share-safe redaction.
 const FTS_TABLES_SQL: &str = r#"
@@ -1423,23 +1454,40 @@ impl Store {
     pub fn open_with_busy_timeout(path: impl AsRef<Path>, busy_timeout: Duration) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let mut migrated_legacy_layout = false;
-        if let Some(parent) = path.parent() {
-            migrated_legacy_layout = migrate_legacy_history_layout(parent)?;
-            fs::create_dir_all(parent)?;
-            restrict_private_dir(parent)?;
+        let existed = path.exists();
+        if !existed {
+            if let Some(parent) = path.parent() {
+                // Reject an unsupported legacy database before moving any
+                // legacy files into the current layout.
+                reject_unsupported_schema_at(
+                    &parent.join(LEGACY_HISTORY_DIR_NAME).join("work.sqlite"),
+                )?;
+            }
+        }
+        if !existed {
+            if let Some(parent) = path.parent() {
+                migrated_legacy_layout = migrate_legacy_history_layout(parent)?;
+                fs::create_dir_all(parent)?;
+                // Close the creation permission window immediately: a
+                // brand-new data root (or one that just received a moved
+                // legacy store) must not linger with default permissions
+                // while the schema chain runs below.
+                restrict_private_dir(parent)?;
+            }
         }
         let object_dir = path
             .parent()
             .map(|parent| parent.join(OBJECTS_DIR))
             .unwrap_or_else(|| PathBuf::from(OBJECTS_DIR));
-        fs::create_dir_all(&object_dir)?;
-        restrict_private_dir(&object_dir)?;
-        if let Some(spool_dir) = path.parent().map(|parent| parent.join(SPOOL_DIR)) {
-            fs::create_dir_all(&spool_dir)?;
-            restrict_private_dir(&spool_dir)?;
-        }
         let conn = Connection::open(&path)?;
-        restrict_private_file(&path)?;
+        if !existed {
+            // The database file was just created empty by SQLite (or just
+            // moved from the already-validated legacy layout); restrict it
+            // to 0600 before any schema or data is written. A pre-existing
+            // database is deliberately left untouched until its schema
+            // version is validated by migrate() below.
+            restrict_private_file(&path)?;
+        }
         let store = Self {
             path,
             object_dir,
@@ -1448,10 +1496,21 @@ impl Store {
             event_search_page_executions: std::cell::Cell::new(0),
             record_list_page_executions: std::cell::Cell::new(0),
         };
-        // migrate() validates the on-disk schema version before applying
-        // any persistent connection configuration (journal mode), so a
-        // rejected foreign database is returned untouched.
+        // Schema validation is deliberately the first operation for an
+        // existing database. Unsupported versions must not trigger chmod,
+        // directory creation, legacy moves, or persistent connection PRAGMAs.
         store.migrate()?;
+        if let Some(parent) = store.path.parent() {
+            fs::create_dir_all(parent)?;
+            restrict_private_dir(parent)?;
+        }
+        fs::create_dir_all(&store.object_dir)?;
+        restrict_private_dir(&store.object_dir)?;
+        if let Some(spool_dir) = store.path.parent().map(|parent| parent.join(SPOOL_DIR)) {
+            fs::create_dir_all(&spool_dir)?;
+            restrict_private_dir(&spool_dir)?;
+        }
+        restrict_private_file(&store.path)?;
         if migrated_legacy_layout {
             store.normalize_legacy_blob_paths()?;
         }
@@ -1676,7 +1735,7 @@ impl Store {
         if user_version > SCHEMA_VERSION {
             return Err(StoreError::UnsupportedSchemaVersion(user_version));
         }
-        if user_version > UPSTREAM_SCHEMA_VERSION_MAX && user_version < SCHEMA_VERSION {
+        if user_version > UPSTREAM_SCHEMA_VERSION_MAX && user_version < FORK_SCHEMA_VERSION_MIN {
             return Err(StoreError::UnsupportedSchemaVersion(user_version));
         }
         configure_connection(&self.conn, self.busy_timeout)?;
@@ -1727,6 +1786,9 @@ impl Store {
         }
         if user_version < 1000 {
             migrate_to_v1000(&self.conn)?;
+        }
+        if user_version < 1001 {
+            migrate_to_v1001(&self.conn)?;
         }
         create_fts_tables_if_supported(&self.conn)?;
         // Recreate dropped rowid map tables empty on open; an empty map is
@@ -2692,6 +2754,28 @@ impl Store {
             .map_err(StoreError::from)
     }
 
+    pub fn sessions_by_external_session(
+        &self,
+        provider: CaptureProvider,
+        external_session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<Session>> {
+        // Saturate instead of `as`-casting: usize::MAX would wrap to -1,
+        // which SQLite treats as "no limit".
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut stmt = self.conn.prepare(
+            session_select_sql(
+                "WHERE provider = ?1 AND external_session_id = ?2 ORDER BY started_at_ms DESC, id LIMIT ?3",
+            )
+            .as_str(),
+        )?;
+        let rows = stmt.query_map(
+            params![provider.as_str(), external_session_id, limit],
+            session_from_row,
+        )?;
+        collect_rows(rows)
+    }
+
     pub fn existing_external_session_ids(
         &self,
         provider: CaptureProvider,
@@ -3152,6 +3236,209 @@ impl Store {
         )?;
         let rows = stmt.query_map(params![session_id.to_string()], event_from_row)?;
         collect_rows(rows)
+    }
+
+    pub fn event_count_for_session(&self, session_id: Uuid) -> Result<usize> {
+        self.selected_event_count_for_session(session_id, SelectedEventMode::Log)
+    }
+
+    pub fn events_for_session_after(
+        &self,
+        session_id: Uuid,
+        after: Option<(u64, Uuid)>,
+        limit: usize,
+    ) -> Result<Vec<Event>> {
+        self.selected_events_for_session_after(session_id, SelectedEventMode::Log, after, limit)
+    }
+
+    /// Count exactly the events selected by `mode`.
+    pub fn selected_event_count_for_session(
+        &self,
+        session_id: Uuid,
+        mode: SelectedEventMode,
+    ) -> Result<usize> {
+        let sql = format!(
+            "SELECT COUNT(*) FROM events AS e WHERE e.session_id = ?1 AND ({})",
+            selected_event_predicate(mode)
+        );
+        let count = self
+            .conn
+            .query_row(&sql, params![session_id.to_string()], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        usize::try_from(count).map_err(|_| StoreError::NumericOutOfRange {
+            field: "selected event count",
+        })
+    }
+
+    /// Read a bounded keyset page over the events selected by `mode`.
+    ///
+    /// Selection is applied before `LIMIT`, so pages are over selected
+    /// transcript records rather than raw event rows.
+    pub fn selected_events_for_session_after(
+        &self,
+        session_id: Uuid,
+        mode: SelectedEventMode,
+        after: Option<(u64, Uuid)>,
+        limit: usize,
+    ) -> Result<Vec<Event>> {
+        let limit = i64::try_from(limit.min(MAX_BOUNDED_EVENT_READ)).map_err(|_| {
+            StoreError::NumericOutOfRange {
+                field: "event page limit",
+            }
+        })?;
+        let (seq, id) = match after {
+            Some((seq, id)) => (
+                i64::try_from(seq).map_err(|_| StoreError::NumericOutOfRange {
+                    field: "event cursor sequence",
+                })?,
+                id.to_string(),
+            ),
+            None => (-1, String::new()),
+        };
+        let tail = format!(
+            "AS e WHERE e.session_id = ?1 AND ({}) AND (e.seq, e.id) > (?2, ?3) ORDER BY e.seq, e.id LIMIT ?4",
+            selected_event_predicate(mode)
+        );
+        let mut stmt = self.conn.prepare(event_select_sql(&tail).as_str())?;
+        let rows = stmt.query_map(
+            params![session_id.to_string(), seq, id, limit],
+            event_from_row,
+        )?;
+        collect_rows(rows)
+    }
+
+    /// Return the zero-based selected position for an exact event cursor.
+    ///
+    /// Uses the same session/mode selection predicate and `(seq, id)` ordering
+    /// as `selected_events_for_session_after`, so callers can validate cursor
+    /// semantics without duplicating store-layer transcript selection rules.
+    pub fn selected_event_cursor_position(
+        &self,
+        session_id: Uuid,
+        mode: SelectedEventMode,
+        cursor: (u64, Uuid),
+    ) -> Result<Option<usize>> {
+        let seq = i64::try_from(cursor.0).map_err(|_| StoreError::NumericOutOfRange {
+            field: "event cursor sequence",
+        })?;
+        let id = cursor.1.to_string();
+        let selected = selected_event_predicate(mode);
+        let sql = format!(
+            r#"
+            SELECT CASE
+                WHEN EXISTS (
+                    SELECT 1 FROM events AS e
+                    WHERE e.session_id = ?1
+                      AND e.seq = ?2
+                      AND e.id = ?3
+                      AND ({selected})
+                ) THEN (
+                    SELECT COUNT(*) FROM events AS e
+                    WHERE e.session_id = ?1
+                      AND ({selected})
+                      AND (e.seq, e.id) < (?2, ?3)
+                )
+                ELSE NULL
+            END
+            "#
+        );
+        let position: Option<i64> =
+            self.conn
+                .query_row(&sql, params![session_id.to_string(), seq, id], |row| {
+                    row.get(0)
+                })?;
+        position
+            .map(|position| {
+                usize::try_from(position).map_err(|_| StoreError::NumericOutOfRange {
+                    field: "selected event cursor position",
+                })
+            })
+            .transpose()
+    }
+
+    pub fn event_window_bounded(
+        &self,
+        event_id: Uuid,
+        before: usize,
+        after: usize,
+    ) -> Result<Vec<Event>> {
+        let event = self.get_event(event_id)?;
+        let Some(session_id) = event.session_id else {
+            return Ok(vec![event]);
+        };
+        let before = i64::try_from(before.min(MAX_BOUNDED_EVENT_READ)).map_err(|_| {
+            StoreError::NumericOutOfRange {
+                field: "event window before",
+            }
+        })?;
+        let after = i64::try_from(after.min(MAX_BOUNDED_EVENT_READ)).map_err(|_| {
+            StoreError::NumericOutOfRange {
+                field: "event window after",
+            }
+        })?;
+        let event_seq = i64::try_from(event.seq).map_err(|_| StoreError::NumericOutOfRange {
+            field: "event sequence",
+        })?;
+        let mut before_stmt = self.conn.prepare(
+            event_select_sql(
+                "WHERE session_id = ?1 AND (seq, id) < (?2, ?3) ORDER BY seq DESC, id DESC LIMIT ?4",
+            )
+            .as_str(),
+        )?;
+        let before_rows = before_stmt.query_map(
+            params![
+                session_id.to_string(),
+                event_seq,
+                event.id.to_string(),
+                before
+            ],
+            event_from_row,
+        )?;
+        let mut events = collect_rows(before_rows)?;
+        events.reverse();
+        events.push(event.clone());
+        let mut after_stmt = self.conn.prepare(
+            event_select_sql(
+                "WHERE session_id = ?1 AND (seq, id) > (?2, ?3) ORDER BY seq, id LIMIT ?4",
+            )
+            .as_str(),
+        )?;
+        let after_rows = after_stmt.query_map(
+            params![
+                session_id.to_string(),
+                event_seq,
+                event.id.to_string(),
+                after
+            ],
+            event_from_row,
+        )?;
+        events.extend(collect_rows(after_rows)?);
+        Ok(events)
+    }
+
+    pub fn snapshot_fingerprint(&self) -> Result<String> {
+        let mut hasher = Sha256::new();
+        hasher.update(b"ctx-store-physical-snapshot-v1\0");
+        for pragma in [
+            "user_version",
+            "schema_version",
+            "data_version",
+            "page_count",
+            "freelist_count",
+        ] {
+            let value: i64 = self
+                .conn
+                .query_row(&format!("PRAGMA {pragma}"), [], |row| row.get(0))?;
+            hash_tagged_bytes(&mut hasher, pragma.as_bytes());
+            hasher.update(value.to_be_bytes());
+        }
+        fingerprint_file_stable(&self.path, b"main", &mut hasher)?;
+        fingerprint_file_stable(&self.wal_path(), b"wal", &mut hasher)?;
+        let mut shm_path = self.path.as_os_str().to_os_string();
+        shm_path.push("-shm");
+        fingerprint_shm_stable(Path::new(&shm_path), &mut hasher)?;
+        Ok(hex_digest(hasher.finalize().as_slice()))
     }
 
     pub fn events_for_record(&self, record_id: Uuid) -> Result<Vec<Event>> {
@@ -4976,6 +5263,18 @@ fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+fn reject_unsupported_schema_at(path: &Path) -> Result<()> {
+    if !path.is_file() {
+        return Ok(());
+    }
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let user_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if user_version != SCHEMA_VERSION && !schema_version_is_migratable(user_version) {
+        return Err(StoreError::UnsupportedSchemaVersion(user_version));
+    }
+    Ok(())
+}
+
 fn migrate_legacy_history_layout(data_root: &Path) -> Result<bool> {
     let legacy_dir = data_root.join(LEGACY_HISTORY_DIR_NAME);
     if !legacy_dir.is_dir() {
@@ -6186,6 +6485,36 @@ fn migrate_to_v1000(conn: &Connection) -> Result<()> {
     let migration = (|| -> Result<()> {
         conn.execute_batch(SEARCH_ROWID_MAP_TABLES_SQL)?;
         conn.execute_batch("PRAGMA user_version = 1000;")?;
+        Ok(())
+    })();
+
+    match migration {
+        Ok(()) => {
+            conn.execute_batch("COMMIT;")?;
+            Ok(())
+        }
+        Err(err) => {
+            if let Err(rollback_err) = conn.execute_batch("ROLLBACK;") {
+                return Err(StoreError::Sql(rollback_err));
+            }
+            Err(err)
+        }
+    }
+}
+
+/// Fork schema v1000 → v1001: bounded pagination keyset indexes.
+///
+/// Creates the two covering indexes in [`V1001_INDEXES_SQL`] and nothing
+/// else. The v1000 rowid maps and every FTS projection are untouched — no
+/// rebuild, no backfill, no rowid churn — so a v1000 store upgrades in
+/// place. Unsupported external recovery mirrors v1000's: drop the two
+/// indexes and reset `PRAGMA user_version` to 1000 in one transaction
+/// (exact steps in docs/storage.md).
+fn migrate_to_v1001(conn: &Connection) -> Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let migration = (|| -> Result<()> {
+        conn.execute_batch(V1001_INDEXES_SQL)?;
+        conn.execute_batch("PRAGMA user_version = 1001;")?;
         Ok(())
     })();
 
@@ -8311,6 +8640,124 @@ fn event_select_sql(tail: &str) -> String {
     format!(
         "SELECT id, seq, history_record_id, session_id, run_id, event_type, role, occurred_at_ms, capture_source_id, payload_json, payload_blob_id, dedupe_key, visibility, redaction_state, fidelity, sync_state, sync_version, deleted_at_ms, metadata_json FROM events {tail}"
     )
+}
+
+fn selected_event_predicate(mode: SelectedEventMode) -> &'static str {
+    match mode {
+        SelectedEventMode::Log => "1 = 1",
+        SelectedEventMode::Full => {
+            "e.event_type = 'message' AND e.role IN ('user', 'assistant', 'system')"
+        }
+        SelectedEventMode::Lite => {
+            r#"e.event_type = 'message' AND (
+                e.role = 'user'
+                OR (
+                    e.role = 'assistant'
+                    AND COALESCE((
+                        SELECT next.role
+                        FROM events AS next
+                        WHERE next.session_id = e.session_id
+                          AND next.event_type = 'message'
+                          AND next.role IN ('user', 'assistant')
+                          AND (next.seq, next.id) > (e.seq, e.id)
+                        ORDER BY next.seq, next.id
+                        LIMIT 1
+                    ), 'user') = 'user'
+                )
+            )"#
+        }
+    }
+}
+
+const FINGERPRINT_SAMPLE_BYTES: usize = 4096;
+
+fn fingerprint_shm_stable(path: &Path, hasher: &mut Sha256) -> Result<()> {
+    hash_tagged_bytes(hasher, b"shm");
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            hasher.update([0]);
+            return Ok(());
+        }
+        Err(err) => return Err(StoreError::Io(err)),
+    };
+    hasher.update([1]);
+    hasher.update(metadata.len().to_be_bytes());
+    // The WAL-index header and nBackfill checkpoint counter occupy the first
+    // 100 bytes. Bytes after that include reader marks and lock bytes which a
+    // read-only open legitimately mutates; hashing those would invalidate a
+    // continuation merely because the previous CLI process exited.
+    let mut header = [0_u8; 100];
+    let mut file = fs::File::open(path)?;
+    let read = file.read(&mut header)?;
+    hash_tagged_bytes(hasher, &header[..read]);
+    Ok(())
+}
+
+fn fingerprint_file_stable(path: &Path, role: &[u8], hasher: &mut Sha256) -> Result<()> {
+    hash_tagged_bytes(hasher, role);
+    let before = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            hasher.update([0]);
+            return Ok(());
+        }
+        Err(err) => return Err(StoreError::Io(err)),
+    };
+    hasher.update([1]);
+    hash_file_metadata(hasher, &before);
+
+    let mut file = fs::File::open(path)?;
+    let mut sample = vec![0_u8; FINGERPRINT_SAMPLE_BYTES];
+    let first_read = file.read(&mut sample)?;
+    hash_tagged_bytes(hasher, &sample[..first_read]);
+    if before.len() > FINGERPRINT_SAMPLE_BYTES as u64 {
+        let tail_start = before.len().saturating_sub(FINGERPRINT_SAMPLE_BYTES as u64);
+        file.seek(SeekFrom::Start(tail_start))?;
+        let tail_read = file.read(&mut sample)?;
+        hash_tagged_bytes(hasher, &sample[..tail_read]);
+    } else {
+        hash_tagged_bytes(hasher, &[]);
+    }
+
+    // A concurrent append/rewrite must not produce a silently hybrid sample.
+    // Hashing both observations is conservative and guarantees a subsequent
+    // before/after query check sees a different physical state.
+    let after = fs::metadata(path)?;
+    hash_file_metadata(hasher, &after);
+    Ok(())
+}
+
+fn hash_file_metadata(hasher: &mut Sha256, metadata: &fs::Metadata) {
+    hasher.update(metadata.len().to_be_bytes());
+    match metadata.modified().ok().and_then(|value| {
+        value
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|duration| (duration.as_secs(), duration.subsec_nanos()))
+    }) {
+        Some((seconds, nanos)) => {
+            hasher.update([1]);
+            hasher.update(seconds.to_be_bytes());
+            hasher.update(nanos.to_be_bytes());
+        }
+        None => hasher.update([0]),
+    }
+}
+
+fn hash_tagged_bytes(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
 fn event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
@@ -12846,7 +13293,7 @@ mod search_rowid_map_tests {
     }
 
     #[test]
-    fn schema_v15_to_v1000_preserves_projections_and_creates_empty_maps() {
+    fn schema_v15_to_v1001_preserves_projections_and_creates_empty_maps() {
         let temp = tempdir();
         let path = temp.path().join("work.sqlite");
         let record_a = new_id();
@@ -12862,7 +13309,7 @@ mod search_rowid_map_tests {
         );
 
         let store = Store::open(&path).unwrap();
-        assert_eq!(user_version(&store), 1000);
+        assert_eq!(user_version(&store), 1001);
         assert_eq!(user_version(&store), SCHEMA_VERSION);
 
         // The maps exist and start empty: no backfill.
@@ -12871,6 +13318,17 @@ mod search_rowid_map_tests {
             0
         );
         assert_eq!(count(&store, "SELECT COUNT(*) FROM event_search_rowids"), 0);
+
+        // The whole fork chain ran: the v1001 pagination indexes exist too.
+        for index in [
+            "idx_sessions_provider_external_session_started",
+            "idx_events_session_seq_id",
+        ] {
+            assert!(
+                index_exists(&store.conn, index),
+                "v15 upgrade did not create {index}"
+            );
+        }
 
         // No forced rebuild: the legacy projection rows survive at their
         // original explicit rowids with their original text (a rebuild
@@ -12902,11 +13360,11 @@ mod search_rowid_map_tests {
     }
 
     #[test]
-    fn fresh_database_reaches_v1000_through_the_upstream_chain() {
+    fn fresh_database_reaches_v1001_through_the_upstream_chain() {
         let temp = tempdir();
         let store = Store::open(temp.path().join("work.sqlite")).unwrap();
         assert_eq!(user_version(&store), SCHEMA_VERSION);
-        assert_eq!(user_version(&store), 1000);
+        assert_eq!(user_version(&store), 1001);
         // The upstream chain ran first: its v13+ stable views exist.
         assert_eq!(
             count(
@@ -12923,6 +13381,17 @@ mod search_rowid_map_tests {
             0
         );
         assert_eq!(count(&store, "SELECT COUNT(*) FROM event_search_rowids"), 0);
+        // A fresh database receives both fork migrations: the v1000 maps
+        // above and the v1001 pagination indexes.
+        for index in [
+            "idx_sessions_provider_external_session_started",
+            "idx_events_session_seq_id",
+        ] {
+            assert!(
+                index_exists(&store.conn, index),
+                "fresh database is missing {index}"
+            );
+        }
     }
 
     #[test]
@@ -12944,20 +13413,42 @@ mod search_rowid_map_tests {
         drop(Store::open_read_only(&current_path).unwrap());
 
         // Versions newer than this binary are refused in both modes: this
-        // is exactly how a v1000 store looks to an older (<= v15) binary.
+        // is exactly how a fork-versioned store looks to an older binary.
         let future_path = temp.path().join("future.sqlite");
         drop(Store::open(&future_path).unwrap());
         Connection::open(&future_path)
             .unwrap()
-            .execute_batch("PRAGMA user_version = 1001;")
+            .execute_batch("PRAGMA user_version = 1002;")
             .unwrap();
         assert!(matches!(
             Store::open(&future_path),
-            Err(StoreError::UnsupportedSchemaVersion(1001))
+            Err(StoreError::UnsupportedSchemaVersion(1002))
         ));
         assert!(matches!(
             Store::open_read_only(&future_path),
-            Err(StoreError::UnsupportedSchemaVersion(1001))
+            Err(StoreError::UnsupportedSchemaVersion(1002))
+        ));
+
+        // Read-only open also requires the exact current version for fork
+        // schemas: a v1000 (rowid maps only) store must be migrated to
+        // v1001 by a writable open first.
+        let v1000_path = temp.path().join("v1000.sqlite");
+        drop(Store::open(&v1000_path).unwrap());
+        Connection::open(&v1000_path)
+            .unwrap()
+            .execute_batch(
+                r#"
+                BEGIN IMMEDIATE;
+                DROP INDEX idx_sessions_provider_external_session_started;
+                DROP INDEX idx_events_session_seq_id;
+                PRAGMA user_version = 1000;
+                COMMIT;
+                "#,
+            )
+            .unwrap();
+        assert!(matches!(
+            Store::open_read_only(&v1000_path),
+            Err(StoreError::UnsupportedSchemaVersion(1000))
         ));
 
         // Versions in the (15, 1000) gap could only come from an unreviewed
@@ -12986,7 +13477,7 @@ mod search_rowid_map_tests {
         // persistent PRAGMA (journal_mode = WAL) applied before the version
         // gate would show up as mutated bytes, a changed journal mode, or
         // WAL sidecar files.
-        for version in [16i64, 999, 1001] {
+        for version in [16i64, 999, 1002] {
             let path = temp.path().join(format!("foreign-{version}.sqlite"));
             {
                 let conn = Connection::open(&path).unwrap();
@@ -13095,10 +13586,11 @@ mod search_rowid_map_tests {
             Err(StoreError::UnsupportedSchemaVersion(15))
         ));
 
-        // Re-upgrading runs only the v1000 step again: data intact, maps
-        // recreated empty, lazy healing resumes.
+        // Re-upgrading re-runs only the fork steps (v1000 maps, then the
+        // v1001 pagination indexes): data intact, maps recreated empty,
+        // lazy healing resumes.
         let store = Store::open(&path).unwrap();
-        assert_eq!(user_version(&store), 1000);
+        assert_eq!(user_version(&store), 1001);
         assert_eq!(
             count(&store, "SELECT COUNT(*) FROM record_search_rowids"),
             0
@@ -13119,6 +13611,158 @@ mod search_rowid_map_tests {
             .upsert_event(&text_event(event_id, 1, "post downgrade healed event"))
             .unwrap();
         assert_map_fts_identity(&store);
+    }
+
+    fn index_exists(conn: &Connection, index: &str) -> bool {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1)",
+            params![index],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// A brand-new data root and database, or a just-moved known legacy
+    /// store, are restricted to 0700/0600 at creation/move time — before the
+    /// migration chain runs — not as a post-migration afterthought. The
+    /// companion rejection-purity tests prove pre-existing foreign databases
+    /// still see no chmod/mkdir before schema validation.
+    #[cfg(unix)]
+    #[test]
+    fn fresh_and_moved_legacy_stores_are_restricted_before_migration() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // Fresh creation: parent 0700 and database 0600 after open.
+        let temp = tempdir();
+        let root = temp.path().join("fresh-root");
+        let db = root.join("work.sqlite");
+        drop(Store::open(&db).unwrap());
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&db).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        // Moved legacy store: permissions are restricted even when the
+        // migration chain fails afterwards, proving the chmod happens at
+        // move/creation time rather than only after a successful migrate.
+        let temp = tempdir();
+        let root = temp.path().join("legacy-root");
+        let legacy_dir = root.join(LEGACY_HISTORY_DIR_NAME);
+        fs::create_dir_all(&legacy_dir).unwrap();
+        let legacy_db = legacy_dir.join("work.sqlite");
+        build_v15_database(&legacy_db, &[], &[]);
+        // Squat on a v1001 index name so migrate() fails mid-chain.
+        let conn = Connection::open(&legacy_db).unwrap();
+        conn.execute_batch("CREATE TABLE idx_events_session_seq_id(id TEXT PRIMARY KEY);")
+            .unwrap();
+        drop(conn);
+        fs::set_permissions(&legacy_db, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let db = root.join("work.sqlite");
+        assert!(Store::open(&db).is_err(), "blocked migration must fail");
+        assert!(db.exists(), "legacy store was not moved into place");
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&db).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn schema_v1000_to_v1001_upgrades_in_place_without_rebuilding_maps_or_fts() {
+        let temp = tempdir();
+        let path = temp.path().join("work.sqlite");
+        let record_id = new_id();
+        let event_id = new_id();
+        {
+            let store = Store::open(&path).unwrap();
+            store
+                .insert_record(&record_with(record_id, "pagination upgrade body"))
+                .unwrap();
+            store
+                .upsert_event(&text_event(event_id, 1, "pagination upgrade event"))
+                .unwrap();
+            assert_map_fts_identity(&store);
+        }
+
+        // Reshape the store to exactly v1000: populated maps and FTS
+        // projections, no pagination indexes.
+        let (maps_before, fts_before) = {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                BEGIN IMMEDIATE;
+                DROP INDEX idx_sessions_provider_external_session_started;
+                DROP INDEX idx_events_session_seq_id;
+                PRAGMA user_version = 1000;
+                COMMIT;
+                "#,
+            )
+            .unwrap();
+            let maps: Vec<(String, i64)> = conn
+                .prepare(
+                    "SELECT record_id, search_rowid FROM record_search_rowids ORDER BY record_id",
+                )
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            let fts: Vec<(i64, String)> = conn
+                .prepare("SELECT rowid, record_id FROM ctx_history_search ORDER BY rowid")
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert!(!maps.is_empty(), "v1000 store should have map entries");
+            (maps, fts)
+        };
+
+        // A writable open migrates v1000 → v1001 in place.
+        let store = Store::open(&path).unwrap();
+        assert_eq!(user_version(&store), 1001);
+        for index in [
+            "idx_sessions_provider_external_session_started",
+            "idx_events_session_seq_id",
+        ] {
+            assert!(
+                index_exists(&store.conn, index),
+                "v1000→v1001 migration did not create {index}"
+            );
+        }
+        // No map rebuild and no FTS rebuild: rows and rowids are identical.
+        let maps_after: Vec<(String, i64)> = store
+            .conn
+            .prepare("SELECT record_id, search_rowid FROM record_search_rowids ORDER BY record_id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let fts_after: Vec<(i64, String)> = store
+            .conn
+            .prepare("SELECT rowid, record_id FROM ctx_history_search ORDER BY rowid")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(maps_before, maps_after);
+        assert_eq!(fts_before, fts_after);
+        assert_map_fts_identity(&store);
+        assert_eq!(
+            store.search_records("pagination", 10).unwrap()[0].id,
+            record_id
+        );
     }
 
     #[test]
@@ -13885,6 +14529,15 @@ mod catalog_tests {
             .unwrap()
     }
 
+    fn index_exists(conn: &Connection, index: &str) -> bool {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1)",
+            params![index],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
     fn fixed_time() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-06-23T12:00:00Z")
             .unwrap()
@@ -13906,6 +14559,195 @@ mod catalog_tests {
             sync_version: 0,
             deleted_at: None,
             metadata: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn schema_v1001_adds_pagination_indexes_and_read_only_rejects_v15() {
+        let temp = tempdir();
+        let path = temp.path().join("work.sqlite");
+        let store = Store::open(&path).unwrap();
+        let user_version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(user_version, 1001);
+        let event_plan = store
+            .conn
+            .prepare("EXPLAIN QUERY PLAN SELECT id FROM events WHERE session_id = ?1 AND (seq, id) > (?2, ?3) ORDER BY seq, id LIMIT ?4")
+            .unwrap()
+            .query_map(params![Uuid::nil().to_string(), 0_i64, "", 10_i64], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            event_plan.contains("idx_events_session_seq_id"),
+            "{event_plan}"
+        );
+        assert!(
+            event_plan.contains("(seq,id)>(?,?)"),
+            "keyset plan did not use the composite range: {event_plan}"
+        );
+        assert!(
+            !event_plan.to_ascii_lowercase().contains("scan events"),
+            "{event_plan}"
+        );
+        let provider_plan = store
+            .conn
+            .prepare("EXPLAIN QUERY PLAN SELECT id FROM sessions WHERE provider = ?1 AND external_session_id = ?2 ORDER BY started_at_ms DESC, id LIMIT ?3")
+            .unwrap()
+            .query_map(params![CaptureProvider::Codex.as_str(), "abc", 2_i64], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            provider_plan.contains("idx_sessions_provider_external_session_started"),
+            "{provider_plan}"
+        );
+        drop(store);
+
+        let legacy = temp.path().join("legacy.sqlite");
+        let conn = Connection::open(&legacy).unwrap();
+        conn.execute_batch(CREATE_TABLES_SQL).unwrap();
+        // CREATE_TABLES_SQL describes the base-table schema without the fork
+        // additions. Drop the fork indexes defensively so this test proves
+        // the v1001 migration creates both of them rather than merely
+        // observing fresh-schema DDL.
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_events_session_seq_id;
+             DROP INDEX IF EXISTS idx_sessions_provider_external_session_started;
+             PRAGMA user_version = 15;",
+        )
+        .unwrap();
+        drop(conn);
+        let err = match Store::open_read_only(&legacy) {
+            Ok(_) => panic!("legacy schema unexpectedly opened read-only"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, StoreError::UnsupportedSchemaVersion(15)));
+        let migrated = Store::open(&legacy).unwrap();
+        let migrated_version: i64 = migrated
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(migrated_version, 1001);
+        for index in [
+            "idx_events_session_seq_id",
+            "idx_sessions_provider_external_session_started",
+        ] {
+            assert!(
+                index_exists(&migrated.conn, index),
+                "migration did not create {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn writable_open_rejects_in_between_fork_schema_versions_without_mutation() {
+        for version in [16_i64, 999, 1002] {
+            let temp = tempdir();
+            let db = temp.path().join(format!("v{version}.sqlite"));
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(CREATE_TABLES_SQL).unwrap();
+            conn.execute_batch(&format!(
+                "PRAGMA journal_mode = DELETE; PRAGMA user_version = {version};"
+            ))
+            .unwrap();
+            drop(conn);
+            let modified_before = fs::metadata(&db).unwrap().modified().unwrap();
+            #[cfg(unix)]
+            let mode_before = {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::metadata(&db).unwrap().permissions().mode()
+            };
+
+            let err = match Store::open(&db) {
+                Ok(_) => panic!("unsupported schema v{version} unexpectedly opened"),
+                Err(err) => err,
+            };
+            assert!(matches!(err, StoreError::UnsupportedSchemaVersion(v) if v == version));
+            assert!(!temp.path().join(OBJECTS_DIR).exists());
+            assert!(!temp.path().join(SPOOL_DIR).exists());
+            assert_eq!(
+                fs::metadata(&db).unwrap().modified().unwrap(),
+                modified_before
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(fs::metadata(&db).unwrap().permissions().mode(), mode_before);
+            }
+
+            let conn = Connection::open(&db).unwrap();
+            let unchanged_version: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(unchanged_version, version);
+            let journal_mode: String = conn
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(journal_mode, "delete");
+            assert!(!index_exists(
+                &conn,
+                "idx_sessions_provider_external_session_started"
+            ));
+            assert!(!index_exists(&conn, "idx_events_session_seq_id"));
+        }
+    }
+
+    #[test]
+    fn v1001_migration_rolls_back_index_and_version_on_failure() {
+        let temp = tempdir();
+        let db = temp.path().join("rollback.sqlite");
+        // Start from a real v1000-shaped store (maps present, pagination
+        // indexes absent) with a table squatting on an index name so the
+        // v1001 step fails after the v1000 step has already been committed.
+        drop(Store::open(&db).unwrap());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            r#"
+            BEGIN IMMEDIATE;
+            DROP INDEX IF EXISTS idx_sessions_provider_external_session_started;
+            DROP INDEX IF EXISTS idx_events_session_seq_id;
+            CREATE TABLE idx_events_session_seq_id(id TEXT PRIMARY KEY);
+            PRAGMA user_version = 1000;
+            COMMIT;
+            "#,
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(Store::open(&db).is_err());
+
+        let conn = Connection::open(&db).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 1000);
+        assert!(!index_exists(
+            &conn,
+            "idx_sessions_provider_external_session_started"
+        ));
+        let blocking_table_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'idx_events_session_seq_id')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(blocking_table_exists);
+        // The v1000 rowid maps survive the failed v1001 step untouched.
+        for map_table in ["record_search_rowids", "event_search_rowids"] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                    params![map_table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "{map_table} missing after failed v1001 step");
         }
     }
 
@@ -13953,6 +14795,37 @@ mod catalog_tests {
             timestamps: timestamps(),
             sync: sync_metadata(),
         }
+    }
+
+    /// `usize` limits saturate to `i64::MAX` instead of `as`-wrapping:
+    /// `usize::MAX as i64` is -1, which SQLite's `LIMIT` treats as
+    /// unlimited. The result set must stay bounded by the available rows
+    /// and small limits must keep their exact semantics.
+    #[test]
+    fn sessions_by_external_session_limit_saturates_instead_of_wrapping() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        for _ in 0..3 {
+            store
+                .upsert_session(&imported_session("shared-external-id"))
+                .unwrap();
+        }
+        store
+            .upsert_session(&imported_session("other-external-id"))
+            .unwrap();
+
+        let all = store
+            .sessions_by_external_session(CaptureProvider::Codex, "shared-external-id", usize::MAX)
+            .unwrap();
+        assert_eq!(all.len(), 3, "usize::MAX must mean 'all rows', bounded");
+        let page = store
+            .sessions_by_external_session(CaptureProvider::Codex, "shared-external-id", 2)
+            .unwrap();
+        assert_eq!(page.len(), 2);
+        let none = store
+            .sessions_by_external_session(CaptureProvider::Codex, "shared-external-id", 0)
+            .unwrap();
+        assert!(none.is_empty(), "limit 0 must not become unlimited");
     }
 
     fn imported_event(id: Uuid, seq: u64) -> Event {
@@ -15238,6 +16111,189 @@ mod catalog_tests {
             )
             .unwrap();
         assert_eq!(store.latest_indexed_source_at_ms().unwrap(), Some(7000));
+    }
+
+    fn pagination_event(
+        session_id: Uuid,
+        seq: u64,
+        event_type: EventType,
+        role: Option<EventRole>,
+    ) -> Event {
+        Event {
+            id: Uuid::from_u128(20_000 + seq as u128),
+            seq,
+            history_record_id: None,
+            session_id: Some(session_id),
+            run_id: None,
+            event_type,
+            role,
+            occurred_at: fixed_time(),
+            capture_source_id: None,
+            payload: serde_json::json!({"text": format!("event-{seq}")}),
+            payload_blob_id: None,
+            dedupe_key: None,
+            redaction_state: RedactionState::LocalPreview,
+            sync: sync_metadata(),
+        }
+    }
+
+    #[test]
+    fn selected_event_modes_share_count_and_bounded_keyset_predicates() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let session = imported_session("selected-mode-session");
+        store.upsert_session(&session).unwrap();
+        let rows = [
+            (EventType::Message, Some(EventRole::System)),
+            (EventType::Message, Some(EventRole::User)),
+            (EventType::Message, Some(EventRole::Assistant)),
+            (EventType::ToolCall, Some(EventRole::Tool)),
+            (EventType::Message, Some(EventRole::Assistant)),
+            (EventType::Message, Some(EventRole::User)),
+            (EventType::Message, Some(EventRole::Assistant)),
+            (EventType::ToolOutput, Some(EventRole::Tool)),
+        ];
+        for (seq, (event_type, role)) in rows.into_iter().enumerate() {
+            store
+                .upsert_event(&pagination_event(session.id, seq as u64, event_type, role))
+                .unwrap();
+        }
+        for (mode, expected) in [
+            (SelectedEventMode::Log, vec![0, 1, 2, 3, 4, 5, 6, 7]),
+            (SelectedEventMode::Full, vec![0, 1, 2, 4, 5, 6]),
+            (SelectedEventMode::Lite, vec![1, 4, 5, 6]),
+        ] {
+            assert_eq!(
+                store
+                    .selected_event_count_for_session(session.id, mode)
+                    .unwrap(),
+                expected.len()
+            );
+            assert!(store
+                .selected_events_for_session_after(session.id, mode, None, 0)
+                .unwrap()
+                .is_empty());
+            let first = store
+                .selected_events_for_session_after(session.id, mode, None, 2)
+                .unwrap();
+            let second = store
+                .selected_events_for_session_after(
+                    session.id,
+                    mode,
+                    first.last().map(|event| (event.seq, event.id)),
+                    usize::MAX,
+                )
+                .unwrap();
+            let actual = first
+                .iter()
+                .chain(&second)
+                .map(|event| event.seq)
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+            for (position, seq) in expected.iter().enumerate() {
+                let id = Uuid::from_u128(20_000 + *seq as u128);
+                assert_eq!(
+                    store
+                        .selected_event_cursor_position(session.id, mode, (*seq, id))
+                        .unwrap(),
+                    Some(position)
+                );
+            }
+        }
+        assert_eq!(
+            store
+                .selected_event_cursor_position(
+                    session.id,
+                    SelectedEventMode::Lite,
+                    (2, Uuid::from_u128(20_002)),
+                )
+                .unwrap(),
+            None
+        );
+
+        let lite_plan = store
+            .conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN SELECT e.id FROM events AS e WHERE e.session_id = ?1 AND ({}) AND (e.seq, e.id) > (?2, ?3) ORDER BY e.seq, e.id LIMIT ?4",
+                selected_event_predicate(SelectedEventMode::Lite)
+            ))
+            .unwrap()
+            .query_map(params![session.id.to_string(), -1_i64, "", 10_i64], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            lite_plan.contains("idx_events_session_seq_id"),
+            "{lite_plan}"
+        );
+    }
+
+    #[test]
+    fn bounded_event_reads_cap_huge_limits_and_keep_sessionless_center() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let session = imported_session("long-session");
+        store.upsert_session(&session).unwrap();
+        let transaction = store.conn.unchecked_transaction().unwrap();
+        {
+            let mut statement = transaction
+                .prepare(
+                    "INSERT INTO events (id, seq, session_id, event_type, role, occurred_at_ms, payload_json) VALUES (?1, ?2, ?3, 'message', 'user', 0, '{}')",
+                )
+                .unwrap();
+            for seq in 0..=MAX_BOUNDED_EVENT_READ {
+                statement
+                    .execute(params![
+                        Uuid::from_u128(1_000_000 + seq as u128).to_string(),
+                        i64::try_from(seq).unwrap(),
+                        session.id.to_string()
+                    ])
+                    .unwrap();
+            }
+        }
+        transaction.commit().unwrap();
+        let bounded = store
+            .selected_events_for_session_after(session.id, SelectedEventMode::Log, None, usize::MAX)
+            .unwrap();
+        assert_eq!(bounded.len(), MAX_BOUNDED_EVENT_READ);
+
+        let mut sessionless = pagination_event(Uuid::nil(), 20_000, EventType::Notice, None);
+        sessionless.id = Uuid::from_u128(8_888_888);
+        sessionless.session_id = None;
+        store.upsert_event(&sessionless).unwrap();
+        assert_eq!(
+            store
+                .event_window_bounded(sessionless.id, usize::MAX, usize::MAX)
+                .unwrap(),
+            vec![sessionless]
+        );
+    }
+
+    #[test]
+    fn snapshot_fingerprint_is_stable_sha256_and_tracks_wal_changes() {
+        let temp = tempdir();
+        let path = temp.path().join("work.sqlite");
+        let store = Store::open(&path).unwrap();
+        let first = store.snapshot_fingerprint().unwrap();
+        let same = store.snapshot_fingerprint().unwrap();
+        assert_eq!(first, same);
+        assert_eq!(first.len(), 64);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+        let session = imported_session("fingerprint-session");
+        store.upsert_session(&session).unwrap();
+        let changed = store.snapshot_fingerprint().unwrap();
+        assert_ne!(first, changed);
+        store.checkpoint_wal_passive().unwrap();
+        let checkpointed = store.snapshot_fingerprint().unwrap();
+        assert_eq!(checkpointed.len(), 64);
+        assert_ne!(
+            changed, checkpointed,
+            "a physical checkpoint transition must conservatively stale tokens"
+        );
     }
 
     #[test]

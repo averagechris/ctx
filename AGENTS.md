@@ -45,17 +45,13 @@ This is a hard fork of [ctxrs/ctx](https://github.com/ctxrs/ctx) maintained at
   legacy full-scan delete; refresh/rebuild clears and repopulates maps in
   lockstep with the projections.
 - **Schema versioning:** upstream chain is v1–v15; this fork diverged at
-  v1000 (durable FTS rowid map tables, no rebuild or backfill at migration).
-  **v1000 is taken by the landed rowid-map migration and is authoritative;**
-  two v1000 schemas cannot coexist. Binaries whose migration chain ends at
-  v15 refuse to newly open a maps-v1000 store both read-only and read-write.
-  The unpublished, pre-rebase local #195 binary is different: it also stamps
-  v1000, so it is not technically rejected and would silently assume its
-  different schema. It must never be built or run against a store migrated by
-  this change, and #195 must be rebased onto this authoritative v1000 as v1001
-  before its next build, run, or ship. Future fork migrations continue from
-  1001. The v15 open-time gate is load-bearing for the map invariants; do not
-  weaken it (it cannot evict pre-upgrade processes that already hold a
+  v1000 (durable FTS rowid map tables, no rebuild or backfill at migration)
+  and continued with v1001 (bounded-pagination covering indexes, reconciled
+  from #195; no map or FTS rebuild). Writable opens migrate ≤v15 and v1000
+  stores; versions 16–999 and >1001 fail closed without mutation, and
+  read-only opens require exactly v1001. Future fork migrations continue
+  from 1002. The open-time gate is load-bearing for the map invariants; do
+  not weaken it (it cannot evict pre-upgrade processes that already hold a
   connection; restart long-lived ctx processes such as `ctx mcp` after
   upgrading). New provider strings require a
   CHECK-constraint rebuild migration — prefer the external history-source

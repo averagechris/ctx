@@ -202,6 +202,8 @@ Writes nothing and returns:
 - `event` for event output;
 - `source`;
 - `events[]`.
+- `pagination`, for session output: `{ has_more, cursor? }`;
+- `total_events`, `omitted_events`, and `fields`, for session output.
 
 `session` includes the ctx-owned `item_id`, `provider`, and
 `provider_session_id` when known. `event` and `events[]` rows include
@@ -215,6 +217,55 @@ local searchable preview: the text may be truncated or projected from provider
 payloads, but it can still include absolute paths, token-shaped strings, command
 output, and other private transcript content. Treat `safe_preview` output as
 private unless a user separately reviews and redacts it.
+
+`ctx show session` is the #195 paged-query slice of #187 (status, sources,
+locate, and raw SQL are not yet query-owned). It returns additive query-owned v1
+typed projections with `fields: "full"|"compact"`. Compact session output
+contains only ctx session ID, provider, agent type, status, primary flag, and
+start/end times; compact events contain only ctx event ID, sequence, event type,
+role, time, text, and text truncation. Compact structurally excludes provider
+session IDs, source IDs/metadata/path/existence, cwd, provider/source cursors,
+citations, raw payload, and suggested commands. Full is still private local
+history, not share-safe. Raw/withheld event payloads project as the literal text
+`raw event payload withheld`.
+
+Session pagination selects the transcript mode before applying the page limit:
+`log` selects all events; `full` selects user/assistant/system message events;
+`lite` selects user messages plus the final assistant message before the next
+user message or end of session. JSON reports the exact `selected_total`,
+`pagination.{has_more,continuation,offset,page_size,returned_items}`, compatible
+`pagination.cursor` and top-level `next`, exact `omitted.{before,after,exact}`
+and compatible `omitted_events`. Store reads are bounded keyset reads over
+`(seq,id)`.
+
+Limits default to `--limit 200`, `--max-event-bytes 4096`, and
+`--max-page-bytes 262144`; caps are `--limit 1000`, per-item bytes 1048576, and
+page bytes 16777216. The byte cap is UTF-8 safe: code points are not split and a
+three-byte ellipsis is appended only when it fits. `bytes.item_json_bytes` is the
+exact sum of the final compact JSON encoding of admitted public item objects,
+including full-mode compatibility aliases. The same item object is used in CLI
+JSON, MCP `structuredContent`, and nested under each JSONL item record. Fixed metadata
+(`session`, pagination, omitted counts, next commands, etc.) is outside that
+budget, as are JSONL framing fields and newlines. Records are admitted whole, so no partial JSON item is emitted; if the
+next item would exceed the page budget, `page_budget_exhausted: true` and the
+page stops after the last admitted item. If even the first item cannot fit, the
+query fails with `item_exceeds_page_budget` rather than returning a
+non-advancing continuation; this includes a zero page budget on a non-empty
+result set.
+
+CLI text/markdown ends with a page summary: returned range, omitted before and
+after, exactness, selected total, and either a copyable continuation command or
+`no more events`. JSON uses explicit `next`, `next_command`, and `next_argv`, all
+`null` on the final page. Canonical continuation argv preserves the mode, fields,
+limit, byte caps, format, and continuation.
+
+Session JSONL emits one independent `record_type: "event"` record per line, with
+compatible item type, mode, session/provider identity, and final event item, and
+exactly one terminal `record_type: "completion"` line. Invalid continuation or
+post-format request/lookup/store errors in JSONL mode emit one structured terminal `record_type: "error"`
+line and exit nonzero. A real broken stdout pipe exits successfully without
+diagnostic noise for paged stdout streaming only. Clap failures before output
+format parsing retain Clap's stderr and exit-code behavior.
 
 ## Locate
 
@@ -244,15 +295,16 @@ metadata when available.
 ctx show session <ctx-session-id> --mode full --format json --out transcript.json
 ```
 
-With `--out`, writes the requested transcript artifact to that path and prints
+With `--out`, writes the requested transcript page to that path and prints
 nothing on success. Without `--out`, stdout is the requested transcript
-artifact. JSON and JSONL artifact rows use the same ctx-owned ID fields as
+page. Continuation argv does not retain `--out`. JSON and JSONL rows use the same ctx-owned ID fields as
 `show`.
 
 ## Search
 
 ```bash
 ctx search <query>|--term <term>|--file <path> --json
+ctx search <query> --format jsonl --refresh off
 ```
 
 Returns:
@@ -272,6 +324,7 @@ Each result can include:
 
 - `ctx_event_id` for event hits;
 - `ctx_session_id` when known;
+- compatible `event_id` and `session_id` aliases;
 - `provider_session_id`;
 - `event_seq`;
 - `title`;
@@ -289,6 +342,7 @@ Each result can include:
 - `cursor`;
 - `why_matched`;
 - `citations[]`;
+- `links`;
 - `suggested_next_commands[]`;
 - `visibility`.
 
@@ -302,6 +356,79 @@ which indexed item produced the match.
 
 Search JSON is local/private by default and is not share-safe or redacted for
 external publication.
+
+Search pagination is additive in v1. `pagination.cursor` is an opaque
+continuation token and is `null` when `has_more` is false. CLI continuation use
+requires `--refresh off` so the query executes against a stable read-only
+snapshot. Search pages are stable replay/slices of a fixed candidate pool: every
+page reruns the same request with the internal candidate limit fixed at 200, then
+slices by offset. The source scan itself can truncate earlier; `pool_total` is
+the exact returned candidate pool size, while `source_truncation.omitted_results`
+is only exact when `omitted_results_exact: true` and otherwise is a lower bound.
+
+Tokens bind the full request shape: query string, ordered/repeated `--term`
+vector, query revision, DTO and search-packet schemas, query plan/match mode,
+every packet option (including snippet length), every filter, result
+mode, page size, field set, and byte policy, plus a conservative local database
+fingerprint. They do not contain private content: no query text, snippets,
+paths, citations, provider IDs, or provider metadata. Malformed, wrong-kind,
+request-mismatched, out-of-range, or stale tokens fail closed; search
+continuations also reject embedded show keyset fields. CLI canonical `next_argv`
+preserves options and always forces `--refresh off` for the next page. JSON uses
+explicit `next`, `next_command`, and `next_argv`, all `null` on the final page.
+
+Search uses the same `--fields`, `--max-snippet-bytes`/aliases
+`--snippet-bytes`/`--item-bytes`, `--max-page-bytes`/alias `--page-bytes`, UTF-8
+ellipsis accounting, whole-record admission, and exact final item JSON byte
+budget as show. Defaults are `--limit 20`, snippets 4096 bytes, page 262144
+bytes; caps are `--limit 200`, per-item 1048576 bytes, page 16777216 bytes.
+`--format jsonl` emits one independent `record_type: "result"` per line and
+exactly one terminal `record_type: "completion"` with returned count, range,
+omitted counts, `pool_total`, source truncation, byte summary, `next`, and
+copyable `next_argv` when another page exists. JSONL invalid continuation or
+post-format request errors emit a single `record_type: "error"` line and exit
+nonzero; broken paged-stdout pipes are silent success. Explicit `--out` I/O
+errors are propagated.
+
+Search compact projections omit provider-session IDs, history source/provider
+key/source ID/source format, source path/existence/cursor, cwd, citations, and
+suggested commands. Full remains private and may include local paths, source
+metadata, snippets, and citations. The query-owned full projection includes
+compatibility aliases and `suggested_next_commands[]`; compact does not.
+
+This pagination/query service is the paged slice of the broader #187 extraction.
+Status, sources, locate, and raw SQL remain CLI/MCP-specific for now.
+
+Continuation snapshot fingerprints are conservative SHA-256 digests over physical
+SQLite state: selected PRAGMAs plus stable samples of the main DB, WAL, and SHM
+files, checked before and after page construction. They intentionally exclude
+path, query, and provider metadata. Because WAL/checkpoint timing affects the
+physical files, a logically equivalent checkpointed store can make an old token
+stale. Show tokens necessarily carry an opaque event ordering key (`seq` and ctx
+event ID) inside the hex token so keyset paging can resume; this is not path,
+query, or provider metadata.
+
+Writable opens migrate known v0-v15 stores through the fork chain — v1000
+(durable FTS rowid maps) then v1001 (pagination indexes) — and existing v1000
+stores to v1001; reserved versions 16-999 and versions above 1001 fail closed
+without mutation. Index creation and `user_version = 1001` are one
+transaction, and the step touches neither the rowid maps nor the FTS
+projections. The v1001 migration adds exactly
+`idx_sessions_provider_external_session_started` on
+`sessions(provider, external_session_id, started_at_ms DESC, id)` and
+`idx_events_session_seq_id` on `events(session_id, seq, id)`. Read-only
+search/show/locate/MCP opens require exactly v1001 and never migrate or write.
+
+The migration was measured on 2026-07-11 with a temporary synthetic v15 SQLite
+database containing 100,000 events (100 sessions × 1,000 events) and 1,000
+session resolver rows. Over 500 warm runs on macOS, median event-page lookup fell
+from 97.3 µs to 32.4 µs and median provider-session resolution from 22.8 µs to
+14.0 µs. The v15 plans used the single-column indexes plus `USE TEMP B-TREE FOR
+ORDER BY`; the pagination indexes give covering `idx_events_session_seq_id`
+with the `(seq,id)`
+range and covering `idx_sessions_provider_external_session_started`, with no
+temporary sort. These are synthetic local measurements, not production latency
+guarantees.
 
 `freshness` describes the pre-search refresh attempt:
 

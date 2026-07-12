@@ -166,6 +166,8 @@ cursor resume is not a universal contract yet.
 ctx show session <ctx-session-id>
 ctx show session <ctx-session-id> --mode full --format text
 ctx show session <ctx-session-id> --mode log --format jsonl
+ctx show session <ctx-session-id> --limit 50 --continue <token>
+ctx show session <ctx-session-id> --fields compact --max-event-bytes 4096 --max-page-bytes 262144 --format json
 ctx show session <ctx-session-id> --format markdown --out transcript.md
 ctx show session <ctx-session-id> --mode full --format markdown --out transcript.md
 ctx show event <ctx-event-id> --window 3 --format text
@@ -180,7 +182,30 @@ assistant messages. `--mode full` keeps all user/assistant/system message
 events, and `--mode log` renders all imported events including tool and command
 activity. `--format` accepts `text`, `markdown`, `json`, or `jsonl`. Without
 `--out`, `show session` writes to stdout. With `--out`, it writes the rendered
-transcript artifact to that path and prints nothing on success.
+transcript page to that path and prints nothing on success; continuation argv
+does not reuse the path.
+
+Session output is paged. `--limit` defaults to 200 and is capped at 1000;
+selection by mode happens before that limit. Continue with the opaque token from
+`next`/`pagination.continuation` using `--continue`. Text and markdown end with
+a page summary and either a continuation command or `no more events`; JSON uses
+explicit `next_command`/`next_argv` and sets them to null on the final page.
+`--fields full|compact` defaults to full. Compact omits provider-session IDs,
+source/path/cursor metadata, cwd, citations, raw payloads, and suggested
+commands. `--max-event-bytes` (aliases `--event-bytes`, `--item-bytes`) defaults
+to 4096 and caps text at 1048576 bytes per event; `--max-page-bytes` (alias
+`--page-bytes`) defaults to 262144 and caps the exact sum of admitted event
+projection JSON bytes at 16777216. UTF-8 is never split; ellipsis is counted only
+when its three bytes fit. If the first selected item cannot fit the page budget,
+the command errors instead of returning a continuation that cannot advance.
+JSONL emits independent event records plus exactly one completion record;
+malformed, wrong-kind, mismatched, and stale continuation errors emit one error
+record and exit nonzero.
+
+JSONL error records cover failures after ctx has parsed JSONL output intent,
+including store, ID lookup, filter, and continuation failures. Clap validation
+before format parsing retains normal Clap stderr and exit code 2. Broken-pipe
+success applies only to paged stdout; explicit `--out` I/O errors are returned.
 
 `show event` renders one ctx-owned event hit. `--before` and `--after` include
 neighboring events in the same session; `--window N` is shorthand for
@@ -200,6 +225,10 @@ names from the current store schema, so treat it as private local data.
 
 ## Search
 
+Repeated `--term` input is bounded before normalization or deduplication: at
+most 32 repeated clauses, 4096 UTF-8 bytes per query clause, and 65536 aggregate
+query bytes.
+
 ```bash
 ctx search "build failure"
 ctx search "sqlite storage" --provider codex
@@ -211,6 +240,8 @@ ctx search "signed metadata" --term checksum --term release
 ctx search "signed metadata" --match phrase
 ctx search "signed metadata" --match any
 ctx search "token budget" --limit 5
+ctx search "token budget" --limit 5 --fields compact --max-snippet-bytes 4096 --max-page-bytes 262144 --format jsonl --refresh off
+ctx search "token budget" --continue <token> --refresh off
 ctx search "token budget" --session <ctx-session-id>
 ctx search "review findings" --include-subagents
 ctx search "this current task" --include-current-session
@@ -274,6 +305,29 @@ title, snippet, rank, result scope, match reasons, source-path/cursor data,
 citations, `suggested_next_commands`, JSON `query_plan`, `broadened_search`
 (no-result diagnostic), `freshness`, and pagination/truncation fields in JSON. Default text output is compact and
 optimized for agent reading; use `--verbose` for expanded text diagnostics.
+
+Search pagination is the #195 paged slice of the broader #187 query extraction;
+status, sources, locate, and raw SQL are still command-specific. `--limit`
+defaults to 20 and caps at 200. Each page replays the same fixed candidate pool
+with an internal maximum of 200 results and slices it stably; source scanning may
+truncate before that, so JSON distinguishes exact `pool_total` from
+`source_truncation` lower-bound omissions. `--continue` requires `--refresh off`.
+Tokens are opaque, private-content-free, and bind query/terms (including repeated
+terms), match mode, filters, result mode, page size, fields, byte caps, query
+revision/schema, and a conservative SQLite snapshot. Malformed, wrong-kind,
+mismatched, or stale tokens fail closed. Canonical `next_argv` preserves options
+and forces `--refresh off`.
+
+`--fields compact` structurally excludes provider-session IDs, history source
+IDs/metadata, source path/existence/cursor, cwd, citations, raw payload, and
+suggested commands. Full output remains private and not share-safe.
+`--max-snippet-bytes` (aliases `--snippet-bytes`, `--item-bytes`) defaults to
+4096 with a 1048576 cap; `--max-page-bytes` (alias `--page-bytes`) defaults to
+262144 with a 16777216 cap. The page byte budget is the exact sum of admitted
+result item projection JSON bytes, not whole-output bytes. JSONL emits one
+independent result per line and exactly one completion record; invalid
+continuation errors emit one terminal error record and exit nonzero,
+while a real broken stdout pipe is silent success.
 
 Filters:
 

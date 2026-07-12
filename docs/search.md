@@ -21,6 +21,8 @@ ctx search "signed metadata" --term checksum --term release
 ctx search "exact adjacent words" --match phrase
 ctx search "one of these words" --match any
 ctx search "token budget" --limit 5
+ctx search "token budget" --limit 5 --fields compact --format json
+ctx search "token budget" --refresh off --continue <token>
 ctx search "token budget" --session <ctx-session-id>
 ctx search "review findings" --include-subagents
 ctx search "this current task" --include-current-session
@@ -157,6 +159,38 @@ filters are also available to MCP hosts as optional `search` tool arguments
 
 `--limit` defaults to `20` and is capped at `200`.
 
+Pagination is query-owned v1 and is the #195 paged slice of the broader #187
+work; status, sources, locate, and raw SQL extraction remain outstanding. A
+search page is a stable replay/slice of a fixed candidate pool. For every page,
+ctx reruns the same request with the candidate pool limit fixed at 200, then
+slices by the continuation offset. `pool_total` is exact for that returned pool.
+Provider/source scanning can truncate before all possible results are considered;
+`source_truncation.omitted_results` is exact only when
+`omitted_results_exact: true`, otherwise it is a lower bound.
+
+Continuation tokens are opaque hex strings. They bind the full request: query,
+ordered and repeated `--term` clauses, match mode, all filters, session/event
+result mode, page size, field set, byte policy, query revision, DTO schema, and a
+conservative SHA-256 snapshot of SQLite physical state. They contain no query
+text, snippets, paths, citations, provider-session IDs, or provider metadata.
+Malformed, wrong-kind, request-mismatched, out-of-range, or stale tokens fail
+closed. CLI continuation requires `--refresh off`; generated `next_argv`
+preserves options and forces `--refresh off`.
+
+`--fields full|compact` defaults to full. Compact results include only ctx IDs,
+title/snippet, rank/scope, match reasons, timestamps, and visibility; they
+structurally exclude provider-session IDs, history-source/source IDs and
+metadata, source path/existence/cursor, cwd, citations, raw payload, and
+suggested commands. Full results can include those fields and remain private
+local history, not share-safe.
+
+`--max-snippet-bytes` (aliases `--snippet-bytes`, `--item-bytes`) defaults to
+4096 and caps at 1048576. `--max-page-bytes` (alias `--page-bytes`) defaults to
+262144 and caps at 16777216. Truncation is UTF-8 safe; code points are not split
+and an ellipsis is appended only when its three bytes fit. The page byte budget
+is the exact sum of admitted result item projection JSON bytes only, not the
+entire response. Items are admitted whole, so ctx never emits partial JSON.
+
 Default search returns diverse session-level results. Use
 `--session <ctx-session-id>` after a default search has identified a session to
 inspect; scoped session search returns dense event hits. Use `--events` without
@@ -202,6 +236,16 @@ file was not available at the stored path when the result was built.
 Search output is local/private by default and is not redacted for sharing.
 Review and redact copied snippets, JSON, or transcripts before sending them
 outside the machine.
+
+JSON exposes explicit `next`, `next_command`, and `next_argv`, all null on the
+final page. Text/markdown end with a page summary and final/continuation state.
+NDJSON (`--format jsonl`) writes one independent `record_type: "result"` per
+line and exactly one terminal `record_type: "completion"` line; malformed,
+wrong-kind, mismatched, stale, lookup, store, and other post-format request errors write one
+terminal `record_type: "error"` and exit
+nonzero. Clap errors before format parsing use normal Clap stderr. Broken paged
+stdout pipes exit successfully without noise; explicit output and unrelated I/O
+errors are propagated.
 
 
 Relevance note: final ranking is not raw text-match order. `--match any`

@@ -1645,6 +1645,10 @@ pub struct ContextTruncation {
     pub truncated: bool,
     #[serde(default)]
     pub omitted_results: u32,
+    /// True when `omitted_results` is a sentinel/lower bound rather than an
+    /// exact count. Consumers must not infer exactness from `reason`.
+    #[serde(default)]
+    pub omitted_results_is_lower_bound: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }

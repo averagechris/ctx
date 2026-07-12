@@ -4,6 +4,22 @@
 
 ### Added
 
+- Bounded pagination across `ctx search`, `ctx show session`, and the MCP
+  `search`/`show_session` tools (#195): opaque `--continue` continuation
+  tokens with conservative physical-snapshot staleness detection, `--fields
+  full|compact` projections, per-item and per-page byte budgets
+  (`--max-snippet-bytes`/`--max-event-bytes` and `--max-page-bytes`), JSONL/
+  NDJSON output via `--format jsonl`, and suggested `next` commands/arguments
+  on every truncated page. Store reads for transcripts and event windows are
+  now hard-bounded keyset pages (never unbounded scans), backed by the new
+  fork schema v1001 covering indexes
+  `idx_sessions_provider_external_session_started` and
+  `idx_events_session_seq_id`. The #195 migration was renumbered from its
+  pre-rebase v1000 to v1001 on top of the authoritative v1000 rowid-map
+  migration: v1000 stores upgrade in place without touching maps or FTS
+  projections, fresh databases receive both fork migrations, read-only opens
+  require exactly v1001, and versions 16–999 or >1001 are rejected without
+  mutation.
 - `ctx search` gains role-aware and tool-noise relevance controls: repeatable
   `--role` / `--exclude-role` filters (`user`, `assistant`, `tool`),
   `--exclude-tool-noise` to drop tool/command events, and a repeatable

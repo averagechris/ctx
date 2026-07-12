@@ -232,6 +232,30 @@ pub struct RawSqlResult {
     pub limits: RawSqlLimits,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqliteProfileMetadata {
+    pub version: String,
+    pub journal_mode: String,
+    pub synchronous: i64,
+    pub page_size: i64,
+    pub foreign_keys: i64,
+    pub user_version: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProfileTableCounts {
+    pub records: u64,
+    pub capture_sources: u64,
+    pub sessions: u64,
+    pub runs: u64,
+    pub events: u64,
+    pub summaries: u64,
+    pub files_touched: u64,
+    pub record_fts: u64,
+    pub event_fts: u64,
+    pub artifact_fts: u64,
+}
+
 impl RawSqlValue {
     fn is_truncated(&self) -> bool {
         match self {
@@ -1300,6 +1324,44 @@ impl Store {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn sqlite_profile_metadata(&self) -> Result<SqliteProfileMetadata> {
+        Ok(SqliteProfileMetadata {
+            version: self
+                .conn
+                .query_row("SELECT sqlite_version()", [], |row| row.get(0))?,
+            journal_mode: self
+                .conn
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))?,
+            synchronous: self
+                .conn
+                .query_row("PRAGMA synchronous", [], |row| row.get(0))?,
+            page_size: self
+                .conn
+                .query_row("PRAGMA page_size", [], |row| row.get(0))?,
+            foreign_keys: self
+                .conn
+                .query_row("PRAGMA foreign_keys", [], |row| row.get(0))?,
+            user_version: self
+                .conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))?,
+        })
+    }
+
+    pub fn profile_table_counts(&self) -> Result<ProfileTableCounts> {
+        Ok(ProfileTableCounts {
+            records: fixed_count(&self.conn, "SELECT COUNT(*) FROM history_records")?,
+            capture_sources: fixed_count(&self.conn, "SELECT COUNT(*) FROM capture_sources")?,
+            sessions: fixed_count(&self.conn, "SELECT COUNT(*) FROM sessions")?,
+            runs: fixed_count(&self.conn, "SELECT COUNT(*) FROM runs")?,
+            events: fixed_count(&self.conn, "SELECT COUNT(*) FROM events")?,
+            summaries: fixed_count(&self.conn, "SELECT COUNT(*) FROM summaries")?,
+            files_touched: fixed_count(&self.conn, "SELECT COUNT(*) FROM files_touched")?,
+            record_fts: fixed_count(&self.conn, "SELECT COUNT(*) FROM ctx_history_search")?,
+            event_fts: fixed_count(&self.conn, "SELECT COUNT(*) FROM event_search")?,
+            artifact_fts: fixed_count(&self.conn, "SELECT COUNT(*) FROM artifact_search")?,
+        })
     }
 
     pub fn raw_sql_query(&self, sql: &str, options: RawSqlOptions) -> Result<RawSqlResult> {
@@ -4844,6 +4906,13 @@ fn table_row_count(conn: &Connection, table: &str) -> Result<i64> {
     Ok(conn.query_row(&sql, [], |row| row.get(0))?)
 }
 
+fn fixed_count(conn: &Connection, sql: &'static str) -> Result<u64> {
+    let count: i64 = conn.query_row(sql, [], |row| row.get(0))?;
+    u64::try_from(count).map_err(|_| StoreError::NumericOutOfRange {
+        field: "profile count",
+    })
+}
+
 fn linked_artifact_preview_count(conn: &Connection) -> Result<i64> {
     let _ = conn;
     Ok(0)
@@ -8220,6 +8289,44 @@ mod search_order_tests {
         DateTime::parse_from_rfc3339("2026-06-23T12:00:00Z")
             .unwrap()
             .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn sqlite_profile_metadata_reports_runtime_settings() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let metadata = store.sqlite_profile_metadata().unwrap();
+        assert!(!metadata.version.is_empty());
+        assert!(!metadata.journal_mode.is_empty());
+        assert!(metadata.page_size > 0);
+        assert!(metadata.user_version >= 0);
+    }
+
+    #[test]
+    fn profile_table_counts_are_exact_internal_instrumentation() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let empty = store.profile_table_counts().unwrap();
+        assert_eq!(empty.records, 0);
+        assert_eq!(empty.record_fts, 0);
+        assert_eq!(empty.events, 0);
+        assert_eq!(empty.event_fts, 0);
+
+        let record = stable_tie_record(42);
+        store.insert_record(&record).unwrap();
+        let counts = store.profile_table_counts().unwrap();
+        assert_eq!(counts.records, 1);
+        assert_eq!(counts.record_fts, 1);
+        assert_eq!(counts.events, 0);
+        assert_eq!(counts.event_fts, 0);
+
+        let raw = store
+            .raw_sql_query("SELECT COUNT(*) FROM history_records", Default::default())
+            .unwrap();
+        assert_eq!(raw.limits.timeout_ms, 10_000);
+        assert!(store
+            .raw_sql_query("DELETE FROM history_records", Default::default())
+            .is_err());
     }
 
     fn sync_metadata() -> SyncMetadata {

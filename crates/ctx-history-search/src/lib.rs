@@ -3076,12 +3076,14 @@ fn pagination(cursor_base: Option<usize>, has_more: bool) -> ContextPagination {
 mod tests {
     use super::*;
     use ctx_history_core::{
-        AgentType, ArtifactKind, CaptureProvider, CaptureSource, CaptureSourceDescriptor,
-        CaptureSourceKind, Confidence, EntityTimestamps, EventRole, EventType, Fidelity,
-        FileChangeKind, HistoryRecordLink, HistoryRecordLinkTargetType, HistoryRecordLinkType,
-        RedactionState, RunStatus, RunType, SessionHistoryArchive, SessionStatus, SummaryKind,
-        SyncMetadata, SyncState, VcsChangeKind, VcsHost, VcsKind, VcsWorkspace,
+        default_data_root, AgentType, ArtifactKind, CaptureProvider, CaptureSource,
+        CaptureSourceDescriptor, CaptureSourceKind, Confidence, EntityTimestamps, EventRole,
+        EventType, Fidelity, FileChangeKind, HistoryRecordLink, HistoryRecordLinkTargetType,
+        HistoryRecordLinkType, RedactionState, RunStatus, RunType, SessionHistoryArchive,
+        SessionStatus, SummaryKind, SyncMetadata, SyncState, VcsChangeKind, VcsHost, VcsKind,
+        VcsWorkspace,
     };
+    use serde::{Deserialize, Serialize};
 
     fn tempdir() -> tempfile::TempDir {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -6048,6 +6050,1373 @@ mod tests {
     }
 
     #[test]
+    fn streaming_large_profile_smoke_writes_stable_artifact() {
+        let temp = tempdir();
+        let cfg = LargeProfileConfig::smoke(temp.path().join("profile-out-a"));
+        let first = run_streaming_large_profile(&cfg).unwrap();
+        let second = run_streaming_large_profile(&LargeProfileConfig::smoke(
+            temp.path().join("profile-out-b"),
+        ))
+        .unwrap();
+        let first_typed: LargeProfileArtifactV1 = serde_json::from_value(first.clone()).unwrap();
+        let second_typed: LargeProfileArtifactV1 = serde_json::from_value(second.clone()).unwrap();
+        assert_eq!(
+            first_typed.stable_projection(),
+            second_typed.stable_projection()
+        );
+        assert_eq!(first["schema_version"], 1);
+        assert_eq!(first["profile"], "ctx-large-index-profile");
+        assert_eq!(first["config"], second["config"]);
+        assert_eq!(first["achieved"], second["achieved"]);
+        assert_eq!(first["counts"], second["counts"]);
+        assert_eq!(
+            first["reopen"]["ordered_result_ids"],
+            second["reopen"]["ordered_result_ids"]
+        );
+        assert_eq!(
+            first["reopen"]["result_digest"],
+            second["reopen"]["result_digest"]
+        );
+        assert_eq!(first["measurements"]["noop_counts_unchanged"], true);
+        assert_eq!(first["event_window"]["contains_target"], true);
+        assert!(first["checkpoint"]["post"].is_object());
+        assert!(first["rss"]["peak_bytes"].as_u64().is_some());
+        assert_eq!(first["achieved"]["baseline_events"], 21);
+        assert_eq!(first["achieved"]["incremental_events"], 3);
+        assert_eq!(first["counts"]["events"], 24);
+        assert_eq!(first["counts"]["records"], 8);
+        assert_eq!(first["counts"]["sessions"], 8);
+        assert_eq!(first["counts"]["runs"], 8);
+        assert_eq!(first["counts"]["summaries"], 8);
+        assert_eq!(first["counts"]["files_touched"], 8);
+        assert_eq!(first["counts"]["record_fts"], 8);
+        assert_eq!(first["counts"]["event_fts"], 24);
+        assert!(first["search"]["ordinary_result_count"].as_u64().unwrap() > 0);
+        assert!(first["search"]["filtered_result_count"].as_u64().unwrap() > 0);
+        assert!(first["paths"]["db"]
+            .as_str()
+            .unwrap()
+            .starts_with(temp.path().to_str().unwrap()));
+        assert!(first["generation"]["max_batch_events"].as_u64().unwrap() <= 7);
+        let parsed: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(first["paths"]["artifact"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(parsed["counts"], first["counts"]);
+    }
+
+    #[test]
+    fn streaming_large_profile_batch_size_invariant_and_partial_batch() {
+        let temp = tempdir();
+        let mut a = LargeProfileConfig::smoke(temp.path().join("a"));
+        a.total_events = 10;
+        a.events_per_record = 3;
+        a.batch_records = 1;
+        let mut b = a.clone();
+        b.output_dir = Some(temp.path().join("b"));
+        b.batch_records = 4;
+        let first = run_streaming_large_profile(&a).unwrap();
+        let second = run_streaming_large_profile(&b).unwrap();
+        assert_eq!(first["achieved"], second["achieved"]);
+        assert_eq!(
+            first["reopen"]["ordered_result_ids"],
+            second["reopen"]["ordered_result_ids"]
+        );
+        assert_eq!(first["counts"]["events"], 13);
+    }
+
+    #[test]
+    fn streaming_large_profile_rejects_malformed_artifacts() {
+        let temp = tempdir();
+        let valid =
+            run_streaming_large_profile(&LargeProfileConfig::smoke(temp.path().join("valid")))
+                .unwrap();
+        assert!(parse_artifact_v1(valid.clone()).is_ok());
+        let mut wrong_type = valid.clone();
+        wrong_type["counts"]["events"] = serde_json::json!("not-a-number");
+        assert!(parse_artifact_v1(wrong_type).is_err());
+        let mut missing = valid.clone();
+        missing["search"]
+            .as_object_mut()
+            .unwrap()
+            .remove("result_digest");
+        assert!(parse_artifact_v1(missing).is_err());
+        let mut wrong_version = valid.clone();
+        wrong_version["schema_version"] = serde_json::json!(2);
+        assert!(parse_artifact_v1(wrong_version)
+            .unwrap_err()
+            .contains("schema_version"));
+        let mut wrong_profile = valid.clone();
+        wrong_profile["profile"] = serde_json::json!("other");
+        assert!(parse_artifact_v1(wrong_profile)
+            .unwrap_err()
+            .contains("profile"));
+        let mut inconsistent = valid;
+        inconsistent["counts"]["events"] = serde_json::json!(999);
+        assert!(parse_artifact_v1(inconsistent)
+            .unwrap_err()
+            .contains("counts"));
+    }
+
+    #[test]
+    fn streaming_large_profile_scaled_projection_parity_stays_bounded() {
+        let temp = tempdir();
+        let mut cfg = LargeProfileConfig::smoke(temp.path().join("scaled-parity"));
+        cfg.total_events = 1_200;
+        cfg.events_per_record = 1;
+        cfg.batch_records = 75;
+        let out = prepare_profile_output(&cfg).unwrap();
+        let store =
+            ctx_history_store::Store::open(out.join("synthetic-large-profile.sqlite")).unwrap();
+        let mut imported = 0usize;
+        let mut records = 0usize;
+        while imported < cfg.total_events {
+            let batch = synthetic_perf_archive_batch(
+                imported,
+                cfg.total_events,
+                cfg.events_per_record,
+                cfg.batch_records,
+                cfg.seed,
+            )
+            .unwrap();
+            imported += batch.events.len();
+            records += batch.records.len();
+            write_synthetic_batch(&store, &batch).unwrap();
+        }
+        let inc_start = imported;
+        let inc = synthetic_perf_archive_batch(
+            inc_start,
+            inc_start + cfg.events_per_record,
+            cfg.events_per_record,
+            1,
+            cfg.seed,
+        )
+        .unwrap();
+        write_synthetic_batch(&store, &inc).unwrap();
+        let counts = profile_counts(&store).unwrap();
+        assert_eq!(counts.events, 1_201);
+        assert_fts_projection_parity(&store, counts, cfg.seed, records, imported, inc_start)
+            .unwrap();
+        let last_event = cfg.total_events - 1;
+        assert_sampled_event_projection(
+            &store,
+            "scaled last event rowid sample",
+            synthetic_event_rowid(last_event, imported, inc_start).unwrap(),
+            synthetic_event_id(last_event, cfg.seed).unwrap(),
+        )
+        .unwrap();
+        assert_sampled_event_projection(
+            &store,
+            "scaled incremental event rowid sample",
+            synthetic_event_rowid(inc_start, imported, inc_start).unwrap(),
+            synthetic_event_id(inc_start, cfg.seed).unwrap(),
+        )
+        .unwrap();
+        assert!(assert_sampled_event_projection(
+            &store,
+            "scaled wrong expected event id sample",
+            synthetic_event_rowid(inc_start, imported, inc_start).unwrap(),
+            synthetic_event_id(0, cfg.seed).unwrap(),
+        )
+        .unwrap_err()
+        .contains("expected 1"));
+        assert!(
+            small_test_table_ids(&store, "events", "id").unwrap().len() < counts.events as usize
+        );
+        assert!(store
+            .raw_sql_query("DELETE FROM event_search", Default::default())
+            .is_err());
+    }
+
+    #[test]
+    fn streaming_large_profile_uuid_bounds_and_rollback() {
+        assert!(validate_uuid_capacity(10, 3, 0x0000_ffff_ff00).is_ok());
+        assert!(validate_uuid_capacity(10, 3, 0x0000_ffff_ffff).is_err());
+        let temp = tempdir();
+        let cfg = LargeProfileConfig::smoke(temp.path().join("rollback"));
+        let out = prepare_profile_output(&cfg).unwrap();
+        let store =
+            ctx_history_store::Store::open(out.join("synthetic-large-profile.sqlite")).unwrap();
+        let batch = synthetic_perf_archive_batch(0, 6, 3, 2, cfg.seed).unwrap();
+        write_synthetic_batch(&store, &batch).unwrap();
+        let before = profile_counts(&store).unwrap();
+        let before_base = all_base_identities(&store).unwrap();
+        let before_record_fts =
+            small_test_fts_ids(&store, "ctx_history_search", "record_id").unwrap();
+        let before_event_fts = small_test_fts_ids(&store, "event_search", "event_id").unwrap();
+        let mutated = synthetic_perf_archive_batch(6, 9, 3, 1, cfg.seed).unwrap();
+        assert!(write_synthetic_batch_injected_failure(&store, &mutated, 2).is_err());
+        let after = profile_counts(&store).unwrap();
+        assert_eq!(before, after);
+        assert_eq!(before_base, all_base_identities(&store).unwrap());
+        assert_eq!(
+            before_record_fts,
+            small_test_fts_ids(&store, "ctx_history_search", "record_id").unwrap()
+        );
+        assert_eq!(
+            before_event_fts,
+            small_test_fts_ids(&store, "event_search", "event_id").unwrap()
+        );
+    }
+
+    #[test]
+    fn streaming_large_profile_output_guardrails() {
+        let temp = tempdir();
+        let custom_root = temp.path().join("custom-root");
+        std::fs::create_dir_all(&custom_root).unwrap();
+        let mut cfg = LargeProfileConfig::manual(custom_root.join("child"));
+        cfg.release_build = true;
+        assert!(
+            prepare_profile_output_with_protected_root(&cfg, Some(custom_root.clone()))
+                .unwrap_err()
+                .contains("data root")
+        );
+
+        let stale = temp.path().join("stale");
+        std::fs::create_dir_all(&stale).unwrap();
+        let cfg = LargeProfileConfig::smoke(stale.clone());
+        assert!(prepare_profile_output(&cfg).unwrap_err().contains("marker"));
+
+        let marked = temp.path().join("marked");
+        std::fs::create_dir_all(&marked).unwrap();
+        std::fs::write(marked.join(".ctx-large-profile-owned"), "wrong\n").unwrap();
+        let cfg = LargeProfileConfig::smoke(marked);
+        assert!(prepare_profile_output(&cfg).unwrap_err().contains("marker"));
+    }
+
+    #[test]
+    fn streaming_large_profile_enforces_manual_target_and_release() {
+        let temp = tempdir();
+        let mut cfg = LargeProfileConfig::manual(temp.path().join("manual"));
+        cfg.release_build = false;
+        assert!(run_streaming_large_profile(&cfg)
+            .unwrap_err()
+            .contains("release"));
+        cfg.release_build = true;
+        cfg.output_dir = None;
+        assert!(run_streaming_large_profile(&cfg)
+            .unwrap_err()
+            .contains("output"));
+        cfg.output_dir = Some(std::path::PathBuf::from("relative"));
+        assert!(run_streaming_large_profile(&cfg)
+            .unwrap_err()
+            .contains("absolute"));
+        let mut threshold = LargeProfileConfig::smoke(temp.path().join("threshold"));
+        threshold.min_footprint_bytes = 1_000_000_000;
+        assert!(run_streaming_large_profile(&threshold)
+            .unwrap_err()
+            .contains("minimum footprint"));
+    }
+
+    #[test]
+    #[ignore = "manual >=10 GiB profile; run with --release and CTX_LARGE_PROFILE_OUTPUT"]
+    fn streaming_large_profile_manual_release() {
+        let out = std::env::var_os("CTX_LARGE_PROFILE_OUTPUT")
+            .map(std::path::PathBuf::from)
+            .expect("CTX_LARGE_PROFILE_OUTPUT must name an explicit non-home output directory");
+        let artifact = run_streaming_large_profile(&LargeProfileConfig::manual(out)).unwrap();
+        println!(
+            "large profile artifact: {}",
+            artifact["paths"]["artifact"].as_str().unwrap()
+        );
+    }
+
+    #[derive(Clone)]
+    struct LargeProfileConfig {
+        output_dir: Option<std::path::PathBuf>,
+        total_events: usize,
+        events_per_record: usize,
+        batch_records: usize,
+        seed: u64,
+        manual: bool,
+        release_build: bool,
+        min_footprint_bytes: u64,
+    }
+
+    impl LargeProfileConfig {
+        fn smoke(output_dir: std::path::PathBuf) -> Self {
+            Self {
+                output_dir: Some(output_dir),
+                total_events: 21,
+                events_per_record: 3,
+                batch_records: 2,
+                seed: 0x186,
+                manual: false,
+                release_build: !cfg!(debug_assertions),
+                min_footprint_bytes: 0,
+            }
+        }
+        fn manual(output_dir: std::path::PathBuf) -> Self {
+            Self {
+                output_dir: Some(output_dir),
+                total_events: env_usize("CTX_LARGE_PROFILE_EVENTS").unwrap_or(1_250_000),
+                events_per_record: env_usize("CTX_LARGE_PROFILE_EVENTS_PER_RECORD")
+                    .unwrap_or(25)
+                    .clamp(1, 100),
+                batch_records: env_usize("CTX_LARGE_PROFILE_BATCH_RECORDS")
+                    .unwrap_or(250)
+                    .clamp(1, 10_000),
+                seed: env_u64("CTX_LARGE_PROFILE_SEED").unwrap_or(0x186),
+                manual: true,
+                release_build: !cfg!(debug_assertions),
+                min_footprint_bytes: env_u64("CTX_LARGE_PROFILE_MIN_FOOTPRINT_BYTES")
+                    .unwrap_or(10 * 1024 * 1024 * 1024),
+            }
+        }
+    }
+
+    fn run_streaming_large_profile(
+        cfg: &LargeProfileConfig,
+    ) -> std::result::Result<serde_json::Value, String> {
+        if cfg.total_events == 0 || cfg.events_per_record == 0 || cfg.batch_records == 0 {
+            return Err("profile counts must be positive".into());
+        }
+        if (cfg.total_events as u64)
+            .checked_add(cfg.seed)
+            .is_none_or(|v| v > 0x0000_ffff_ffff)
+        {
+            return Err("deterministic UUID range exceeded".into());
+        }
+        let batch_event_bound = cfg
+            .batch_records
+            .checked_mul(cfg.events_per_record)
+            .ok_or("batch bound overflow")?;
+        if cfg.manual && !cfg.release_build {
+            return Err("manual large profile requires --release".into());
+        }
+        let out = prepare_profile_output(cfg)?;
+        let db = out.join("synthetic-large-profile.sqlite");
+        let store = ctx_history_store::Store::open(db.clone()).map_err(|e| e.to_string())?;
+        let started = std::time::Instant::now();
+        let mut imported = 0usize;
+        let mut records = 0usize;
+        let mut max_batch_events = 0usize;
+        let mut last_batch = None;
+        while imported < cfg.total_events {
+            let archive = synthetic_perf_archive_batch(
+                imported,
+                cfg.total_events,
+                cfg.events_per_record,
+                cfg.batch_records,
+                cfg.seed,
+            )?;
+            max_batch_events = max_batch_events.max(archive.events.len());
+            records += archive.records.len();
+            imported += archive.events.len();
+            write_synthetic_batch(&store, &archive).map_err(|e| e.to_string())?;
+            last_batch = Some(archive);
+        }
+        let initial_ms = elapsed_ms(started.elapsed());
+        let baseline_counts = profile_counts(&store)?;
+        assert_expected_counts("baseline", baseline_counts, records as u64, imported as u64)?;
+        let noop_started = std::time::Instant::now();
+        write_synthetic_batch(&store, last_batch.as_ref().unwrap()).map_err(|e| e.to_string())?;
+        let noop_ms = elapsed_ms(noop_started.elapsed());
+        let noop_counts = profile_counts(&store)?;
+        if noop_counts != baseline_counts {
+            return Err("no-op replay changed base/FTS counts".into());
+        }
+        let inc_start = imported
+            .div_ceil(cfg.events_per_record)
+            .checked_mul(cfg.events_per_record)
+            .ok_or("incremental start overflow")?;
+        let inc = synthetic_perf_archive_batch(
+            inc_start,
+            inc_start
+                .checked_add(cfg.events_per_record)
+                .ok_or("incremental overflow")?,
+            cfg.events_per_record,
+            1,
+            cfg.seed,
+        )?;
+        let inc_started = std::time::Instant::now();
+        write_synthetic_batch(&store, &inc).map_err(|e| e.to_string())?;
+        let inc_ms = elapsed_ms(inc_started.elapsed());
+        let counts = profile_counts(&store)?;
+        assert_expected_counts(
+            "incremental",
+            counts,
+            records as u64 + 1,
+            imported as u64 + cfg.events_per_record as u64,
+        )?;
+        assert_fts_projection_parity(&store, counts, cfg.seed, records, imported, inc_start)?;
+        let opts = PacketOptions {
+            limit: 10,
+            snippet_chars: 180,
+            ..PacketOptions::default()
+        };
+        let warm_started = std::time::Instant::now();
+        let warm = search_packet(&store, "perfneedle", &opts).map_err(|e| e.to_string())?;
+        let warm_ms = elapsed_ms(warm_started.elapsed());
+        let filtered_opts = PacketOptions {
+            filters: SearchFilters {
+                provider: Some(CaptureProvider::Codex),
+                repo: Some("ctx".into()),
+                event_type: Some(EventType::ToolCall),
+                file: Some("perf_profile.rs".into()),
+                ..SearchFilters::default()
+            },
+            ..opts.clone()
+        };
+        let filt_started = std::time::Instant::now();
+        let filt =
+            search_packet(&store, "perfneedle", &filtered_opts).map_err(|e| e.to_string())?;
+        let filt_ms = elapsed_ms(filt_started.elapsed());
+        if warm.results.is_empty() || filt.results.is_empty() {
+            return Err("ordinary and filtered search results must be nonempty".into());
+        }
+        let middle_id = synthetic_event_id(imported / 2, cfg.seed)?;
+        let window_started = std::time::Instant::now();
+        let window = store
+            .event_window_bounded(middle_id, 1, 1)
+            .map_err(|e| e.to_string())?;
+        let window_ms = elapsed_ms(window_started.elapsed());
+        let pre_checkpoint = storage_snapshot(&db);
+        let checkpoint_started = std::time::Instant::now();
+        store.checkpoint_wal_truncate().map_err(|e| e.to_string())?;
+        let checkpoint_ms = elapsed_ms(checkpoint_started.elapsed());
+        let post_checkpoint = storage_snapshot(&db);
+        let sqlite = sqlite_metadata(&store)?;
+        drop(store);
+        let reopen_started = std::time::Instant::now();
+        let store = ctx_history_store::Store::open(db.clone()).map_err(|e| e.to_string())?;
+        let reopened = search_packet(&store, "perfneedle", &opts).map_err(|e| e.to_string())?;
+        let reopen_ms = elapsed_ms(reopen_started.elapsed());
+        let warm_ids = result_ids(&warm);
+        let reopened_ids = result_ids(&reopened);
+        let warm_digest = digest_strings(&warm_ids);
+        let reopened_digest = digest_strings(&reopened_ids);
+        if warm_ids != reopened_ids || warm_digest != reopened_digest {
+            return Err("reopen search IDs/digest changed".into());
+        }
+        let artifact_path = out.join("ctx-large-index-profile-v1.json");
+        let footprint = post_checkpoint.total_present_bytes();
+        if footprint < cfg.min_footprint_bytes {
+            return Err(format!(
+                "minimum footprint not reached: {footprint} < {}",
+                cfg.min_footprint_bytes
+            ));
+        }
+        let artifact = serde_json::json!({
+            "schema_version": 1, "profile": "ctx-large-index-profile", "mode": if cfg.manual {"manual"} else {"smoke"},
+            "requested": {"baseline_events": cfg.total_events, "min_footprint_bytes": cfg.min_footprint_bytes, "min_footprint_override_env": std::env::var("CTX_LARGE_PROFILE_MIN_FOOTPRINT_BYTES").ok()},
+            "achieved": {"baseline_events": imported, "baseline_records": records, "incremental_events": inc.events.len(), "incremental_records": inc.records.len()},
+            "config": {"seed": cfg.seed, "events_per_record": cfg.events_per_record, "batch_records": cfg.batch_records, "batch_event_bound": batch_event_bound},
+            "environment": {"os": std::env::consts::OS, "arch": std::env::consts::ARCH, "jj_change": local_jj_id("change"), "jj_commit": local_jj_id("commit"), "cache_state": "warm followed by reopen; true cold cache requires operator OS cache-drop steps"},
+            "sqlite": sqlite,
+            "paths": {"db": canonical_display(&db), "wal": canonical_display(&db.with_extension("sqlite-wal")), "shm": canonical_display(&db.with_extension("sqlite-shm")), "artifact": artifact_path.display().to_string()},
+            "storage": {"pre_checkpoint": pre_checkpoint.to_json(), "post_checkpoint": post_checkpoint.to_json()},
+            "counts": counts.to_json(),
+            "generation": {"max_batch_events": max_batch_events, "bounded_by_batch_size": true},
+            "measurements": {"initial_import_ms": initial_ms, "noop_import_ms": noop_ms, "incremental_import_ms": inc_ms, "warm_search_ms": warm_ms, "filtered_search_ms": filt_ms, "noop_counts_unchanged": baseline_counts == noop_counts},
+            "search": {"ordinary_result_count": warm.results.len(), "filtered_result_count": filt.results.len(), "ordered_result_ids": warm_ids, "result_digest": warm_digest},
+            "event_window": {"target_event_id": middle_id.to_string(), "ids": window.iter().map(|e| e.id.to_string()).collect::<Vec<_>>(), "count": window.len(), "bound": 3, "contains_target": window.iter().any(|e| e.id == middle_id), "duration_ms": window_ms},
+            "checkpoint": {"duration_ms": checkpoint_ms, "pre": pre_checkpoint.to_json(), "post": post_checkpoint.to_json()},
+            "reopen": {"cache_state": "reopen_not_cold", "ordered_result_ids": reopened_ids, "result_digest": reopened_digest, "reopen_ms": reopen_ms},
+            "rss": peak_rss(), "privacy": "synthetic deterministic corpus only; no real home, no network, no private data"
+        });
+        let typed: LargeProfileArtifactV1 =
+            serde_json::from_value(artifact.clone()).map_err(|e| e.to_string())?;
+        typed.validate()?;
+        let stable = typed.stable_projection();
+        let artifact = serde_json::to_value(&typed).map_err(|e| e.to_string())?;
+        let reparsed: LargeProfileArtifactV1 =
+            serde_json::from_value(artifact.clone()).map_err(|e| e.to_string())?;
+        reparsed.validate()?;
+        if stable != reparsed.stable_projection() {
+            return Err("typed stable projection changed".into());
+        }
+        std::fs::write(
+            &artifact_path,
+            serde_json::to_vec_pretty(&artifact).unwrap(),
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(artifact)
+    }
+
+    fn synthetic_perf_archive_batch(
+        start_event: usize,
+        total_events: usize,
+        events_per_record: usize,
+        batch_records: usize,
+        seed: u64,
+    ) -> std::result::Result<SessionHistoryArchive, String> {
+        validate_uuid_capacity(total_events, events_per_record, seed)?;
+        let mut archive = SessionHistoryArchive::default();
+        let start_record = start_event / events_per_record;
+        let max_records = (total_events - start_event)
+            .div_ceil(events_per_record)
+            .min(batch_records);
+        for record_index in start_record..start_record + max_records {
+            append_synthetic_perf_record(
+                &mut archive,
+                record_index,
+                start_event,
+                total_events,
+                events_per_record,
+                seed,
+            )?;
+        }
+        Ok(archive)
+    }
+
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    struct ProfileCounts {
+        records: u64,
+        capture_sources: u64,
+        sessions: u64,
+        runs: u64,
+        events: u64,
+        summaries: u64,
+        files_touched: u64,
+        record_fts: u64,
+        event_fts: u64,
+        artifact_fts: u64,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    struct LargeProfileStableProjection {
+        schema_version: u64,
+        profile: String,
+        mode: String,
+        requested: RequestedProfile,
+        achieved: AchievedProfile,
+        config: ProfileConfigArtifact,
+        counts: ProfileCounts,
+        search: SearchEvidence,
+        event_window: EventWindowEvidenceStable,
+        reopen: ReopenEvidenceStable,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LargeProfileArtifactV1 {
+        schema_version: u64,
+        profile: String,
+        mode: String,
+        requested: RequestedProfile,
+        achieved: AchievedProfile,
+        config: ProfileConfigArtifact,
+        environment: EnvironmentEvidence,
+        sqlite: SqliteEvidence,
+        paths: PathEvidence,
+        storage: StorageEvidence,
+        counts: ProfileCounts,
+        generation: GenerationEvidence,
+        measurements: MeasurementEvidence,
+        search: SearchEvidence,
+        event_window: EventWindowEvidence,
+        checkpoint: CheckpointEvidence,
+        reopen: ReopenEvidence,
+        rss: RssEvidence,
+        privacy: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    struct RequestedProfile {
+        baseline_events: usize,
+        min_footprint_bytes: u64,
+        min_footprint_override_env: Option<String>,
+    }
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    struct AchievedProfile {
+        baseline_events: usize,
+        baseline_records: usize,
+        incremental_events: usize,
+        incremental_records: usize,
+    }
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    struct ProfileConfigArtifact {
+        seed: u64,
+        events_per_record: usize,
+        batch_records: usize,
+        batch_event_bound: usize,
+    }
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct EnvironmentEvidence {
+        os: String,
+        arch: String,
+        jj_change: Option<String>,
+        jj_commit: Option<String>,
+        cache_state: String,
+    }
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct SqliteEvidence {
+        version: String,
+        journal_mode: String,
+        synchronous: i64,
+        page_size: i64,
+        foreign_keys: i64,
+        user_version: i64,
+    }
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct PathEvidence {
+        db: String,
+        wal: String,
+        shm: String,
+        artifact: String,
+    }
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StorageEvidence {
+        pre_checkpoint: StorageStageEvidence,
+        post_checkpoint: StorageStageEvidence,
+    }
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StorageStageEvidence {
+        db: FileEvidence,
+        wal: FileEvidence,
+        shm: FileEvidence,
+        total_present_bytes: u64,
+    }
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FileEvidence {
+        path: String,
+        bytes: Option<u64>,
+        error: Option<String>,
+        present: bool,
+    }
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct GenerationEvidence {
+        max_batch_events: usize,
+        bounded_by_batch_size: bool,
+    }
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct MeasurementEvidence {
+        initial_import_ms: f64,
+        noop_import_ms: f64,
+        incremental_import_ms: f64,
+        warm_search_ms: f64,
+        filtered_search_ms: f64,
+        noop_counts_unchanged: bool,
+    }
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    struct SearchEvidence {
+        ordinary_result_count: usize,
+        filtered_result_count: usize,
+        ordered_result_ids: Vec<String>,
+        result_digest: String,
+    }
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct EventWindowEvidence {
+        target_event_id: String,
+        ids: Vec<String>,
+        count: usize,
+        bound: usize,
+        contains_target: bool,
+        duration_ms: f64,
+    }
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    struct EventWindowEvidenceStable {
+        target_event_id: String,
+        ids: Vec<String>,
+        count: usize,
+        bound: usize,
+        contains_target: bool,
+    }
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct CheckpointEvidence {
+        duration_ms: f64,
+        pre: StorageStageEvidence,
+        post: StorageStageEvidence,
+    }
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ReopenEvidence {
+        cache_state: String,
+        ordered_result_ids: Vec<String>,
+        result_digest: String,
+        reopen_ms: f64,
+    }
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    struct ReopenEvidenceStable {
+        cache_state: String,
+        ordered_result_ids: Vec<String>,
+        result_digest: String,
+    }
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct RssEvidence {
+        peak_bytes: Option<u64>,
+        source: String,
+        semantics: String,
+    }
+
+    impl LargeProfileArtifactV1 {
+        fn stable_projection(&self) -> LargeProfileStableProjection {
+            LargeProfileStableProjection {
+                schema_version: self.schema_version,
+                profile: self.profile.clone(),
+                mode: self.mode.clone(),
+                requested: self.requested.clone(),
+                achieved: self.achieved.clone(),
+                config: self.config.clone(),
+                counts: self.counts,
+                search: self.search.clone(),
+                event_window: EventWindowEvidenceStable {
+                    target_event_id: self.event_window.target_event_id.clone(),
+                    ids: self.event_window.ids.clone(),
+                    count: self.event_window.count,
+                    bound: self.event_window.bound,
+                    contains_target: self.event_window.contains_target,
+                },
+                reopen: ReopenEvidenceStable {
+                    cache_state: self.reopen.cache_state.clone(),
+                    ordered_result_ids: self.reopen.ordered_result_ids.clone(),
+                    result_digest: self.reopen.result_digest.clone(),
+                },
+            }
+        }
+
+        fn validate(&self) -> std::result::Result<(), String> {
+            if self.schema_version != 1 {
+                return Err("wrong schema_version".into());
+            }
+            if self.profile != "ctx-large-index-profile" {
+                return Err("wrong profile".into());
+            }
+            if self.mode != "smoke" && self.mode != "manual" {
+                return Err("wrong mode".into());
+            }
+            if self.achieved.incremental_records != 1
+                || self.achieved.incremental_events != self.config.events_per_record
+            {
+                return Err("bad incremental counts".into());
+            }
+            assert_expected_counts(
+                "artifact",
+                self.counts,
+                (self.achieved.baseline_records + 1) as u64,
+                (self.achieved.baseline_events + self.achieved.incremental_events) as u64,
+            )?;
+            if !self.measurements.noop_counts_unchanged {
+                return Err("noop changed counts".into());
+            }
+            if self.search.ordinary_result_count == 0 || self.search.filtered_result_count == 0 {
+                return Err("empty search evidence".into());
+            }
+            if self.search.result_digest != digest_strings(&self.search.ordered_result_ids) {
+                return Err("search digest mismatch".into());
+            }
+            if self.event_window.count != self.event_window.ids.len()
+                || self.event_window.count > self.event_window.bound
+                || !self.event_window.contains_target
+                || !self
+                    .event_window
+                    .ids
+                    .contains(&self.event_window.target_event_id)
+            {
+                return Err("bad event window".into());
+            }
+            if self.reopen.ordered_result_ids != self.search.ordered_result_ids
+                || self.reopen.result_digest != self.search.result_digest
+            {
+                return Err("reopen mismatch".into());
+            }
+            Ok(())
+        }
+    }
+
+    fn parse_artifact_v1(
+        value: serde_json::Value,
+    ) -> std::result::Result<LargeProfileArtifactV1, String> {
+        let artifact: LargeProfileArtifactV1 =
+            serde_json::from_value(value).map_err(|e| e.to_string())?;
+        artifact.validate()?;
+        Ok(artifact)
+    }
+
+    impl ProfileCounts {
+        fn to_json(self) -> serde_json::Value {
+            serde_json::json!({"records": self.records, "capture_sources": self.capture_sources, "sessions": self.sessions, "runs": self.runs, "events": self.events, "summaries": self.summaries, "files_touched": self.files_touched, "record_fts": self.record_fts, "event_fts": self.event_fts, "artifact_fts": self.artifact_fts})
+        }
+    }
+
+    fn assert_expected_counts(
+        label: &str,
+        counts: ProfileCounts,
+        records: u64,
+        events: u64,
+    ) -> std::result::Result<(), String> {
+        let expected = ProfileCounts {
+            records,
+            capture_sources: records,
+            sessions: records,
+            runs: records,
+            events,
+            summaries: records,
+            files_touched: records,
+            record_fts: records,
+            event_fts: events,
+            artifact_fts: 0,
+        };
+        if counts != expected {
+            return Err(format!(
+                "{label} counts mismatch: got {counts:?}, expected {expected:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn assert_fts_projection_parity(
+        store: &ctx_history_store::Store,
+        counts: ProfileCounts,
+        seed: u64,
+        baseline_records: usize,
+        baseline_events: usize,
+        incremental_start_event: usize,
+    ) -> std::result::Result<(), String> {
+        if counts.records != counts.record_fts || counts.events != counts.event_fts {
+            return Err(format!(
+                "base/FTS cardinality mismatch: records {} vs {}, events {} vs {}",
+                counts.records, counts.record_fts, counts.events, counts.event_fts
+            ));
+        }
+        let incremental_record =
+            incremental_start_event / baseline_events.div_ceil(baseline_records);
+        let record_sentinels = bounded_sample_indexes(baseline_records, incremental_record);
+        for record_index in record_sentinels {
+            let record_id = perf_uuid_checked(
+                0x7000,
+                (record_index as u64)
+                    .checked_add(seed)
+                    .ok_or("uuid index overflow")?,
+            )?;
+            let base_label = format!("record sample {record_index} base row {record_id}");
+            assert_scalar_count_eq(
+                store,
+                &base_label,
+                &format!("SELECT COUNT(*) FROM history_records WHERE id = '{record_id}'"),
+                1,
+            )?;
+            assert_sampled_record_projection(store, record_index, record_id)?;
+        }
+        let event_sentinels = bounded_sample_indexes(
+            baseline_events,
+            incremental_start_event + baseline_events.div_ceil(baseline_records) - 1,
+        );
+        for event_index in event_sentinels {
+            let event_id = synthetic_event_id(event_index, seed)?;
+            let base_label = format!("event sample {event_index} base row {event_id}");
+            assert_scalar_count_eq(
+                store,
+                &base_label,
+                &format!("SELECT COUNT(*) FROM events WHERE id = '{event_id}'"),
+                1,
+            )?;
+            assert_sampled_event_projection(
+                store,
+                &format!("event sample {event_index}"),
+                synthetic_event_rowid(event_index, baseline_events, incremental_start_event)?,
+                event_id,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn assert_sampled_record_projection(
+        store: &ctx_history_store::Store,
+        record_index: usize,
+        record_id: Uuid,
+    ) -> std::result::Result<(), String> {
+        let label = format!("record sample {record_index} FTS perfneedle projection {record_id}");
+        assert_scalar_count_eq(
+            store,
+            &label,
+            &format!("SELECT COUNT(*) FROM ctx_history_search WHERE record_id = '{record_id}' AND ctx_history_search MATCH 'perfneedle'"),
+            1,
+        )
+    }
+
+    fn assert_sampled_event_projection(
+        store: &ctx_history_store::Store,
+        label_prefix: &str,
+        rowid: u64,
+        event_id: Uuid,
+    ) -> std::result::Result<(), String> {
+        // Synthetic profile invariant only: events are inserted exactly once in
+        // deterministic batch order, so FTS5 rowid follows insertion order. The
+        // incremental record may follow a partial final baseline batch, so its
+        // rowid is derived from baseline cardinality, not necessarily index+1.
+        // This is not a production storage-contract assumption.
+        let label = format!("{label_prefix} FTS rowid {rowid} perfneedle projection {event_id}");
+        assert_scalar_count_eq(
+            store,
+            &label,
+            &format!("SELECT COUNT(*) FROM event_search WHERE rowid = {rowid} AND event_id = '{event_id}' AND event_search MATCH 'perfneedle'"),
+            1,
+        )
+    }
+
+    fn checked_sample_rowid(index: usize) -> std::result::Result<u64, String> {
+        (index as u64)
+            .checked_add(1)
+            .ok_or_else(|| "sample rowid overflow".to_string())
+    }
+
+    fn synthetic_event_rowid(
+        event_index: usize,
+        baseline_events: usize,
+        incremental_start_event: usize,
+    ) -> std::result::Result<u64, String> {
+        let insertion_index = if event_index < baseline_events {
+            event_index
+        } else {
+            baseline_events
+                .checked_add(
+                    event_index
+                        .checked_sub(incremental_start_event)
+                        .ok_or("event sample before incremental start")?,
+                )
+                .ok_or("event rowid insertion index overflow")?
+        };
+        checked_sample_rowid(insertion_index)
+    }
+
+    fn bounded_sample_indexes(baseline_len: usize, incremental_index: usize) -> Vec<usize> {
+        let last = baseline_len.saturating_sub(1);
+        let mut indexes = std::collections::BTreeSet::new();
+        indexes.insert(0);
+        indexes.insert(baseline_len / 4);
+        indexes.insert(baseline_len / 2);
+        indexes.insert((baseline_len * 3) / 4);
+        indexes.insert(last);
+        indexes.insert(incremental_index);
+        indexes.into_iter().collect()
+    }
+
+    fn all_base_identities(
+        store: &ctx_history_store::Store,
+    ) -> std::result::Result<Vec<(String, Vec<String>)>, String> {
+        Ok(vec![
+            (
+                "history_records".into(),
+                small_test_table_ids(store, "history_records", "id")?,
+            ),
+            (
+                "capture_sources".into(),
+                small_test_table_ids(store, "capture_sources", "id")?,
+            ),
+            (
+                "sessions".into(),
+                small_test_table_ids(store, "sessions", "id")?,
+            ),
+            ("runs".into(), small_test_table_ids(store, "runs", "id")?),
+            (
+                "events".into(),
+                small_test_table_ids(store, "events", "id")?,
+            ),
+            (
+                "summaries".into(),
+                small_test_table_ids(store, "summaries", "id")?,
+            ),
+            (
+                "files_touched".into(),
+                small_test_table_ids(store, "files_touched", "id")?,
+            ),
+        ])
+    }
+
+    fn write_synthetic_batch(
+        store: &ctx_history_store::Store,
+        archive: &SessionHistoryArchive,
+    ) -> ctx_history_store::Result<()> {
+        store.begin_immediate_batch()?;
+        let result = write_synthetic_batch_inner(store, archive, None);
+        match result {
+            Ok(()) => store.commit_batch(),
+            Err(error) => {
+                let _ = store.rollback_batch();
+                Err(error)
+            }
+        }
+    }
+
+    fn write_synthetic_batch_injected_failure(
+        store: &ctx_history_store::Store,
+        archive: &SessionHistoryArchive,
+        fail_after: usize,
+    ) -> ctx_history_store::Result<()> {
+        store.begin_immediate_batch()?;
+        let result = write_synthetic_batch_inner(store, archive, Some(fail_after));
+        match result {
+            Ok(()) => store.commit_batch(),
+            Err(error) => {
+                let _ = store.rollback_batch();
+                Err(error)
+            }
+        }
+    }
+
+    fn write_synthetic_batch_inner(
+        store: &ctx_history_store::Store,
+        archive: &SessionHistoryArchive,
+        fail_after: Option<usize>,
+    ) -> ctx_history_store::Result<()> {
+        let mut writes = 0usize;
+        for workspace in &archive.vcs_workspaces {
+            store.upsert_vcs_workspace(workspace)?;
+        }
+        writes += 1;
+        if fail_after == Some(writes) {
+            return Err(ctx_history_store::StoreError::NumericOutOfRange {
+                field: "injected profile failure",
+            });
+        }
+        for record in &archive.records {
+            store.upsert_record(record)?;
+        }
+        writes += 1;
+        if fail_after == Some(writes) {
+            return Err(ctx_history_store::StoreError::NumericOutOfRange {
+                field: "injected profile failure",
+            });
+        }
+        for source in &archive.capture_sources {
+            store.upsert_capture_source(source)?;
+        }
+        for session in &archive.sessions {
+            store.upsert_session(session)?;
+        }
+        for run in &archive.runs {
+            store.insert_run_if_absent(run)?;
+        }
+        for summary in &archive.summaries {
+            store.upsert_summary(summary)?;
+        }
+        for file in &archive.files_touched {
+            store.upsert_file_touched(file)?;
+        }
+        for event in &archive.events {
+            store.insert_event_if_absent(event)?;
+        }
+        Ok(())
+    }
+
+    fn small_test_fts_ids(
+        store: &ctx_history_store::Store,
+        table: &str,
+        column: &str,
+    ) -> std::result::Result<Vec<String>, String> {
+        small_test_table_ids(store, table, column)
+    }
+
+    fn small_test_table_ids(
+        store: &ctx_history_store::Store,
+        table: &str,
+        column: &str,
+    ) -> std::result::Result<Vec<String>, String> {
+        let sql = format!("SELECT {column} FROM {table} ORDER BY {column}");
+        let result = store
+            .raw_sql_query(&sql, Default::default())
+            .map_err(|e| e.to_string())?;
+        result
+            .rows
+            .iter()
+            .map(|row| {
+                row.first()
+                    .and_then(raw_str)
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| "missing fts id".to_string())
+            })
+            .collect()
+    }
+
+    fn validate_uuid_capacity(
+        total_events: usize,
+        events_per_record: usize,
+        seed: u64,
+    ) -> std::result::Result<(), String> {
+        if total_events == 0 || events_per_record == 0 {
+            return Err("counts must be positive".into());
+        }
+        let final_record = (total_events - 1) / events_per_record;
+        let inc_start = total_events
+            .div_ceil(events_per_record)
+            .checked_mul(events_per_record)
+            .ok_or("incremental start overflow")?;
+        let final_inc_event = inc_start
+            .checked_add(events_per_record)
+            .and_then(|v| v.checked_sub(1))
+            .ok_or("event overflow")?;
+        for index in [final_record as u64, final_inc_event as u64] {
+            for ns in [0x7000, 0x7100, 0x7200, 0x7300, 0x7400, 0x7500, 0x7600] {
+                let _ =
+                    perf_uuid_checked(ns, index.checked_add(seed).ok_or("uuid index overflow")?)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn profile_counts(
+        store: &ctx_history_store::Store,
+    ) -> std::result::Result<ProfileCounts, String> {
+        let counts = store.profile_table_counts().map_err(|e| e.to_string())?;
+        Ok(ProfileCounts {
+            records: counts.records,
+            capture_sources: counts.capture_sources,
+            sessions: counts.sessions,
+            runs: counts.runs,
+            events: counts.events,
+            summaries: counts.summaries,
+            files_touched: counts.files_touched,
+            record_fts: counts.record_fts,
+            event_fts: counts.event_fts,
+            artifact_fts: counts.artifact_fts,
+        })
+    }
+
+    fn scalar_sql_count_labeled(
+        store: &ctx_history_store::Store,
+        label: &str,
+        sql: &str,
+    ) -> std::result::Result<u64, String> {
+        let result = store
+            .raw_sql_query(sql, Default::default())
+            .map_err(|e| format!("{label}: {e}"))?;
+        result
+            .rows
+            .first()
+            .and_then(|row| row.first())
+            .and_then(raw_i64)
+            .map(|v| v as u64)
+            .ok_or_else(|| format!("{label}: missing scalar count"))
+    }
+
+    fn assert_scalar_count_eq(
+        store: &ctx_history_store::Store,
+        label: &str,
+        sql: &str,
+        expected: u64,
+    ) -> std::result::Result<(), String> {
+        let actual = scalar_sql_count_labeled(store, label, sql)?;
+        if actual != expected {
+            return Err(format!("{label}: expected {expected}, got {actual}"));
+        }
+        Ok(())
+    }
+
+    fn sqlite_metadata(
+        store: &ctx_history_store::Store,
+    ) -> std::result::Result<serde_json::Value, String> {
+        let metadata = store.sqlite_profile_metadata().map_err(|e| e.to_string())?;
+        Ok(
+            serde_json::json!({"version": metadata.version, "journal_mode": metadata.journal_mode, "synchronous": metadata.synchronous, "page_size": metadata.page_size, "foreign_keys": metadata.foreign_keys, "user_version": metadata.user_version}),
+        )
+    }
+    fn raw_i64(value: &ctx_history_store::RawSqlValue) -> Option<i64> {
+        match value {
+            ctx_history_store::RawSqlValue::Integer(v) => Some(*v),
+            _ => None,
+        }
+    }
+    fn raw_str(value: &ctx_history_store::RawSqlValue) -> Option<&str> {
+        match value {
+            ctx_history_store::RawSqlValue::Text { value, .. } => Some(value.as_str()),
+            _ => None,
+        }
+    }
+
+    #[derive(Clone)]
+    struct StorageSnapshot {
+        db: FileState,
+        wal: FileState,
+        shm: FileState,
+    }
+    #[derive(Clone)]
+    struct FileState {
+        path: String,
+        bytes: Option<u64>,
+        error: Option<String>,
+    }
+    impl StorageSnapshot {
+        fn to_json(&self) -> serde_json::Value {
+            serde_json::json!({"db": self.db.to_json(), "wal": self.wal.to_json(), "shm": self.shm.to_json(), "total_present_bytes": self.total_present_bytes()})
+        }
+        fn total_present_bytes(&self) -> u64 {
+            self.db.bytes.unwrap_or(0) + self.wal.bytes.unwrap_or(0) + self.shm.bytes.unwrap_or(0)
+        }
+    }
+    impl FileState {
+        fn to_json(&self) -> serde_json::Value {
+            serde_json::json!({"path": self.path, "bytes": self.bytes, "error": self.error, "present": self.bytes.is_some()})
+        }
+    }
+
+    fn storage_snapshot(db: &std::path::Path) -> StorageSnapshot {
+        StorageSnapshot {
+            db: file_state(db),
+            wal: file_state(&db.with_extension("sqlite-wal")),
+            shm: file_state(&db.with_extension("sqlite-shm")),
+        }
+    }
+    fn file_state(path: &std::path::Path) -> FileState {
+        match std::fs::metadata(path) {
+            Ok(m) => FileState {
+                path: canonical_display(path),
+                bytes: Some(m.len()),
+                error: None,
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => FileState {
+                path: path.display().to_string(),
+                bytes: None,
+                error: None,
+            },
+            Err(e) => FileState {
+                path: path.display().to_string(),
+                bytes: None,
+                error: Some(e.to_string()),
+            },
+        }
+    }
+
+    fn prepare_profile_output(
+        cfg: &LargeProfileConfig,
+    ) -> std::result::Result<std::path::PathBuf, String> {
+        prepare_profile_output_with_protected_root(cfg, None)
+    }
+
+    fn prepare_profile_output_with_protected_root(
+        cfg: &LargeProfileConfig,
+        protected_root: Option<std::path::PathBuf>,
+    ) -> std::result::Result<std::path::PathBuf, String> {
+        let out = cfg
+            .output_dir
+            .clone()
+            .ok_or("manual large profile requires explicit output")?;
+        if cfg.manual && !out.is_absolute() {
+            return Err("manual output must be absolute".into());
+        }
+        let parent = out.parent().ok_or("output must have parent")?;
+        let parent = parent.canonicalize().map_err(|e| e.to_string())?;
+        let out = parent.join(out.file_name().ok_or("output must have final component")?);
+        reject_protected_data_root(&out, protected_root.as_deref())?;
+        let marker = out.join(".ctx-large-profile-owned");
+        if out.exists() {
+            let canon = out.canonicalize().map_err(|e| e.to_string())?;
+            reject_protected_data_root(&canon, protected_root.as_deref())?;
+            let marker_text = std::fs::read_to_string(&marker).map_err(|_| {
+                "pre-existing output lacks valid .ctx-large-profile-owned marker".to_string()
+            })?;
+            let expected = marker_contents(&canon);
+            if marker_text != expected {
+                return Err("pre-existing output marker is stale or foreign".into());
+            }
+            for name in [
+                "synthetic-large-profile.sqlite",
+                "synthetic-large-profile.sqlite-wal",
+                "synthetic-large-profile.sqlite-shm",
+                "ctx-large-index-profile-v1.json",
+            ] {
+                let path = out.join(name);
+                if path.exists() {
+                    std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+                }
+            }
+        } else {
+            std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
+        }
+        let canon = out.canonicalize().map_err(|e| e.to_string())?;
+        reject_protected_data_root(&canon, protected_root.as_deref())?;
+        std::fs::write(&marker, marker_contents(&canon)).map_err(|e| e.to_string())?;
+        Ok(out)
+    }
+
+    fn marker_contents(canonical_output: &std::path::Path) -> String {
+        format!(
+            "ctx-large-profile-owned-v1\n{}\n",
+            canonical_output.display()
+        )
+    }
+
+    fn reject_protected_data_root(
+        path: &std::path::Path,
+        protected_root: Option<&std::path::Path>,
+    ) -> std::result::Result<(), String> {
+        let protected = match protected_root {
+            Some(root) => root.to_path_buf(),
+            None => default_data_root().map_err(|e| format!("cannot resolve data root: {e}"))?,
+        };
+        let protected = canonicalize_existing_ancestor(&protected)
+            .map_err(|e| format!("cannot canonicalize data root: {e}"))?;
+        let candidate = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if candidate == protected || candidate.starts_with(&protected) {
+            return Err("output overlaps protected ctx data root".into());
+        }
+        Ok(())
+    }
+
+    fn canonicalize_existing_ancestor(
+        path: &std::path::Path,
+    ) -> std::io::Result<std::path::PathBuf> {
+        if path.exists() {
+            return path.canonicalize();
+        }
+        let name = path
+            .file_name()
+            .ok_or_else(|| std::io::Error::other("missing file name"))?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("missing parent"))?;
+        Ok(parent.canonicalize()?.join(name))
+    }
+
+    fn result_ids(packet: &SearchPacket) -> Vec<String> {
+        packet
+            .results
+            .iter()
+            .map(|r| r.record_id.to_string())
+            .collect()
+    }
+    fn digest_strings(values: &[String]) -> String {
+        let mut h = 0xcbf29ce484222325u64;
+        for value in values {
+            for byte in value.as_bytes().iter().copied().chain([0]) {
+                h ^= byte as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+        }
+        format!("{h:016x}")
+    }
+    fn synthetic_event_id(index: usize, seed: u64) -> std::result::Result<Uuid, String> {
+        perf_uuid_checked(
+            0x7600,
+            (index as u64)
+                .checked_add(seed)
+                .ok_or("uuid index overflow")?,
+        )
+    }
+    fn perf_uuid_checked(namespace: u16, index: u64) -> std::result::Result<Uuid, String> {
+        if index > 0x0000_ffff_ffff {
+            return Err("uuid index out of deterministic range".into());
+        }
+        Uuid::parse_str(&format!("018f45d0-{namespace:04x}-7000-8000-{index:012x}"))
+            .map_err(|e| e.to_string())
+    }
+    fn canonical_display(path: &std::path::Path) -> String {
+        path.canonicalize()
+            .unwrap_or_else(|_| path.to_path_buf())
+            .display()
+            .to_string()
+    }
+
+    #[test]
     #[ignore = "manual perf benchmark; private release gates run scripts/public-ctx/perf-smoke.sh from ctx-private"]
     fn synthetic_search_perf_records_thresholded_evidence() {
         let out_dir = std::env::var_os("CTX_ARTIFACT_DIR")
@@ -6528,6 +7897,185 @@ mod tests {
         }
 
         archive
+    }
+
+    fn append_synthetic_perf_record(
+        archive: &mut SessionHistoryArchive,
+        record_index: usize,
+        _batch_start_event: usize,
+        total_events: usize,
+        events_per_record: usize,
+        seed: u64,
+    ) -> std::result::Result<(), String> {
+        if archive.vcs_workspaces.is_empty() {
+            archive.vcs_workspaces.push(VcsWorkspace {
+                id: perf_uuid_checked(0x5000, seed)?,
+                kind: VcsKind::Git,
+                root_path: "/workspace/ctx".into(),
+                repo_fingerprint: "git:ctx-large-profile".into(),
+                primary_remote_url_normalized: None,
+                host: VcsHost::Unknown,
+                owner: Some("synthetic".into()),
+                name: Some("ctx".into()),
+                monorepo_subpath: None,
+                timestamps: timestamps(),
+                source_id: None,
+                sync: sync_metadata(),
+            });
+        }
+        let id_index = (record_index as u64)
+            .checked_add(seed)
+            .ok_or("uuid index overflow")?;
+        let record_id = perf_uuid_checked(0x7000, id_index)?;
+        let source_id = perf_uuid_checked(0x7100, id_index)?;
+        let session_id = perf_uuid_checked(0x7200, id_index)?;
+        let run_id = perf_uuid_checked(0x7300, id_index)?;
+        let summary_id = perf_uuid_checked(0x7400, id_index)?;
+        let file_id = perf_uuid_checked(0x7500, id_index)?;
+        let time = fixed_time() + chrono::Duration::seconds(record_index as i64);
+        let mut record = HistoryRecord::new(
+            format!("Large synthetic profile {record_index:08}"),
+            format!(
+                "perfneedle deterministic large profile record {record_index:08} seed {seed}; {}",
+                "payload ".repeat(16)
+            ),
+            vec![
+                "large-profile".into(),
+                format!("bucket-{:02}", record_index % 64),
+            ],
+            "task",
+            Some("/workspace/ctx".into()),
+        );
+        record.id = record_id;
+        record.created_at = time;
+        record.updated_at = time;
+        archive.records.push(record);
+        archive.capture_sources.push(CaptureSource {
+            id: source_id,
+            descriptor: CaptureSourceDescriptor {
+                kind: CaptureSourceKind::ProviderImport,
+                provider: CaptureProvider::Codex,
+                machine_id: "synthetic-large-profile".into(),
+                process_id: None,
+                cwd: Some("/workspace/ctx".into()),
+                raw_source_path: Some(format!(
+                    "/synthetic/ctx-large-profile-{record_index:08}.jsonl"
+                )),
+                external_session_id: Some(format!("large-profile-{record_index:08}")),
+            },
+            started_at: time,
+            ended_at: Some(time),
+            sync: sync_metadata(),
+        });
+        archive.sessions.push(Session {
+            id: session_id,
+            history_record_id: Some(record_id),
+            parent_session_id: None,
+            root_session_id: None,
+            capture_source_id: Some(source_id),
+            provider: CaptureProvider::Codex,
+            external_session_id: Some(format!("large-profile-{record_index:08}")),
+            external_agent_id: None,
+            agent_type: AgentType::Primary,
+            role_hint: Some("synthetic-profile".into()),
+            is_primary: true,
+            status: SessionStatus::Imported,
+            transcript_blob_id: None,
+            started_at: time,
+            ended_at: Some(time),
+            timestamps: timestamps(),
+            sync: sync_metadata(),
+        });
+        archive.runs.push(Run {
+            id: run_id,
+            history_record_id: Some(record_id),
+            session_id: Some(session_id),
+            run_type: RunType::Command,
+            status: RunStatus::Succeeded,
+            started_at: time,
+            ended_at: Some(time),
+            exit_code: Some(0),
+            cwd: Some("/workspace/ctx".into()),
+            command_preview: Some("ctx profile synthetic".into()),
+            input_blob_id: None,
+            output_blob_id: None,
+            timestamps: timestamps(),
+            source_id: Some(source_id),
+            sync: sync_metadata(),
+        });
+        archive.summaries.push(Summary {
+            id: summary_id,
+            history_record_id: Some(record_id),
+            session_id: Some(session_id),
+            kind: SummaryKind::ImportedProviderSummary,
+            model_or_source: Some("synthetic-large-profile".into()),
+            text: format!("perfneedle summary deterministic record {record_index:08}"),
+            citations: Vec::new(),
+            timestamps: timestamps(),
+            source_id: Some(source_id),
+            sync: sync_metadata(),
+        });
+        archive.files_touched.push(FileTouched {
+            id: file_id,
+            history_record_id: Some(record_id),
+            run_id: Some(run_id),
+            event_id: None,
+            vcs_workspace_id: archive.vcs_workspaces.first().map(|w| w.id),
+            path: format!(
+                "crates/perf/profile_{:02}/perf_profile.rs",
+                record_index % 24
+            ),
+            change_kind: Some(FileChangeKind::Modified),
+            old_path: None,
+            line_count_delta: Some(1),
+            confidence: Confidence::Explicit,
+            timestamps: timestamps(),
+            source_id: Some(source_id),
+            sync: sync_metadata(),
+        });
+        let event_start = record_index * events_per_record;
+        let event_end = total_events.min(event_start + events_per_record);
+        for event_index in event_start..event_end {
+            let local_index = event_index - event_start;
+            archive.events.push(Event { id: perf_uuid_checked(0x7600, (event_index as u64).checked_add(seed).ok_or("uuid index overflow")?)?, seq: (event_index + 1) as u64, history_record_id: Some(record_id), session_id: Some(session_id), run_id: Some(run_id), event_type: if local_index % 2 == 0 { EventType::ToolCall } else { EventType::Message }, role: Some(if local_index % 2 == 0 { EventRole::Assistant } else { EventRole::User }), occurred_at: time + chrono::Duration::milliseconds(local_index as i64), capture_source_id: Some(source_id), payload: serde_json::json!({"body":{"text":format!("perfneedle deterministic event {event_index:012} record {record_index:08} seed {seed}")}}), payload_blob_id: None, dedupe_key: Some(format!("ctx-large-profile:{seed}:{event_index}")), redaction_state: RedactionState::SafePreview, sync: sync_metadata() });
+        }
+        Ok(())
+    }
+
+    fn peak_rss() -> serde_json::Value {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+        if rc != 0 {
+            return serde_json::json!({"peak_bytes": null, "source": "getrusage", "semantics": "unavailable"});
+        }
+        let usage = unsafe { usage.assume_init() };
+        #[cfg(target_os = "macos")]
+        let (bytes, semantics) = (
+            usage.ru_maxrss as u64,
+            "getrusage ru_maxrss high-water bytes on macOS",
+        );
+        #[cfg(target_os = "linux")]
+        let (bytes, semantics) = (
+            (usage.ru_maxrss as u64).saturating_mul(1024),
+            "getrusage ru_maxrss high-water KiB converted to bytes on Linux",
+        );
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let (bytes, semantics) = (usage.ru_maxrss as u64, "getrusage ru_maxrss platform units");
+        serde_json::json!({"peak_bytes": bytes, "source": "getrusage(RUSAGE_SELF).ru_maxrss", "semantics": semantics})
+    }
+    fn local_jj_id(kind: &str) -> Option<String> {
+        let template = if kind == "commit" {
+            "commit_id"
+        } else {
+            "change_id"
+        };
+        std::process::Command::new("jj")
+            .args(["log", "-r", "@", "--no-graph", "-T", template])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
     }
 
     fn perf_uuid(namespace: u16, index: u64) -> Uuid {

@@ -312,6 +312,7 @@ dependencies = [
  "chrono",
  "ctx-history-core",
  "ctx-history-store",
+ "libc",
  "regex",
  "serde",
  "serde_json",

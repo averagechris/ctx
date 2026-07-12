@@ -945,6 +945,79 @@ fn import_custom_history_jsonl_format_is_searchable_and_idempotent() {
 }
 
 #[test]
+fn search_refresh_off_reports_additive_freshness_without_plugins_or_writes() {
+    let temp = tempdir();
+    let fixture = provider_history_fixture("codex-sessions");
+    json_output(ctx(&temp).args([
+        "import",
+        "--provider",
+        "codex",
+        "--path",
+        &fixture,
+        "--json",
+    ]));
+    let plugin = write_history_source_plugin(&temp, "noexec", true, None);
+    let db_path = temp.path().join("work.sqlite");
+    let before = fs::metadata(&db_path).unwrap().modified().unwrap();
+
+    let search = json_output(
+        ctx(&temp)
+            .env("CTX_HISTORY_PLUGIN_PATH", &plugin.manifest_dir)
+            .args(["search", "onboarding", "--refresh", "off", "--json"]),
+    );
+
+    assert_eq!(search["schema_version"], 1);
+    assert_eq!(search["freshness"]["mode"], "off");
+    assert_eq!(search["freshness"]["status"], "skipped");
+    assert_eq!(search["freshness"]["ran"], false);
+    assert_eq!(search["freshness"]["reason"], "refresh_off");
+    assert_eq!(search["freshness"]["duration_ms"], 0);
+    assert!(search["freshness"]["index_age_seconds"].is_number());
+    assert_eq!(search["freshness"]["totals"]["unchanged_sources"], 0);
+    assert_eq!(search["freshness"]["totals"]["imported_events"], 0);
+    assert!(!search["results"].as_array().unwrap().is_empty());
+    assert!(!plugin.run_marker.exists());
+    assert_eq!(fs::metadata(&db_path).unwrap().modified().unwrap(), before);
+
+    let stdout = ctx(&temp)
+        .args(["search", "onboarding", "--refresh", "off"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(stdout).unwrap();
+    assert!(stdout.contains("freshness: refresh skipped"), "{stdout}");
+    assert!(stdout.contains("unchanged 0"), "{stdout}");
+}
+
+#[test]
+fn search_freshness_reports_persisted_index_age() {
+    let temp = tempdir();
+    let fixture = provider_history_fixture("codex-sessions");
+    json_output(ctx(&temp).args([
+        "import",
+        "--provider",
+        "codex",
+        "--path",
+        &fixture,
+        "--json",
+    ]));
+    let fresh =
+        json_output(ctx(&temp).args(["search", "onboarding", "--refresh", "off", "--json"]));
+    assert!(fresh["freshness"]["index_age_seconds"].as_i64().unwrap() >= 0);
+
+    let conn = Connection::open(temp.path().join("work.sqlite")).unwrap();
+    conn.execute("UPDATE sessions SET updated_at_ms = 1000", [])
+        .unwrap();
+    conn.execute("UPDATE history_records SET updated_at_ms = 1000", [])
+        .unwrap();
+    let stale =
+        json_output(ctx(&temp).args(["search", "onboarding", "--refresh", "off", "--json"]));
+    assert!(stale["freshness"]["index_age_seconds"].as_i64().unwrap() > 1_000_000);
+}
+
+#[test]
 fn import_custom_history_jsonl_format_rejects_malformed_atomically() {
     let temp = tempdir();
     let fixture = custom_history_fixture("malformed-partial.jsonl");
@@ -2823,6 +2896,11 @@ fn mcp_search_and_show_tools_return_structured_json_without_refresh() {
     assert_eq!(search["query"], "onboarding");
     assert_eq!(search["freshness"]["mode"], "off");
     assert_eq!(search["freshness"]["status"], "skipped");
+    assert_eq!(search["freshness"]["ran"], false);
+    assert_eq!(search["freshness"]["reason"], "refresh_off");
+    assert_eq!(search["freshness"]["duration_ms"], 0);
+    assert!(search["freshness"]["index_age_seconds"].is_number());
+    assert_eq!(search["freshness"]["totals"]["unchanged_sources"], 0);
     assert_eq!(search["share_safe"], false);
     assert_eq!(
         search_responses[1]["result"]["content"][0]["text"],
@@ -3340,6 +3418,21 @@ fn search_refresh_auto_runs_enabled_auto_history_source_plugins_incrementally() 
     );
     assert!(plugin.run_marker.exists());
 
+    let unchanged = json_output(
+        ctx(&temp)
+            .env("CTX_HISTORY_PLUGIN_PATH", &plugin.manifest_dir)
+            .args([
+                "search",
+                "hermes plugin incremental marker",
+                "--provider",
+                "custom",
+                "--json",
+            ]),
+    );
+    assert_eq!(unchanged["freshness"]["totals"]["imported_sessions"], 0);
+    assert_eq!(unchanged["freshness"]["totals"]["imported_events"], 0);
+    assert_eq!(unchanged["freshness"]["totals"]["unchanged_sources"], 1);
+
     let cursor_log = fs::read_to_string(cursor_log).unwrap();
     assert!(cursor_log.contains(r#""message_id":7"#), "{cursor_log}");
     assert!(cursor_log.contains("cursor_file="), "{cursor_log}");
@@ -3608,11 +3701,51 @@ sys.exit(23)
     );
 
     assert_eq!(search["freshness"]["status"], "failed");
+    assert_eq!(search["freshness"]["ran"], true);
+    assert_eq!(search["freshness"]["reason"], "refresh_failed");
+    assert!(search["freshness"]["duration_ms"].as_u64().unwrap() > 0);
     assert!(search["freshness"]["error"]
         .as_str()
         .unwrap()
         .contains("history source plugin badplugin/default failed"));
     assert!(!search["results"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn search_refresh_auto_delayed_progress_stays_on_stderr_with_json_stdout() {
+    let temp = tempdir();
+    let fixture = provider_history_fixture("codex-sessions");
+    json_output(ctx(&temp).args([
+        "import",
+        "--provider",
+        "codex",
+        "--path",
+        &fixture,
+        "--json",
+    ]));
+    let script = r#"#!/usr/bin/env python3
+import sys, time
+time.sleep(0.05)
+print("slow plugin exploded", file=sys.stderr)
+sys.exit(23)
+"#;
+    let plugin =
+        write_raw_history_source_plugin_with_options(&temp, "slowbad", script, true, Some("auto"));
+
+    let output = ctx(&temp)
+        .env("CTX_HISTORY_PLUGIN_PATH", &plugin.manifest_dir)
+        .env("CTX_TEST_REFRESH_PROGRESS_DELAY_MS", "1")
+        .args(["search", "onboarding", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let json: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["freshness"]["status"], "failed");
+    assert!(stderr.contains(r#""type":"ctx_progress""#), "{stderr}");
+    assert!(stderr.contains("refresh still running"), "{stderr}");
 }
 
 #[test]

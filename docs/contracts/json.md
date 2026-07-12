@@ -259,8 +259,22 @@ external publication.
 - `status`, such as `completed`, `skipped`, `no_sources`,
   `skipped_large_index`, or `failed`;
 - `source_count`;
+- `ran`, true when refresh/import execution was attempted and false for
+  pre-execution skips such as `--refresh off` or no supported sources;
+- `duration_ms`, elapsed pre-search refresh time in milliseconds for attempted
+  refreshes and skipped source discovery; it is `0` for `--refresh off`;
+- `index_age_seconds`, omitted when no persisted indexed/import timestamp is
+  known; when present, the age in seconds of the newest persisted indexed/import
+  timestamp, not the time since a no-op freshness check;
+- `reason`, one of the stable current reasons `refresh_off`, `no_sources`,
+  `refreshed`, or `refresh_failed`;
 - `totals`, using the same import total fields as `ctx import --json`;
 - `error`, present when refresh failed but results were still served.
+
+This is an additive compatible revision to search `schema_version: 1`; consumers
+must continue to ignore unknown fields. `totals.unchanged_sources` is additive and
+counts refresh sources that completed without importing sessions, events, or
+edges and without failures.
 
 `suggested_next_commands` can include `ctx show event`, `ctx show session`,
 `ctx search "<query>" --session <ctx-session-id>`, `ctx locate event`, and

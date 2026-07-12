@@ -378,7 +378,9 @@ fn tool_search(arguments: &Value, data_root: &Path) -> Result<Value> {
         ..ctx_history_search::PacketOptions::default()
     };
     let packet = ctx_history_search::search_packet(&store, &query, &options)?;
-    let refresh = SearchRefreshReport::skipped(RefreshArg::Off, "skipped");
+    let mut refresh = SearchRefreshReport::skipped(RefreshArg::Off, "skipped");
+    refresh.reason = "refresh_off";
+    let refresh = refresh.with_index_age(Some(&store));
     let mut value = SearchDto::packet(&store, &packet, &refresh, Some(&query));
     mark_share_safe(&mut value);
     Ok(value)

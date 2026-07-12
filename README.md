@@ -66,6 +66,7 @@ Search results include session and event IDs; use `ctx show event <id>` or
 | [SQL](docs/sql.md) | The read-only SQL surface and schema. |
 | [MCP](docs/mcp.md) | Serving ctx tools to agents over MCP. |
 | [Providers](docs/providers.md) | Which agent histories ctx can discover, import, and search. |
+| [Large-index profile](docs/large-index-profile.md) | Deterministic bounded synthetic profile harness and manual large-run commands. |
 | [Fork plan](docs/fork-plan.md) | Why this fork exists and what was removed. |
 
 ## Privacy

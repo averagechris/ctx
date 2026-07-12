@@ -20,4 +20,5 @@ ctx-history-core = { path = "../ctx-history-core" }
 ctx-history-store = { path = "../ctx-history-store" }
 
 [dev-dependencies]
+libc.workspace = true
 tempfile.workspace = true

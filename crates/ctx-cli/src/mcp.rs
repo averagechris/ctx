@@ -19,9 +19,10 @@ use uuid::Uuid;
 use super::{
     compact_json, config::CONFIG_FILE, discovered_plugin_sources_json, discovered_sources,
     event_window, event_window_json, indexed_history_item_count, mark_share_safe,
-    raw_sql_result_json, search_filters, search_has_intent, session_transcript_json, sources_json,
-    OutputFormat, ProviderArg, RefreshArg, SearchDto, SearchFilterInput, SearchIntentInput,
-    SearchRefreshReport, SourceIdentityFilterArgs, TranscriptMode, MAX_SEARCH_LIMIT,
+    normalize_cli_filter_list, parse_event_roles, raw_sql_result_json, search_filters,
+    search_has_intent, session_transcript_json, sources_json, OutputFormat, ProviderArg,
+    RefreshArg, SearchDto, SearchFilterInput, SearchIntentInput, SearchRefreshReport,
+    SourceIdentityFilterArgs, TranscriptMode, MAX_SEARCH_LIMIT,
 };
 
 const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
@@ -217,6 +218,10 @@ fn handle_tools_call(params: Value, data_root: &Path) -> Result<Value, Value> {
                     "primary_only",
                     "include_subagents",
                     "event_type",
+                    "role",
+                    "exclude_role",
+                    "exclude_tool_noise",
+                    "exclude_tool",
                     "file",
                     "session",
                     "events",
@@ -336,6 +341,18 @@ fn tool_search(arguments: &Value, data_root: &Path) -> Result<Value> {
     let primary_only = optional_bool(arguments, "primary_only")?.unwrap_or(false);
     let include_subagents = optional_bool(arguments, "include_subagents")?.unwrap_or(false);
     let event_type = optional_string(arguments, "event_type")?;
+    // Role and tool-noise filters mirror the CLI flags; values are validated
+    // here so errors name the MCP argument, then flow through the same
+    // `search_filters` conversion as `ctx search`.
+    let role = optional_string_array(arguments, "role")?;
+    let exclude_role = optional_string_array(arguments, "exclude_role")?;
+    parse_event_roles("role", role.clone())?;
+    parse_event_roles("exclude_role", exclude_role.clone())?;
+    let exclude_tool_noise = optional_bool(arguments, "exclude_tool_noise")?.unwrap_or(false);
+    let exclude_tool = normalize_cli_filter_list(
+        "exclude_tool entries",
+        optional_string_array(arguments, "exclude_tool")?,
+    )?;
     let file = optional_string(arguments, "file")?.map(PathBuf::from);
     if !search_has_intent(SearchIntentInput {
         query: Some(&query),
@@ -375,6 +392,10 @@ fn tool_search(arguments: &Value, data_root: &Path) -> Result<Value> {
                 primary_only,
                 include_subagents,
                 event_type,
+                role,
+                exclude_role,
+                exclude_tool_noise,
+                exclude_tool_name: exclude_tool,
                 file,
                 include_current_session,
             },
@@ -551,6 +572,10 @@ fn tool_definitions() -> Vec<Value> {
                 "since": { "type": "string", "description": "RFC3339 timestamp or day window such as 30d." },
                 "include_subagents": { "type": "boolean", "default": false, "description": "Include subagent sessions in addition to primary-agent sessions." },
                 "event_type": { "type": "string", "enum": event_type_names() },
+                "role": { "type": "array", "items": { "type": "string", "enum": event_role_names() }, "default": [], "description": "Include only events with one of these roles, matching the CLI --role filter. Events without role metadata never match a non-empty include set." },
+                "exclude_role": { "type": "array", "items": { "type": "string", "enum": event_role_names() }, "default": [], "description": "Exclude events with one of these roles, matching the CLI --exclude-role filter." },
+                "exclude_tool_noise": { "type": "boolean", "default": false, "description": "Exclude tool invocations and command output, matching the CLI --exclude-tool-noise filter." },
+                "exclude_tool": { "type": "array", "items": { "type": "string" }, "default": [], "description": "Exclude tool/command events whose structured tool or command executable is one of these names (for example ctx), matching the repeatable CLI --exclude-tool filter." },
                 "file": { "type": "string", "description": "Indexed touched-file path. Required unless query is provided." },
                 "session": { "type": "string", "description": "ctx session id." },
                 "events": { "type": "boolean", "default": false },
@@ -650,11 +675,32 @@ fn event_type_names() -> Vec<&'static str> {
     ]
 }
 
+/// The full stored role domain accepted by the CLI's `--role` /
+/// `--exclude-role` parsing (`EventRole::from_str`); `user`, `assistant`,
+/// and `tool` are the values that commonly appear in indexed history.
+fn event_role_names() -> &'static [&'static str] {
+    ctx_history_core::EventRole::variants()
+}
+
 fn optional_string(arguments: &Value, key: &str) -> Result<Option<String>> {
     match arguments.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(value)) => Ok(Some(value.clone())),
         Some(_) => Err(anyhow!("{key} must be a string")),
+    }
+}
+
+fn optional_string_array(arguments: &Value, key: &str) -> Result<Vec<String>> {
+    match arguments.get(key) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(|value| match value {
+                Value::String(value) => Ok(value.clone()),
+                _ => Err(anyhow!("{key} entries must be strings")),
+            })
+            .collect(),
+        Some(_) => Err(anyhow!("{key} must be an array of strings")),
     }
 }
 

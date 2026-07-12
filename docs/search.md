@@ -100,6 +100,13 @@ Search filters narrow both human output and JSON:
 - `--event-type <event-type>`, one of `message`, `tool_call`, `tool_output`,
   `command_started`, `command_output`, `command_finished`, `file_touched`,
   `vcs_change`, `artifact`, `summary`, or `notice`;
+- `--role user|assistant|tool` and `--exclude-role user|assistant|tool`,
+  repeatable role filters when transcript metadata records roles;
+- `--exclude-tool-noise`, to remove tool invocations, tool output, and command
+  output from results while preserving message/event retrieval by default;
+- `--exclude-tool <name>`, to remove tool/command events whose structured tool
+  name or command executable is a name such as `ctx`; repeatable to exclude
+  several executables at once;
 - `--file <path>`, indexed touched-file path metadata, not the current
   filesystem;
 - `--session <ctx-session-id-or-prefix>`;
@@ -134,6 +141,14 @@ history.
 The default searches primary-agent sessions so human intent and decisions stay
 prominent. Use `--include-subagents` when you want implementation details, code
 review notes, test output, or failure analysis from subagent sessions too.
+Equivalent user and assistant message matches rank ahead of incidental
+tool/command matches by default. Tool calls, tool output, and command events are
+still retrievable explicitly (for example with `--event-type tool_output` or
+`--events`), and `why_matched` explains the role, event type, source field, and
+any relevance penalty when metadata is available. JSON always includes
+`why_matched`; human output shows it with `--verbose`. The role and tool-noise
+filters are also available to MCP hosts as optional `search` tool arguments
+(`role`, `exclude_role`, `exclude_tool_noise`, `exclude_tool`).
 
 `--limit` defaults to `20` and is capped at `200`.
 
@@ -184,4 +199,13 @@ Review and redact copied snippets, JSON, or transcripts before sending them
 outside the machine.
 
 
-Relevance note: `--match any` rewards results that match more normalized tokens, but ctx reranks only a bounded candidate pool (at least `max(limit*8, 50)` candidates, collected on unfiltered searches and on `--match any` searches whose filters are pushed exactly into the ranked query, subject to existing scan caps), not the entire historical corpus.
+Relevance note: final ranking is not raw text-match order. `--match any`
+rewards results that match more normalized tokens, and the documented role and
+tool-noise relevance penalty rescales every match mode. ctx applies this
+reranking over a bounded candidate pool — at least
+`max(limit*8, 50, limit+1)` of the strongest raw text matches, collected on
+every large-index search (unfiltered, filtered, or default scope) subject to
+the existing scan caps — not over the entire historical corpus. A
+user/assistant match ranked deep in raw text order can be promoted over
+tool/command noise only if it lands inside that pool; increase `--limit` to
+widen the pool when a penalized corpus buries relevant messages deeper.

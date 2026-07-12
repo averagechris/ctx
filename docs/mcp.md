@@ -40,6 +40,13 @@ output, or failure traces from subagent sessions are relevant. When
 by default; pass `include_current_session: true` when the active session tree is
 the target.
 
+MCP `search` also accepts the CLI's role and tool-noise filters as optional
+arguments with permissive defaults: `role` and `exclude_role` (arrays of role
+names such as `user`, `assistant`, or `tool`), `exclude_tool_noise` (boolean,
+default `false`), and `exclude_tool` (array of executable names such as `ctx`,
+matching the repeatable `--exclude-tool` CLI flag). Omitting them searches all
+roles and keeps tool evidence, exactly like the CLI defaults.
+
 The MCP `sql` tool uses the same read-only stable views and result limits as
 `ctx sql --json`. Prefer stable `ctx_*` views for scripts and agent workflows.
 Run `ctx docs show sql` for the view schemas and examples.

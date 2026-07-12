@@ -3,7 +3,10 @@ use std::{
     io::{Cursor, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     thread,
     time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -885,6 +888,7 @@ struct ImportTotals {
     imported_edges: usize,
     skipped: usize,
     failed: usize,
+    unchanged_sources: usize,
     zero_yield_anomaly_sources: usize,
 }
 
@@ -1018,6 +1022,7 @@ impl ImportTotals {
         self.imported_edges += summary.imported_edges;
         self.skipped += summary.skipped;
         self.failed += summary.failed;
+        self.unchanged_sources += summary.unchanged_sources;
         if health.zero_yield_anomaly_count > 0 {
             self.zero_yield_anomaly_sources += 1;
         }
@@ -1073,7 +1078,44 @@ struct SearchRefreshReport {
     status: &'static str,
     source_count: usize,
     totals: ImportTotals,
+    duration_ms: u128,
+    index_age_seconds: Option<i64>,
+    reason: &'static str,
     error: Option<String>,
+}
+
+struct DelayedRefreshProgress {
+    cancel: Arc<AtomicBool>,
+}
+
+impl DelayedRefreshProgress {
+    fn start(refresh: RefreshArg) -> Option<Self> {
+        if refresh == RefreshArg::Off {
+            return None;
+        }
+        let delay_ms = env::var("CTX_TEST_REFRESH_PROGRESS_DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1500);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let thread_cancel = Arc::clone(&cancel);
+        thread::spawn(move || {
+            thread::sleep(StdDuration::from_millis(delay_ms));
+            if !thread_cancel.load(Ordering::Relaxed) {
+                eprintln!(
+                    "{}",
+                    json!({"type":"ctx_progress","operation":"search-refresh","phase":"refreshing","message":"refresh still running","done":false})
+                );
+            }
+        });
+        Some(Self { cancel })
+    }
+}
+
+impl Drop for DelayedRefreshProgress {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 impl SearchRefreshReport {
@@ -1083,11 +1125,19 @@ impl SearchRefreshReport {
             status,
             source_count: 0,
             totals: ImportTotals::default(),
+            duration_ms: 0,
+            index_age_seconds: None,
+            reason: status,
             error: None,
         }
     }
 
-    fn completed(mode: RefreshArg, source_count: usize, totals: ImportTotals) -> Self {
+    fn completed(
+        mode: RefreshArg,
+        source_count: usize,
+        totals: ImportTotals,
+        duration_ms: u128,
+    ) -> Self {
         let status = if totals.zero_yield_anomaly_sources > 0 {
             "degraded_zero_yield"
         } else {
@@ -1098,18 +1148,35 @@ impl SearchRefreshReport {
             status,
             source_count,
             totals,
+            duration_ms,
+            index_age_seconds: Some(0),
+            reason: if status == "completed" {
+                "refreshed"
+            } else {
+                "zero_yield_anomaly"
+            },
             error: None,
         }
     }
 
-    fn failed(mode: RefreshArg, source_count: usize, error: String) -> Self {
+    fn failed(mode: RefreshArg, source_count: usize, error: String, duration_ms: u128) -> Self {
         Self {
             mode,
             status: "failed",
             source_count,
             totals: ImportTotals::default(),
+            duration_ms,
+            index_age_seconds: None,
+            reason: "refresh_failed",
             error: Some(error),
         }
+    }
+
+    fn with_index_age(mut self, store: Option<&Store>) -> Self {
+        self.index_age_seconds = store
+            .and_then(|store| store.latest_indexed_source_at_ms().ok().flatten())
+            .map(|ms| (utc_now().timestamp_millis().saturating_sub(ms)) / 1000);
+        self
     }
 
     fn to_json(&self) -> Value {
@@ -1117,6 +1184,10 @@ impl SearchRefreshReport {
             "mode": self.mode.as_str(),
             "status": self.status,
             "source_count": self.source_count,
+            "ran": self.status == "completed" || self.status == "degraded_zero_yield" || self.status == "failed",
+            "duration_ms": self.duration_ms,
+            "index_age_seconds": self.index_age_seconds,
+            "reason": self.reason,
             "totals": import_totals_json(&self.totals),
             "error": self.error,
         }))
@@ -2460,6 +2531,7 @@ fn import_totals_json(totals: &ImportTotals) -> Value {
         "imported_edges": totals.imported_edges,
         "skipped": totals.skipped,
         "failed": totals.failed,
+        "unchanged_sources": totals.unchanged_sources,
         "zero_yield_anomaly_sources": totals.zero_yield_anomaly_sources,
     })
 }
@@ -4380,6 +4452,7 @@ fn run_search(args: SearchArgs, data_root: PathBuf) -> Result<()> {
     } else {
         Store::open(&db_path)?
     };
+    let refresh = refresh.with_index_age(Some(&store));
     let source_identity = SourceIdentityFilterArgs::from(&args);
     let query = args.query.clone().unwrap_or_default();
     let event_results = args.events || args.session.is_some();
@@ -4443,6 +4516,22 @@ fn run_search(args: SearchArgs, data_root: PathBuf) -> Result<()> {
                 "warning: search refresh detected zero-yield import health anomalies; serving search results; run `ctx doctor` or `ctx import --strict`"
             );
         }
+        println!(
+            "freshness: refresh {} ({}), duration {}ms, index age {}, imported sessions/events/edges {}/{}/{}, skipped {}, unchanged {}, failed {}",
+            refresh.status,
+            refresh.reason,
+            refresh.duration_ms,
+            refresh
+                .index_age_seconds
+                .map(|seconds| format!("{seconds}s"))
+                .unwrap_or_else(|| "unknown".to_owned()),
+            refresh.totals.imported_sessions,
+            refresh.totals.imported_events,
+            refresh.totals.imported_edges,
+            refresh.totals.skipped,
+            refresh.totals.unchanged_sources,
+            refresh.totals.failed,
+        );
         if packet.results.is_empty() {
             if let Some(file) = args
                 .file
@@ -4612,9 +4701,13 @@ fn search_inspect_command(result: &ctx_history_search::SearchPacketResult) -> Op
 }
 
 fn refresh_before_search(args: &SearchArgs, data_root: &Path) -> Result<SearchRefreshReport> {
+    let started = Instant::now();
     if args.refresh == RefreshArg::Off {
-        return Ok(SearchRefreshReport::skipped(RefreshArg::Off, "skipped"));
+        let mut report = SearchRefreshReport::skipped(RefreshArg::Off, "skipped");
+        report.reason = "refresh_off";
+        return Ok(report);
     }
+    let _delayed_progress = DelayedRefreshProgress::start(args.refresh);
     let source_identity = normalize_source_identity_filters(SourceIdentityFilterArgs::from(args))?;
     if !source_identity.is_empty()
         && args
@@ -4638,6 +4731,7 @@ fn refresh_before_search(args: &SearchArgs, data_root: &Path) -> Result<SearchRe
                     RefreshArg::Auto,
                     sources.len(),
                     error_summary(&err),
+                    started.elapsed().as_millis(),
                 ));
             }
             Err(err) => return Err(err.context("search refresh failed")),
@@ -4648,7 +4742,10 @@ fn refresh_before_search(args: &SearchArgs, data_root: &Path) -> Result<SearchRe
                 "strict search refresh found no supported discovered native provider or enabled auto history-source plugin sources; rerun the search with --refresh off to use the existing index"
             ));
         }
-        return Ok(SearchRefreshReport::skipped(args.refresh, "no_sources"));
+        let mut report = SearchRefreshReport::skipped(args.refresh, "no_sources");
+        report.reason = "no_sources";
+        report.duration_ms = started.elapsed().as_millis();
+        return Ok(report);
     }
     let source_count = sources.len().saturating_add(plugin_sources.len());
     match refresh_sources_for_search(data_root, sources, plugin_sources, args.refresh, args.json) {
@@ -4660,12 +4757,14 @@ fn refresh_before_search(args: &SearchArgs, data_root: &Path) -> Result<SearchRe
                 args.refresh,
                 source_count,
                 totals,
+                started.elapsed().as_millis(),
             ))
         }
         Err(err) if args.refresh == RefreshArg::Auto => Ok(SearchRefreshReport::failed(
             RefreshArg::Auto,
             source_count,
             error_summary(&err),
+            started.elapsed().as_millis(),
         )),
         Err(err) => Err(err.context("search refresh failed")),
     }
@@ -6822,9 +6921,11 @@ mod tests {
             zero_yield_anomaly_sources: 1,
             ..ImportTotals::default()
         };
-        let report = SearchRefreshReport::completed(RefreshArg::Auto, 1, totals);
+        let report = SearchRefreshReport::completed(RefreshArg::Auto, 1, totals, 7);
         assert_eq!(report.status, "degraded_zero_yield");
+        assert_eq!(report.reason, "zero_yield_anomaly");
         assert_eq!(report.to_json()["status"], "degraded_zero_yield");
+        assert_eq!(report.to_json()["reason"], "zero_yield_anomaly");
     }
 
     #[test]

@@ -1079,6 +1079,64 @@ fn import_custom_history_jsonl_format_is_searchable_and_idempotent() {
 }
 
 #[test]
+fn search_refresh_off_reports_freshness_and_does_not_run_plugins_or_write() {
+    let temp = tempdir();
+    import_match_fixture(&temp);
+    let plugin = write_history_source_plugin(&temp, "noexec", true, None);
+    let db_path = temp.path().join("work.sqlite");
+    let before = fs::metadata(&db_path).unwrap().modified().unwrap();
+
+    let search = json_output(
+        ctx(&temp)
+            .env("CTX_HISTORY_PLUGIN_PATH", &plugin.manifest_dir)
+            .args(["search", "alpha", "--refresh", "off", "--json"]),
+    );
+
+    assert_eq!(search["freshness"]["mode"], "off");
+    assert_eq!(search["freshness"]["ran"], false);
+    assert_eq!(search["freshness"]["reason"], "refresh_off");
+    assert_eq!(search["freshness"]["duration_ms"], 0);
+    assert_eq!(search["freshness"]["totals"]["imported_events"], 0);
+    assert_eq!(search["freshness"]["totals"]["unchanged_sources"], 0);
+    assert!(!plugin.run_marker.exists());
+    assert_eq!(fs::metadata(&db_path).unwrap().modified().unwrap(), before);
+
+    let (stdout, _) = success_output(ctx(&temp).args(["search", "alpha", "--refresh", "off"]));
+    assert!(stdout.contains("freshness: refresh skipped"), "{stdout}");
+    assert!(
+        stdout.contains("imported sessions/events/edges 0/0/0"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("unchanged 0"), "{stdout}");
+}
+
+#[test]
+fn search_freshness_reports_fresh_and_stale_index_age() {
+    let temp = tempdir();
+    let fixture = provider_history_fixture("codex-sessions");
+    json_output(ctx(&temp).args([
+        "import",
+        "--provider",
+        "codex",
+        "--path",
+        &fixture,
+        "--json",
+    ]));
+    let fresh =
+        json_output(ctx(&temp).args(["search", "onboarding", "--refresh", "off", "--json"]));
+    assert!(fresh["freshness"]["index_age_seconds"].as_i64().unwrap() >= 0);
+
+    let conn = Connection::open(temp.path().join("work.sqlite")).unwrap();
+    conn.execute("UPDATE sessions SET updated_at_ms = 1000", [])
+        .unwrap();
+    conn.execute("UPDATE history_records SET updated_at_ms = 1000", [])
+        .unwrap();
+    let stale =
+        json_output(ctx(&temp).args(["search", "onboarding", "--refresh", "off", "--json"]));
+    assert!(stale["freshness"]["index_age_seconds"].as_i64().unwrap() > 1_000_000);
+}
+
+#[test]
 fn search_match_modes_terms_json_and_no_result_suggestion_are_explicit() {
     let temp = tempdir();
     import_match_fixture(&temp);
@@ -2587,6 +2645,8 @@ fn preview_native_sources_are_listed_but_not_auto_imported() {
         json_output(search_command.args(["search", query, "--provider", "nanoclaw", "--json"]));
     assert_eq!(search["freshness"]["mode"], "auto");
     assert_eq!(search["freshness"]["status"], "no_sources");
+    assert_eq!(search["freshness"]["ran"], false);
+    assert_eq!(search["freshness"]["reason"], "no_sources");
     assert_eq!(search["freshness"]["source_count"], 0);
     assert!(search["results"].as_array().unwrap().is_empty());
 
@@ -4968,11 +5028,39 @@ sys.exit(23)
     );
 
     assert_eq!(search["freshness"]["status"], "failed");
+    assert_eq!(search["freshness"]["ran"], true);
+    assert_eq!(search["freshness"]["reason"], "refresh_failed");
+    assert!(search["freshness"]["duration_ms"].as_u64().unwrap() > 0);
     assert!(search["freshness"]["error"]
         .as_str()
         .unwrap()
         .contains("history source plugin badplugin/default failed"));
     assert!(!search["results"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn search_refresh_auto_delayed_progress_stays_on_stderr_with_json_stdout() {
+    let temp = tempdir();
+    import_match_fixture(&temp);
+    let script = r#"#!/usr/bin/env python3
+import sys, time
+time.sleep(0.05)
+print("slow plugin exploded", file=sys.stderr)
+sys.exit(23)
+"#;
+    let plugin =
+        write_raw_history_source_plugin_with_options(&temp, "slowbad", script, true, Some("auto"));
+
+    let (stdout, stderr) = success_output(
+        ctx(&temp)
+            .env("CTX_HISTORY_PLUGIN_PATH", &plugin.manifest_dir)
+            .env("CTX_TEST_REFRESH_PROGRESS_DELAY_MS", "1")
+            .args(["search", "alpha", "--provider", "custom", "--json"]),
+    );
+    let json: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["freshness"]["status"], "failed");
+    assert!(stderr.contains(r#""type":"ctx_progress""#), "{stderr}");
+    assert!(stderr.contains("refresh still running"), "{stderr}");
 }
 
 #[test]
@@ -5197,6 +5285,85 @@ fn search_refresh_auto_tail_imports_appended_codex_session_event() {
         1,
         "message",
     );
+}
+
+#[test]
+fn search_refresh_manifested_source_noop_then_one_change_reports_freshness_counts() {
+    let temp = tempdir();
+    let root = temp.path().join(".pi");
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("sessions.jsonl");
+    let write_pair = |file: &mut fs::File, id: usize, needle: &str| {
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"session","version":3,"id":format!("pi-noop-{id}"),"timestamp":"2026-06-24T12:00:00.000Z","cwd":"/workspace"})
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"message","id":format!("pi-noop-msg-{id}"),"timestamp":"2026-06-24T12:00:01.000Z","message":{"role":"user","content":needle}})
+        )
+        .unwrap();
+    };
+    {
+        let mut file = fs::File::create(&path).unwrap();
+        for index in 0..20 {
+            write_pair(&mut file, index, &format!("pi-noop-initial-{index}"));
+        }
+    }
+
+    let first = json_output(ctx(&temp).args([
+        "search",
+        "pi-noop-initial-19",
+        "--provider",
+        "pi",
+        "--refresh",
+        "strict",
+        "--json",
+    ]));
+    assert_eq!(first["freshness"]["ran"], true);
+    assert_eq!(first["freshness"]["reason"], "refreshed");
+    assert_eq!(first["freshness"]["totals"]["imported_sessions"], 20);
+    assert_eq!(first["freshness"]["totals"]["imported_events"], 20);
+    assert_eq!(first["freshness"]["totals"]["unchanged_sources"], 0);
+
+    let second = json_output(ctx(&temp).args([
+        "search",
+        "pi-noop-initial-19",
+        "--provider",
+        "pi",
+        "--refresh",
+        "strict",
+        "--json",
+    ]));
+    assert_eq!(second["freshness"]["ran"], true);
+    assert_eq!(second["freshness"]["reason"], "refreshed");
+    assert_eq!(second["freshness"]["totals"]["imported_sessions"], 0);
+    assert_eq!(second["freshness"]["totals"]["imported_events"], 0);
+    assert_eq!(second["freshness"]["totals"]["skipped"], 0);
+    assert_eq!(second["freshness"]["totals"]["unchanged_sources"], 1);
+
+    {
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        write_pair(&mut file, 21, "pi-noop-one-change");
+    }
+    let third = json_output(ctx(&temp).args([
+        "search",
+        "pi-noop-one-change",
+        "--provider",
+        "pi",
+        "--refresh",
+        "strict",
+        "--json",
+    ]));
+    assert_eq!(third["freshness"]["ran"], true);
+    assert_eq!(third["freshness"]["reason"], "refreshed");
+    assert_eq!(third["freshness"]["totals"]["imported_sessions"], 1);
+    assert_eq!(third["freshness"]["totals"]["imported_events"], 1);
+    assert_eq!(third["freshness"]["totals"]["unchanged_sources"], 0);
+    assert_search_provider_oracle(&third, "pi", "pi-noop-one-change", 1, "message");
 }
 
 #[test]

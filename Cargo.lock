@@ -291,9 +291,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "ctx-history-capture",
  "ctx-history-core",
  "ctx-history-search",
  "ctx-history-store",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

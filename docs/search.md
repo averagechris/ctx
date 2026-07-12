@@ -160,7 +160,8 @@ filters are also available to MCP hosts as optional `search` tool arguments
 `--limit` defaults to `20` and is capped at `200`.
 
 Pagination is query-owned v1 and is the #195 paged slice of the broader #187
-work; status, sources, locate, and raw SQL extraction remain outstanding. A
+work. Status, sources, locate, and raw SQL now share the same read-only query
+projection layer for transport-neutral DTO construction. A
 search page is a stable replay/slice of a fixed candidate pool. For every page,
 ctx reruns the same request with the candidate pool limit fixed at 200, then
 slices by the continuation offset. `pool_total` is exact for that returned pool.

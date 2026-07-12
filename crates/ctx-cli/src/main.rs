@@ -14,7 +14,7 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use chrono::{Duration, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use serde_json::{json, Number, Value};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -48,14 +48,15 @@ use ctx_history_capture::{
 };
 use ctx_history_core::{
     database_path, default_data_root, utc_now, CaptureProvider, CtxHistoryJsonlRecord, CtxIdPrefix,
-    Event, EventRole, EventType, HistoryRecord, ProviderRawRetention, RedactionState,
-    SearchMatchMode, Session,
+    Event, EventRole, EventType, HistoryRecord, RedactionState, SearchMatchMode, Session,
 };
 use ctx_history_query::{
-    BytePolicy, EventPageV1, EventProjectionV1, FieldSet, QueryError, QueryService,
-    SearchContextProjectionV1, SearchPageV1, SearchResultProjectionV1, SessionProjectionV1,
-    TranscriptMode as QueryTranscriptMode, DEFAULT_ITEM_BYTES, DEFAULT_PAGE_BYTES,
-    DEFAULT_SHOW_LIMIT, MAX_SHOW_LIMIT,
+    raw_sql_result_json, sources_json as query_sources_json, status_json as query_status_json,
+    status_snapshot as query_status_snapshot, BytePolicy, EventPageV1, EventProjectionV1, FieldSet,
+    HistorySourcePluginFailureProjection, HistorySourcePluginSourceProjection, QueryError,
+    QueryService, SearchContextProjectionV1, SearchPageV1, SearchResultProjectionV1,
+    SessionProjectionV1, TranscriptMode as QueryTranscriptMode, DEFAULT_ITEM_BYTES,
+    DEFAULT_PAGE_BYTES, DEFAULT_SHOW_LIMIT, MAX_SHOW_LIMIT,
 };
 use ctx_history_store::{
     CatalogSession, CatalogSourceIndexUpdate, IdPrefixResolution, RawSqlOptions, RawSqlResult,
@@ -1802,7 +1803,7 @@ fn run_setup(args: SetupArgs, data_root: PathBuf) -> Result<()> {
             "config_path": config_path,
             "mode": if args.catalog_only { "catalog_only" } else { "ready" },
             "indexed_items": indexed_items,
-            "sources": sources_json(&sources),
+            "sources": ctx_history_query::native_sources_json(&sources),
             "catalog": {
                 "sources": catalog.sources,
                 "source_files": catalog.source_files,
@@ -1924,10 +1925,21 @@ fn setup_has_failed_sources(report: Option<&ImportReport>) -> bool {
 }
 
 fn run_status(args: JsonArgs, data_root: PathBuf) -> Result<()> {
-    let snapshot = storage_status::snapshot(&data_root, CONFIG_FILE)?;
+    // Preserve the version-aware guidance of the pre-extraction status
+    // path: unsupported schema versions keep their migrate/upgrade advice.
+    let db_path = database_path(data_root.clone());
+    let snapshot = query_status_snapshot(&data_root, CONFIG_FILE).map_err(|err| match err {
+        ctx_history_query::QueryError::Store(StoreError::UnsupportedSchemaVersion(version)) => {
+            unsupported_schema_version_error(version, "ctx status")
+        }
+        err => anyhow!(err).context(format!(
+            "read `ctx status` storage snapshot from read-only ctx store {}",
+            db_path.display()
+        )),
+    })?;
 
     if args.json {
-        print_json(storage_status::status_json(&snapshot))?;
+        print_json(query_status_json(&snapshot))?;
     } else {
         println!("data_root: {}", snapshot.data_root.display());
         println!("database_path: {}", snapshot.db_path.display());
@@ -1949,11 +1961,11 @@ fn run_status(args: JsonArgs, data_root: PathBuf) -> Result<()> {
             snapshot.counts.catalog_failed
         );
         println!("stale_catalog_sessions: {}", snapshot.counts.catalog_stale);
-        println!("{}", storage_status::human_total(&snapshot));
-        for warning in storage_status::warnings(&snapshot) {
+        println!("{}", storage_status::human_total_query(&snapshot));
+        for warning in storage_status::status_warnings(snapshot.available_space_bytes) {
             println!("warning: {warning}");
         }
-        for diagnostic in storage_status::diagnostic_messages_for_snapshot(&snapshot) {
+        for diagnostic in &snapshot.diagnostics {
             println!("diagnostic: {diagnostic}");
         }
         println!("local_only: true");
@@ -1967,13 +1979,12 @@ fn run_sources(args: JsonArgs, data_root: PathBuf) -> Result<()> {
     let plugin_sources = plugin_discovery.sources;
     let plugin_failures = plugin_discovery.failures;
     if args.json {
-        let mut source_values = sources_json(&sources);
-        source_values.extend(plugin_sources_json(&plugin_sources));
-        source_values.extend(plugin_manifest_failures_json(&plugin_failures));
-        print_json(json!({
-            "schema_version": 1,
-            "sources": source_values,
-        }))?;
+        print_json(query_sources_json(
+            &sources,
+            &plugin_source_projections(&plugin_sources),
+            &plugin_failure_projections(&plugin_failures),
+            false,
+        ))?;
     } else {
         for source in sources {
             println!(
@@ -2000,13 +2011,6 @@ fn run_sources(args: JsonArgs, data_root: PathBuf) -> Result<()> {
         }
     }
     Ok(())
-}
-
-pub(crate) fn discovered_plugin_sources_json(data_root: &Path) -> Result<Vec<Value>> {
-    let plugin_discovery = discover_history_source_plugins_with_diagnostics(data_root, &[])?;
-    let mut values = plugin_sources_json(&plugin_discovery.sources);
-    values.extend(plugin_manifest_failures_json(&plugin_discovery.failures));
-    Ok(values)
 }
 
 fn catalog_available_sources(
@@ -3239,7 +3243,7 @@ fn run_locate(args: LocateArgs, data_root: PathBuf) -> Result<()> {
                 args.provider.map(ProviderArg::capture_provider),
                 args.provider_session.as_deref(),
             )?;
-            let value = locate_session_json(&store, &session);
+            let value = serde_json::to_value(QueryService::new(&store).locate_session(&session)?)?;
             if locate_json_output(args.format, args.json) {
                 print_json(value)?;
             } else {
@@ -3248,7 +3252,7 @@ fn run_locate(args: LocateArgs, data_root: PathBuf) -> Result<()> {
         }
         LocateTarget::Event(args) => {
             let event = resolve_event(&store, &args.id)?;
-            let value = locate_event_json(&store, &event);
+            let value = serde_json::to_value(QueryService::new(&store).locate_event(&event)?)?;
             if locate_json_output(args.format, args.json) {
                 print_json(value)?;
             } else {
@@ -3736,50 +3740,6 @@ fn render_events_jsonl(store: &Store, events: &[Event]) -> Result<String> {
     Ok(lines.join("\n") + "\n")
 }
 
-fn locate_session_json(store: &Store, session: &Session) -> Value {
-    compact_json(json!({
-        "schema_version": 1,
-        "target": "session",
-        "item_type": "session_location",
-        "ctx_session_id": session.id,
-        "provider": session.provider,
-        "provider_session_id": session.external_session_id,
-        "parent_ctx_session_id": session.parent_session_id,
-        "root_ctx_session_id": session.root_session_id,
-        "agent_type": session.agent_type,
-        "role": session.role_hint,
-        "status": session.status,
-        "started_at": session.started_at,
-        "ended_at": session.ended_at,
-        "source": source_json_for(store, session.capture_source_id),
-        "resume": provider_resume_json(session.provider, session.external_session_id.as_deref()),
-    }))
-}
-
-fn locate_event_json(store: &Store, event: &Event) -> Value {
-    let session = event.session_id.and_then(|id| store.get_session(id).ok());
-    compact_json(json!({
-        "schema_version": 1,
-        "target": "event",
-        "item_type": "event_location",
-        "ctx_event_id": event.id,
-        "ctx_session_id": event.session_id,
-        "provider": session.as_ref().map(|session| session.provider),
-        "provider_session_id": session
-            .as_ref()
-            .and_then(|session| session.external_session_id.clone()),
-        "sequence": event.seq,
-        "event_type": event.event_type,
-        "role": event.role,
-        "occurred_at": event.occurred_at,
-        "source": source_json_for(store, event.capture_source_id),
-        "cursor": event_cursor(event),
-        "resume": session
-            .as_ref()
-            .map(|session| provider_resume_json(session.provider, session.external_session_id.as_deref())),
-    }))
-}
-
 fn source_json_for(store: &Store, source_id: Option<Uuid>) -> Option<Value> {
     let source = source_id.and_then(|source_id| store.get_capture_source(source_id).ok())?;
     let path = source.descriptor.raw_source_path.clone();
@@ -3817,25 +3777,6 @@ fn source_cursor(metadata: &Value) -> Option<String> {
         .and_then(|value| value.as_str())
         .or_else(|| metadata.pointer("/cursor").and_then(|value| value.as_str()))
         .map(str::to_owned)
-}
-
-fn provider_resume_json(provider: CaptureProvider, provider_session_id: Option<&str>) -> Value {
-    let (command, argv) = match (provider, provider_session_id) {
-        (CaptureProvider::Codex, Some(session_id)) => (
-            Some(format!("codex resume {}", shell_quote_arg(session_id))),
-            Some(vec![
-                "codex".to_owned(),
-                "resume".to_owned(),
-                session_id.to_owned(),
-            ]),
-        ),
-        _ => (None, None),
-    };
-    compact_json(json!({
-        "available": command.is_some(),
-        "command": command,
-        "argv": argv,
-    }))
 }
 
 fn shell_quote_arg(value: &str) -> String {
@@ -4302,7 +4243,7 @@ fn run_sql(args: SqlArgs, data_root: PathBuf) -> Result<()> {
     let sql = read_sql_input(&args)?;
     let db_path = database_path(data_root);
     let store = open_existing_store_read_only(&db_path, "ctx sql")?;
-    let result = store.raw_sql_query(
+    let result = QueryService::new(&store).raw_sql(
         &sql,
         RawSqlOptions {
             max_rows: args.max_rows,
@@ -4437,64 +4378,6 @@ fn print_sql_truncation_notice(result: &RawSqlResult) {
             "warning: values truncated at {} bytes; rerun with --max-value-bytes for more",
             result.limits.max_value_bytes
         );
-    }
-}
-
-pub(crate) fn raw_sql_result_json(result: &RawSqlResult) -> Value {
-    compact_json(json!({
-        "schema_version": 1,
-        "item_type": "sql_result",
-        "read_only": true,
-        "columns": result.columns.iter().map(|column| column.name.clone()).collect::<Vec<_>>(),
-        "rows": result
-            .rows
-            .iter()
-            .map(|row| row.iter().map(raw_sql_value_json).collect::<Vec<_>>())
-            .collect::<Vec<_>>(),
-        "returned_rows": result.returned_rows,
-        "truncated": {
-            "rows": result.truncated.rows,
-            "values": result.truncated.values,
-        },
-        "limits": {
-            "max_rows": result.limits.max_rows,
-            "max_columns": result.limits.max_columns,
-            "max_value_bytes": result.limits.max_value_bytes,
-            "max_sql_bytes": result.limits.max_sql_bytes,
-            "timeout_ms": result.limits.timeout_ms,
-        },
-        "elapsed_ms": result.elapsed.as_millis(),
-    }))
-}
-
-fn raw_sql_value_json(value: &RawSqlValue) -> Value {
-    match value {
-        RawSqlValue::Null => Value::Null,
-        RawSqlValue::Integer(value) => json!(value),
-        RawSqlValue::Real(value) => Number::from_f64(*value)
-            .map(Value::Number)
-            .unwrap_or(Value::Null),
-        RawSqlValue::Text {
-            value,
-            bytes,
-            truncated,
-        } if *truncated => json!({
-            "type": "text",
-            "value": value,
-            "bytes": bytes,
-            "truncated": true,
-        }),
-        RawSqlValue::Text { value, .. } => Value::String(value.clone()),
-        RawSqlValue::Blob {
-            bytes,
-            preview_hex,
-            truncated,
-        } => json!({
-            "type": "blob",
-            "bytes": bytes,
-            "preview_hex": preview_hex,
-            "truncated": truncated,
-        }),
     }
 }
 
@@ -6841,84 +6724,35 @@ fn source_for_path(provider: CaptureProvider, path: PathBuf) -> SourceInfo {
     provider_source_for_path(provider, path)
 }
 
-fn sources_json(sources: &[SourceInfo]) -> Vec<Value> {
+pub(crate) fn plugin_source_projections(
+    sources: &[HistorySourcePluginSource],
+) -> Vec<HistorySourcePluginSourceProjection> {
     sources
         .iter()
-        .map(|source| {
-            json!({
-                "provider": source.provider.as_str(),
-                "path": source.path,
-                "exists": source.exists,
-                "source_format": source.source_format,
-                "status": source.status.as_str(),
-                "import_support": import_support_json(source.import_support),
-                "native_import": source.import_support.is_auto_importable(),
-                "importable": source.status == ProviderSourceStatus::Available
-                    && source.import_support.is_importable(),
-                "raw_retention": raw_retention_json(source.raw_retention),
-                "unsupported_reason": source.unsupported_reason,
-            })
+        .map(|source| HistorySourcePluginSourceProjection {
+            plugin_name: source.plugin_name.clone(),
+            plugin_display_name: source.plugin_display_name.clone(),
+            plugin_version: source.plugin_version.clone(),
+            manifest_path: source.manifest_path.clone(),
+            id: source.id.clone(),
+            display_name: source.display_name.clone(),
+            provider_key: source.provider_key.clone(),
+            source_id: source.source_id.clone(),
+            source_format: source.source_format.clone(),
+            enabled: source.enabled,
+            refresh: history_source_plugin_refresh_json(source.refresh),
         })
         .collect()
 }
 
-fn plugin_sources_json(sources: &[HistorySourcePluginSource]) -> Vec<Value> {
-    sources
-        .iter()
-        .map(|source| {
-            json!({
-                "provider": CaptureProvider::Custom.as_str(),
-                "kind": "history_source_plugin",
-                "plugin": source.plugin_name,
-                "plugin_display_name": source.plugin_display_name,
-                "plugin_version": source.plugin_version,
-                "history_source": source.label(),
-                "history_source_id": source.id,
-                "display_name": source.display_name,
-                "provider_key": source.provider_key,
-                "source_id": source.source_id,
-                "source_format": source.source_format,
-                "manifest_path": source.manifest_path,
-                "enabled": source.enabled,
-                "refresh": history_source_plugin_refresh_json(source.refresh),
-                "status": "available",
-                "import_support": "history_source_plugin",
-                "native_import": false,
-                "importable": true,
-                "raw_retention": "metadata_only",
-                "unsupported_reason": null,
-            })
-        })
-        .collect()
-}
-
-fn plugin_manifest_failures_json(failures: &[HistorySourcePluginManifestFailure]) -> Vec<Value> {
+pub(crate) fn plugin_failure_projections(
+    failures: &[HistorySourcePluginManifestFailure],
+) -> Vec<HistorySourcePluginFailureProjection> {
     failures
         .iter()
-        .map(|failure| {
-            json!({
-                "provider": CaptureProvider::Custom.as_str(),
-                "kind": "history_source_plugin",
-                "plugin": null,
-                "plugin_display_name": null,
-                "plugin_version": null,
-                "history_source": null,
-                "history_source_id": null,
-                "display_name": null,
-                "provider_key": null,
-                "source_id": null,
-                "source_format": null,
-                "manifest_path": failure.manifest_path,
-                "enabled": false,
-                "refresh": null,
-                "status": "invalid",
-                "import_support": "history_source_plugin",
-                "native_import": false,
-                "importable": false,
-                "raw_retention": "metadata_only",
-                "unsupported_reason": failure.error,
-                "error": failure.error,
-            })
+        .map(|failure| HistorySourcePluginFailureProjection {
+            manifest_path: failure.manifest_path.clone(),
+            error: failure.error.clone(),
         })
         .collect()
 }
@@ -6927,24 +6761,6 @@ fn history_source_plugin_refresh_json(refresh: HistorySourcePluginRefresh) -> &'
     match refresh {
         HistorySourcePluginRefresh::Manual => "manual",
         HistorySourcePluginRefresh::Auto => "auto",
-    }
-}
-
-fn import_support_json(support: ProviderImportSupport) -> &'static str {
-    match support {
-        ProviderImportSupport::Native => "native",
-        ProviderImportSupport::Preview => "preview",
-        ProviderImportSupport::Unsupported => "unsupported",
-    }
-}
-
-fn raw_retention_json(retention: ProviderRawRetention) -> &'static str {
-    match retention {
-        ProviderRawRetention::None => "none",
-        ProviderRawRetention::PathReference => "path_reference",
-        ProviderRawRetention::MetadataOnly => "metadata_only",
-        ProviderRawRetention::LocalBlob => "local_blob",
-        ProviderRawRetention::Withheld => "withheld",
     }
 }
 

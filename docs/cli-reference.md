@@ -307,7 +307,8 @@ citations, `suggested_next_commands`, JSON `query_plan`, `broadened_search`
 optimized for agent reading; use `--verbose` for expanded text diagnostics.
 
 Search pagination is the #195 paged slice of the broader #187 query extraction;
-status, sources, locate, and raw SQL are still command-specific. `--limit`
+status, sources, locate, and raw SQL use the same transport-neutral read-only
+query service for indexed projections and bounded SQL execution. `--limit`
 defaults to 20 and caps at 200. Each page replays the same fixed candidate pool
 with an internal maximum of 200 results and slices it stably; source scanning may
 truncate before that, so JSON distinguishes exact `pool_total` from

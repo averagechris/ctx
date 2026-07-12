@@ -371,6 +371,7 @@ pub struct EventSearchHit {
     pub record_title: Option<String>,
     pub record_kind: Option<String>,
     pub record_workspace: Option<String>,
+    pub tool_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -3984,6 +3985,7 @@ impl Store {
                     record_title: row.get(20)?,
                     record_kind: row.get(21)?,
                     record_workspace: row.get(22)?,
+                    tool_names: event_tool_names_from_payload(&payload_json),
                 })
             },
         )?;
@@ -4095,6 +4097,45 @@ impl Store {
         )?;
         Ok(())
     }
+}
+
+fn event_tool_names_from_payload(payload_json: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload_json) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    collect_tool_names(&value, &mut names);
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn collect_tool_names(value: &serde_json::Value, names: &mut Vec<String>) {
+    let Some(object) = value.as_object() else {
+        return;
+    };
+    for key in ["tool", "name", "executable", "command"] {
+        if let Some(text) = object.get(key).and_then(|value| value.as_str()) {
+            if let Some(name) = executable_name(text) {
+                names.push(name);
+            }
+        }
+    }
+    if let Some(body) = object.get("body") {
+        collect_tool_names(body, names);
+    }
+}
+
+fn executable_name(text: &str) -> Option<String> {
+    let first = text
+        .split_whitespace()
+        .next()?
+        .trim_matches(|c: char| c == '"' || c == '\'' || c == '`' || c == '[' || c == ']');
+    let name = std::path::Path::new(first)
+        .file_name()?
+        .to_str()?
+        .to_ascii_lowercase();
+    (!name.is_empty()).then_some(name)
 }
 
 fn configure_connection(conn: &Connection, busy_timeout: Duration) -> Result<()> {

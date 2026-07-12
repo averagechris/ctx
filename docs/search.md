@@ -105,6 +105,12 @@ Search filters narrow both human output and JSON:
 - `--event-type <event-type>`, one of `message`, `tool_call`, `tool_output`,
   `command_started`, `command_output`, `command_finished`, `file_touched`,
   `vcs_change`, `artifact`, `summary`, or `notice`;
+- `--role user|assistant|tool` and `--exclude-role user|assistant|tool`,
+  repeatable role filters when transcript metadata records roles;
+- `--exclude-tool-noise`, to remove tool invocations, tool output, and command
+  output from results while preserving message/event retrieval by default;
+- `--exclude-tool <name>`, to remove tool/command events whose structured tool
+  name or command executable is a name such as `ctx`;
 - `--file <path>`, indexed touched-file path metadata, not the current
   filesystem;
 - `--session <ctx-session-id-or-prefix>`;
@@ -139,6 +145,12 @@ history.
 The default searches primary-agent sessions so human intent and decisions stay
 prominent. Use `--include-subagents` when you want implementation details, code
 review notes, test output, or failure analysis from subagent sessions too.
+Equivalent user and assistant message matches rank ahead of incidental
+tool/command matches by default. Tool calls, tool output, and command events are
+still retrievable explicitly (for example with `--event-type tool_output` or
+`--events`), and `why_matched` explains the role, event type, source field, and
+any relevance penalty when metadata is available. JSON always includes
+`why_matched`; human output shows it with `--verbose`.
 
 `--limit` defaults to `20` and is capped at `200`.
 

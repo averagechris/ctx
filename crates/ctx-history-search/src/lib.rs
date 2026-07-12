@@ -82,6 +82,14 @@ pub struct SearchFilters {
     pub include_subagents: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_type: Option<EventType>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<ctx_history_core::EventRole>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_roles: Vec<ctx_history_core::EventRole>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exclude_tool_noise: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude_tool_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -206,6 +214,7 @@ struct RecordContext {
 #[derive(Debug, Clone)]
 struct SearchSection {
     reason: &'static str,
+    why_metadata: Vec<String>,
     weight: f32,
     text: String,
     citation: ContextCitation,
@@ -816,6 +825,9 @@ fn event_hit_matches_filters(
             return false;
         }
     }
+    if !role_matches(hit.role, filters) || event_hit_is_excluded_tool_noise(hit, filters) {
+        return false;
+    }
     if let Some(repo) = filters
         .repo
         .as_deref()
@@ -841,6 +853,38 @@ fn event_hit_matches_filters(
         }
     }
     true
+}
+
+fn role_matches(role: Option<ctx_history_core::EventRole>, filters: &SearchFilters) -> bool {
+    if !filters.roles.is_empty() && !role.is_some_and(|role| filters.roles.contains(&role)) {
+        return false;
+    }
+    if role.is_some_and(|role| filters.exclude_roles.contains(&role)) {
+        return false;
+    }
+    true
+}
+
+fn event_hit_is_excluded_tool_noise(hit: &EventSearchHit, filters: &SearchFilters) -> bool {
+    if filters.exclude_tool_noise
+        && matches!(
+            hit.event_type,
+            EventType::ToolCall
+                | EventType::ToolOutput
+                | EventType::CommandStarted
+                | EventType::CommandOutput
+                | EventType::CommandFinished
+        )
+    {
+        return true;
+    }
+    is_tool_or_command_event(hit.event_type)
+        && filters
+            .exclude_tool_name
+            .as_deref()
+            .map(normalized_tool_name)
+            .filter(|needle| !needle.is_empty())
+            .is_some_and(|needle| hit.tool_names.iter().any(|name| name == &needle))
 }
 
 fn event_hit_matches_excluded_provider_session(
@@ -982,12 +1026,13 @@ fn event_search_result(
         event_seq: Some(hit.seq),
         title: event_result_title(hit),
         snippet: matched_snippet(&hit.preview, plan, &terms, snippet_chars),
-        rank: (-hit.score as f32).max(0.0)
+        rank: ((-hit.score as f32).max(0.0)
             + if matches!(plan.mode, SearchMatchMode::Any) {
                 matched_token_count(&hit.preview, plan) as f32
             } else {
                 0.0
-            },
+            })
+            * event_relevance_penalty(hit),
         result_scope: SearchResultScope::Event,
         more_matches_in_session: 0,
         session_importance: 0.0,
@@ -1003,7 +1048,7 @@ fn event_search_result(
         raw_source_path: hit.raw_source_path.clone(),
         raw_source_exists,
         cursor: hit.cursor.clone(),
-        why_matched: vec![event_reason(hit.event_type).to_owned()],
+        why_matched: event_why_matched(hit),
         citations,
         links: ContextLinks::default(),
         visibility: Visibility::LocalOnly,
@@ -1064,6 +1109,66 @@ fn event_reason(event_type: EventType) -> &'static str {
         EventType::Artifact => "artifact",
         EventType::Summary => "summary",
         EventType::Notice => "notice",
+    }
+}
+
+fn event_why_matched(hit: &EventSearchHit) -> Vec<String> {
+    let mut why = vec![event_reason(hit.event_type).to_owned()];
+    why.extend(event_why_metadata(hit.event_type, hit.role));
+    why
+}
+
+fn event_why_metadata(
+    event_type: EventType,
+    role: Option<ctx_history_core::EventRole>,
+) -> Vec<String> {
+    let mut why = vec![
+        format!("event_type:{}", event_type.as_str()),
+        format!("source_field:{}", event_source_field(event_type)),
+    ];
+    if let Some(role) = role {
+        why.push(format!("role:{}", role.as_str()));
+    }
+    let penalty = event_relevance_penalty_for(event_type, role);
+    if penalty < 1.0 {
+        why.push(format!("relevance_penalty:{penalty:.2}"));
+    }
+    why
+}
+
+fn event_source_field(event_type: EventType) -> &'static str {
+    match event_type {
+        EventType::Message => "message.body",
+        EventType::ToolCall => "tool.arguments",
+        EventType::ToolOutput => "tool.output",
+        EventType::CommandStarted => "command",
+        EventType::CommandOutput => "command.output",
+        EventType::CommandFinished => "command.status",
+        _ => "payload",
+    }
+}
+
+fn event_relevance_penalty(hit: &EventSearchHit) -> f32 {
+    event_relevance_penalty_for(hit.event_type, hit.role)
+}
+
+fn event_relevance_penalty_for(
+    event_type: EventType,
+    role: Option<ctx_history_core::EventRole>,
+) -> f32 {
+    match event_type {
+        EventType::Message
+            if matches!(
+                role,
+                Some(ctx_history_core::EventRole::User | ctx_history_core::EventRole::Assistant)
+            ) =>
+        {
+            1.0
+        }
+        EventType::Message => 0.85,
+        EventType::ToolCall | EventType::ToolOutput => 0.55,
+        EventType::CommandStarted | EventType::CommandOutput | EventType::CommandFinished => 0.45,
+        _ => 0.75,
     }
 }
 
@@ -1455,6 +1560,9 @@ fn analyze_record(
                 section.citation,
                 &section.hit,
             );
+            for reason in section.why_metadata {
+                push_unique_why(&mut why, reason);
+            }
         }
     }
 
@@ -1499,11 +1607,14 @@ fn search_sections(
     filters: &SearchFilters,
 ) -> Vec<SearchSection> {
     let mut sections = Vec::new();
+    let event_evidence_only = filters.event_type.is_some() || !filters.roles.is_empty();
     let record_hit = record_context_display_hit(context, filters, record.updated_at);
-    let include_record_bookkeeping_text = !is_agent_history_bookkeeping_record(record);
+    let include_record_bookkeeping_text =
+        !event_evidence_only && !is_agent_history_bookkeeping_record(record);
     if include_record_bookkeeping_text {
         sections.push(SearchSection {
             reason: "title",
+            why_metadata: Vec::new(),
             weight: 8.0,
             text: record.title.clone(),
             citation: citation(
@@ -1521,6 +1632,7 @@ fn search_sections(
     if include_record_text {
         sections.push(SearchSection {
             reason: "primary_user_message",
+            why_metadata: Vec::new(),
             weight: 5.0,
             text: record.body.clone(),
             citation: citation(
@@ -1536,6 +1648,7 @@ fn search_sections(
         for tag in &record.tags {
             sections.push(SearchSection {
                 reason: "tag",
+                why_metadata: Vec::new(),
                 weight: 3.0,
                 text: tag.clone(),
                 citation: citation(
@@ -1549,6 +1662,9 @@ fn search_sections(
         }
     }
     for session in &context.sessions {
+        if event_evidence_only {
+            break;
+        }
         if !session_matches_agent_scope(session, filters)
             || !source_id_matches_history_source_filter(session.capture_source_id, context, filters)
         {
@@ -1557,6 +1673,7 @@ fn search_sections(
         let hit = session_hit(session, context);
         sections.push(SearchSection {
             reason: "session_metadata",
+            why_metadata: Vec::new(),
             weight: 2.5,
             text: joined([
                 session.provider.as_str(),
@@ -1577,12 +1694,16 @@ fn search_sections(
     }
 
     for run in &context.runs {
+        if event_evidence_only || run_is_excluded_tool_noise(run, filters) {
+            continue;
+        }
         if !item_matches_agent_scope(run.session_id, run.source_id, context, filters) {
             continue;
         }
         let hit = run_hit(run, context);
         sections.push(SearchSection {
             reason: "run_command",
+            why_metadata: Vec::new(),
             weight: if run.exit_code.unwrap_or(0) == 0 {
                 3.0
             } else {
@@ -1608,6 +1729,15 @@ fn search_sections(
         if !item_matches_agent_scope(event.session_id, event.capture_source_id, context, filters) {
             continue;
         }
+        if filters
+            .event_type
+            .is_some_and(|event_type| event.event_type != event_type)
+        {
+            continue;
+        }
+        if !role_matches(event.role, filters) || event_is_excluded_tool_noise(event, filters) {
+            continue;
+        }
         let event_text = event_text(event);
         let hit = event_hit(event, context);
         sections.push(SearchSection {
@@ -1620,6 +1750,7 @@ fn search_sections(
                 | ctx_history_core::EventType::CommandFinished => "command_event",
                 _ => "event",
             },
+            why_metadata: event_why_metadata(event.event_type, event.role),
             weight: event_weight(event),
             text: event_text,
             citation: citation(
@@ -1633,12 +1764,16 @@ fn search_sections(
     }
 
     for artifact in &context.artifacts {
+        if event_evidence_only {
+            break;
+        }
         if !item_matches_agent_scope(None, artifact.source_id, context, filters) {
             continue;
         }
         let hit = artifact_hit(artifact, context);
         sections.push(SearchSection {
             reason: "artifact",
+            why_metadata: Vec::new(),
             weight: 2.5,
             text: joined([
                 artifact.kind.as_str(),
@@ -1657,6 +1792,9 @@ fn search_sections(
     }
 
     for file in &context.files_touched {
+        if event_evidence_only {
+            break;
+        }
         let session_id = file.event_id.and_then(|id| {
             context
                 .events
@@ -1670,6 +1808,7 @@ fn search_sections(
         let hit = file_hit(file, context);
         sections.push(SearchSection {
             reason: "file_touched",
+            why_metadata: Vec::new(),
             weight: 3.0,
             text: file_touched_search_text(file),
             citation: citation(
@@ -1683,6 +1822,9 @@ fn search_sections(
     }
 
     for change in &context.vcs_changes {
+        if event_evidence_only {
+            break;
+        }
         if !item_matches_agent_scope(None, change.source_id, context, filters) {
             continue;
         }
@@ -1694,6 +1836,7 @@ fn search_sections(
         );
         sections.push(SearchSection {
             reason: "vcs_change",
+            why_metadata: Vec::new(),
             weight: 3.0,
             text: joined([
                 change.kind.as_str(),
@@ -1713,12 +1856,16 @@ fn search_sections(
     }
 
     for summary in &context.summaries {
+        if event_evidence_only {
+            break;
+        }
         if !item_matches_agent_scope(None, summary.source_id, context, filters) {
             continue;
         }
         let hit = source_hit(summary.source_id, summary.timestamps.updated_at, context);
         sections.push(SearchSection {
             reason: "summary",
+            why_metadata: Vec::new(),
             weight: 4.0,
             text: summary.text.clone(),
             citation: citation(
@@ -2265,14 +2412,102 @@ fn joined<const N: usize>(parts: [&str; N]) -> String {
 }
 
 fn event_weight(event: &Event) -> f32 {
-    match event.event_type {
+    let base = match event.event_type {
         ctx_history_core::EventType::Message => 4.0,
         ctx_history_core::EventType::ToolCall | ctx_history_core::EventType::ToolOutput => 3.5,
         ctx_history_core::EventType::CommandStarted
         | ctx_history_core::EventType::CommandOutput
         | ctx_history_core::EventType::CommandFinished => 3.0,
         _ => 2.0,
+    };
+    base * event_relevance_penalty_for(event.event_type, event.role)
+}
+
+fn event_is_excluded_tool_noise(event: &Event, filters: &SearchFilters) -> bool {
+    if filters.exclude_tool_noise
+        && matches!(
+            event.event_type,
+            EventType::ToolCall
+                | EventType::ToolOutput
+                | EventType::CommandStarted
+                | EventType::CommandOutput
+                | EventType::CommandFinished
+        )
+    {
+        return true;
     }
+    is_tool_or_command_event(event.event_type)
+        && filters
+            .exclude_tool_name
+            .as_deref()
+            .map(normalized_tool_name)
+            .filter(|needle| !needle.is_empty())
+            .is_some_and(|needle| event_tool_names(event).iter().any(|name| name == &needle))
+}
+
+fn run_is_excluded_tool_noise(run: &Run, filters: &SearchFilters) -> bool {
+    if filters.exclude_tool_noise {
+        return true;
+    }
+    filters
+        .exclude_tool_name
+        .as_deref()
+        .map(normalized_tool_name)
+        .filter(|needle| !needle.is_empty())
+        .is_some_and(|needle| {
+            run.command_preview
+                .as_deref()
+                .and_then(executable_name)
+                .is_some_and(|name| name == needle)
+        })
+}
+
+fn is_tool_or_command_event(event_type: EventType) -> bool {
+    matches!(
+        event_type,
+        EventType::ToolCall
+            | EventType::ToolOutput
+            | EventType::CommandStarted
+            | EventType::CommandOutput
+            | EventType::CommandFinished
+    )
+}
+
+fn event_tool_names(event: &Event) -> Vec<String> {
+    let mut names = Vec::new();
+    collect_tool_names(&event.payload, &mut names);
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn collect_tool_names(value: &serde_json::Value, names: &mut Vec<String>) {
+    let Some(object) = value.as_object() else {
+        return;
+    };
+    for key in ["tool", "name", "executable", "command"] {
+        if let Some(text) = object.get(key).and_then(|value| value.as_str()) {
+            if let Some(name) = executable_name(text) {
+                names.push(name);
+            }
+        }
+    }
+    if let Some(body) = object.get("body") {
+        collect_tool_names(body, names);
+    }
+}
+
+fn executable_name(text: &str) -> Option<String> {
+    let first = text
+        .split_whitespace()
+        .next()?
+        .trim_matches(|c: char| c == '"' || c == '\'' || c == '`' || c == '[' || c == ']');
+    let name = Path::new(first).file_name()?.to_str()?.to_ascii_lowercase();
+    (!name.is_empty()).then_some(name)
+}
+
+fn normalized_tool_name(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
 }
 
 fn event_text(event: &Event) -> String {
@@ -2406,6 +2641,13 @@ fn has_filters(filters: &SearchFilters) -> bool {
         || filters.primary_only
         || !filters.include_subagents
         || filters.event_type.is_some()
+        || !filters.roles.is_empty()
+        || !filters.exclude_roles.is_empty()
+        || filters.exclude_tool_noise
+        || filters
+            .exclude_tool_name
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty())
         || filters
             .file
             .as_ref()
@@ -2509,10 +2751,19 @@ fn record_matches_filters(
         if !context
             .events
             .iter()
-            .any(|event| event.event_type == event_type)
+            .any(|event| event.event_type == event_type && role_matches(event.role, filters))
         {
             return false;
         }
+    }
+    if filters.event_type.is_none()
+        && !filters.roles.is_empty()
+        && !context
+            .events
+            .iter()
+            .any(|event| role_matches(event.role, filters))
+    {
+        return false;
     }
 
     if let Some(repo) = filters
@@ -2969,6 +3220,514 @@ mod tests {
     }
 
     #[test]
+    fn role_and_tool_noise_filters_penalize_incidental_tool_matches() {
+        let (_temp, store) = test_store();
+        let record = HistoryRecord::new(
+            "role noise corpus",
+            "indexed role noise corpus",
+            Vec::new(),
+            "agent_history",
+            Some("/workspace/role-noise".into()),
+        );
+        store.insert_record(&record).unwrap();
+        let mut source_record = HistoryRecord::new(
+            "source_only_token.rs",
+            "fn source_code_fixture() { let source_only_token = \"zephyr-token\"; }",
+            Vec::new(),
+            "source_code",
+            Some("/workspace/role-noise/src".into()),
+        );
+        source_record.id = Uuid::parse_str("018f45d0-0000-7000-8000-000000009210").unwrap();
+        store.insert_record(&source_record).unwrap();
+        let session = Session {
+            id: Uuid::parse_str("018f45d0-0000-7000-8000-000000009193").unwrap(),
+            history_record_id: Some(record.id),
+            parent_session_id: None,
+            root_session_id: None,
+            capture_source_id: None,
+            provider: CaptureProvider::Codex,
+            external_session_id: Some("role-noise".into()),
+            external_agent_id: None,
+            agent_type: AgentType::Primary,
+            role_hint: Some("primary".into()),
+            is_primary: true,
+            status: SessionStatus::Imported,
+            transcript_blob_id: None,
+            started_at: fixed_time(),
+            ended_at: None,
+            timestamps: timestamps(),
+            sync: sync_metadata(),
+        };
+        store.upsert_session(&session).unwrap();
+        let run = Run {
+            id: Uuid::parse_str("018f45d0-0000-7000-8000-000000009206").unwrap(),
+            history_record_id: Some(record.id),
+            session_id: Some(session.id),
+            run_type: RunType::Command,
+            status: RunStatus::Succeeded,
+            started_at: fixed_time(),
+            ended_at: Some(fixed_time()),
+            exit_code: Some(0),
+            cwd: Some("/workspace/role-noise".into()),
+            command_preview: Some("ctx search zephyr-token".into()),
+            input_blob_id: None,
+            output_blob_id: None,
+            timestamps: timestamps(),
+            source_id: None,
+            sync: sync_metadata(),
+        };
+        store.upsert_run(&run).unwrap();
+        let artifact = Artifact {
+            id: Uuid::parse_str("018f45d0-0000-7000-8000-000000009207").unwrap(),
+            kind: ArtifactKind::Markdown,
+            blob_hash: "hash-role-noise-source".into(),
+            blob_path: "objects/role-noise-source".into(),
+            byte_size: 64,
+            media_type: Some("text/rust".into()),
+            preview_text: Some(
+                "fn source_code_fixture() { let source_only_token = \"zephyr-token\"; }".into(),
+            ),
+            redaction_state: RedactionState::SafePreview,
+            timestamps: timestamps(),
+            source_id: None,
+            sync: sync_metadata(),
+        };
+        store.upsert_artifact(&artifact).unwrap();
+        store
+            .upsert_history_record_link(&HistoryRecordLink {
+                id: Uuid::parse_str("018f45d0-0000-7000-8000-000000009208").unwrap(),
+                history_record_id: record.id,
+                target_type: HistoryRecordLinkTargetType::Artifact,
+                target_id: artifact.id,
+                link_type: HistoryRecordLinkType::References,
+                confidence: Confidence::Explicit,
+                source_id: None,
+                timestamps: timestamps(),
+                sync: sync_metadata(),
+            })
+            .unwrap();
+        store
+            .upsert_file_touched(&FileTouched {
+                id: Uuid::parse_str("018f45d0-0000-7000-8000-000000009209").unwrap(),
+                history_record_id: Some(record.id),
+                run_id: None,
+                event_id: None,
+                vcs_workspace_id: None,
+                path: "src/source_only_token.rs".into(),
+                old_path: None,
+                change_kind: Some(FileChangeKind::Modified),
+                line_count_delta: Some(1),
+                confidence: Confidence::Explicit,
+                timestamps: timestamps(),
+                source_id: None,
+                sync: sync_metadata(),
+            })
+            .unwrap();
+        let rows = [
+            (
+                "018f45d0-0000-7000-8000-000000009201",
+                EventType::Message,
+                Some(EventRole::User),
+                serde_json::json!({"body":{"text":"Decided to use zephyr-token for rollout"}}),
+            ),
+            (
+                "018f45d0-0000-7000-8000-000000009202",
+                EventType::Message,
+                Some(EventRole::Assistant),
+                serde_json::json!({"body":{"text":"We will keep zephyr-token in the implementation plan"}}),
+            ),
+            (
+                "018f45d0-0000-7000-8000-000000009203",
+                EventType::CommandStarted,
+                Some(EventRole::Tool),
+                serde_json::json!({"command":"ctx search zephyr-token"}),
+            ),
+            (
+                "018f45d0-0000-7000-8000-000000009204",
+                EventType::CommandOutput,
+                Some(EventRole::Tool),
+                serde_json::json!({"output":"ctx result zephyr-token unrelated source shared token"}),
+            ),
+            (
+                "018f45d0-0000-7000-8000-000000009205",
+                EventType::ToolOutput,
+                Some(EventRole::Tool),
+                serde_json::json!({"tool":"shell","output":"unrelated source has zephyr-token"}),
+            ),
+        ];
+        for (seq, (id, event_type, role, payload)) in rows.into_iter().enumerate() {
+            store
+                .upsert_event(&Event {
+                    id: Uuid::parse_str(id).unwrap(),
+                    seq: seq as u64,
+                    history_record_id: Some(record.id),
+                    session_id: Some(session.id),
+                    run_id: None,
+                    event_type,
+                    role,
+                    occurred_at: fixed_time() + chrono::Duration::milliseconds(seq as i64),
+                    capture_source_id: None,
+                    payload,
+                    payload_blob_id: None,
+                    dedupe_key: None,
+                    redaction_state: RedactionState::SafePreview,
+                    sync: sync_metadata(),
+                })
+                .unwrap();
+        }
+        store.refresh_search_index().unwrap();
+        assert_role_noise_packet(&store, source_record.id);
+
+        for seq in 5..1030_u64 {
+            let mut bytes = *session.id.as_bytes();
+            bytes[10] = ((seq >> 8) & 0xff) as u8;
+            bytes[11] = (seq & 0xff) as u8;
+            store
+                .upsert_event(&Event {
+                    id: Uuid::from_bytes(bytes),
+                    seq,
+                    history_record_id: Some(record.id),
+                    session_id: Some(session.id),
+                    run_id: None,
+                    event_type: EventType::Message,
+                    role: Some(EventRole::Assistant),
+                    occurred_at: fixed_time() + chrono::Duration::milliseconds(seq as i64),
+                    capture_source_id: None,
+                    payload: serde_json::json!({"body":{"text":"filler without target token"}}),
+                    payload_blob_id: None,
+                    dedupe_key: None,
+                    redaction_state: RedactionState::SafePreview,
+                    sync: sync_metadata(),
+                })
+                .unwrap();
+        }
+        store.refresh_search_index().unwrap();
+        assert_role_noise_packet(&store, source_record.id);
+    }
+
+    fn assert_role_noise_packet(store: &Store, source_record_id: Uuid) {
+        let packet = search_packet(
+            store,
+            "zephyr-token",
+            &PacketOptions {
+                limit: 5,
+                result_mode: SearchResultMode::Events,
+                ..PacketOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            packet.results[0].event_id,
+            Some(Uuid::parse_str("018f45d0-0000-7000-8000-000000009201").unwrap())
+        );
+        assert!(packet.results[0]
+            .why_matched
+            .iter()
+            .any(|why| why.contains("role:user")));
+        assert!(packet.results.iter().any(|result| result
+            .why_matched
+            .iter()
+            .any(|why| why.contains("relevance_penalty:"))));
+
+        let users = search_packet(
+            store,
+            "zephyr-token",
+            &PacketOptions {
+                limit: 5,
+                result_mode: SearchResultMode::Events,
+                filters: SearchFilters {
+                    roles: vec![EventRole::User],
+                    ..SearchFilters::default()
+                },
+                ..PacketOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(users.results.len(), 1);
+
+        let no_tools = search_packet(
+            store,
+            "zephyr-token",
+            &PacketOptions {
+                limit: 5,
+                result_mode: SearchResultMode::Events,
+                filters: SearchFilters {
+                    exclude_tool_noise: true,
+                    ..SearchFilters::default()
+                },
+                ..PacketOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(no_tools.results.iter().all(|result| result
+            .why_matched
+            .iter()
+            .all(|why| !why.contains("relevance_penalty:"))));
+
+        let no_ctx = search_packet(
+            store,
+            "zephyr-token",
+            &PacketOptions {
+                limit: 5,
+                result_mode: SearchResultMode::Events,
+                filters: SearchFilters {
+                    exclude_tool_name: Some("ctx".into()),
+                    ..SearchFilters::default()
+                },
+                ..PacketOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(no_ctx.results.iter().all(|result| result.event_id
+            != Some(Uuid::parse_str("018f45d0-0000-7000-8000-000000009203").unwrap())));
+
+        assert!(no_ctx.results.iter().any(|result| result.event_id
+            == Some(Uuid::parse_str("018f45d0-0000-7000-8000-000000009201").unwrap())));
+
+        let default_packet = search_packet(
+            store,
+            "zephyr-token",
+            &PacketOptions {
+                limit: 5,
+                result_mode: SearchResultMode::Sessions,
+                ..PacketOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(default_packet.results[0]
+            .why_matched
+            .iter()
+            .any(|why| why.contains("role:user") || why.contains("role:assistant")));
+
+        let source_packet = search_packet(
+            store,
+            "source_only_token",
+            &PacketOptions {
+                limit: 5,
+                result_mode: SearchResultMode::Sessions,
+                ..PacketOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(source_packet
+            .results
+            .iter()
+            .any(|result| result.record_id == source_record_id));
+
+        let no_ctx_session = search_packet(
+            store,
+            "zephyr-token",
+            &PacketOptions {
+                limit: 5,
+                result_mode: SearchResultMode::Sessions,
+                filters: SearchFilters {
+                    exclude_tool_name: Some("ctx".into()),
+                    ..SearchFilters::default()
+                },
+                ..PacketOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(no_ctx_session
+            .results
+            .iter()
+            .all(|result| !result.why_matched.iter().any(|why| why == "run_command")));
+    }
+
+    #[test]
+    fn fast_role_filter_pages_past_many_excluded_fts_hits() {
+        let (_temp, store) = test_store();
+        let record = HistoryRecord::new(
+            "role paging corpus",
+            "indexed role paging corpus",
+            Vec::new(),
+            "agent_history",
+            Some("/workspace/role-paging".into()),
+        );
+        store.insert_record(&record).unwrap();
+        let session = Session {
+            id: Uuid::parse_str("018f45d0-0000-7000-8000-000000009300").unwrap(),
+            history_record_id: Some(record.id),
+            parent_session_id: None,
+            root_session_id: None,
+            capture_source_id: None,
+            provider: CaptureProvider::Codex,
+            external_session_id: Some("role-paging".into()),
+            external_agent_id: None,
+            agent_type: AgentType::Primary,
+            role_hint: Some("primary".into()),
+            is_primary: true,
+            status: SessionStatus::Imported,
+            transcript_blob_id: None,
+            started_at: fixed_time(),
+            ended_at: None,
+            timestamps: timestamps(),
+            sync: sync_metadata(),
+        };
+        store.upsert_session(&session).unwrap();
+        for seq in 0..1100_u64 {
+            let event_id =
+                Uuid::parse_str(&format!("018f45d0-0000-7000-8000-0000001{seq:05x}")).unwrap();
+            store
+                .upsert_event(&Event {
+                    id: event_id,
+                    seq,
+                    history_record_id: Some(record.id),
+                    session_id: Some(session.id),
+                    run_id: None,
+                    event_type: EventType::CommandOutput,
+                    role: Some(EventRole::Tool),
+                    occurred_at: fixed_time() + chrono::Duration::milliseconds(seq as i64 + 10),
+                    capture_source_id: None,
+                    payload: serde_json::json!({"output":"late-token noisy command output"}),
+                    payload_blob_id: None,
+                    dedupe_key: None,
+                    redaction_state: RedactionState::SafePreview,
+                    sync: sync_metadata(),
+                })
+                .unwrap();
+        }
+        let user_id = Uuid::parse_str("018f45d0-0000-7000-8000-0000000093ff").unwrap();
+        store
+            .upsert_event(&Event {
+                id: user_id,
+                seq: 1200,
+                history_record_id: Some(record.id),
+                session_id: Some(session.id),
+                run_id: None,
+                event_type: EventType::Message,
+                role: Some(EventRole::User),
+                occurred_at: fixed_time(),
+                capture_source_id: None,
+                payload: serde_json::json!({"body":{"text":"late-token human decision"}}),
+                payload_blob_id: None,
+                dedupe_key: None,
+                redaction_state: RedactionState::SafePreview,
+                sync: sync_metadata(),
+            })
+            .unwrap();
+        store.refresh_search_index().unwrap();
+
+        let packet = search_packet(
+            &store,
+            "late-token",
+            &PacketOptions {
+                limit: 1,
+                result_mode: SearchResultMode::Events,
+                filters: SearchFilters {
+                    roles: vec![EventRole::User],
+                    ..SearchFilters::default()
+                },
+                ..PacketOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(packet.results[0].event_id, Some(user_id));
+    }
+
+    #[test]
+    fn rich_role_and_event_type_filters_only_score_matching_event_evidence() {
+        let (_temp, store) = test_store();
+        let mut wrong = HistoryRecord::new(
+            "mixed-token misleading title",
+            "mixed-token misleading body",
+            Vec::new(),
+            "agent_history",
+            Some("/workspace/mixed".into()),
+        );
+        wrong.id = Uuid::parse_str("018f45d0-0000-7000-8000-000000009401").unwrap();
+        store.insert_record(&wrong).unwrap();
+        let mut right = HistoryRecord::new(
+            "right record",
+            "right body",
+            Vec::new(),
+            "agent_history",
+            Some("/workspace/mixed".into()),
+        );
+        right.id = Uuid::parse_str("018f45d0-0000-7000-8000-000000009402").unwrap();
+        store.insert_record(&right).unwrap();
+        for (record, sid, eid, role, text, seq) in [
+            (
+                &wrong,
+                "018f45d0-0000-7000-8000-000000009411",
+                "018f45d0-0000-7000-8000-000000009421",
+                EventRole::Assistant,
+                "mixed-token assistant only",
+                1_u64,
+            ),
+            (
+                &right,
+                "018f45d0-0000-7000-8000-000000009412",
+                "018f45d0-0000-7000-8000-000000009422",
+                EventRole::User,
+                "mixed-token user decision",
+                2_u64,
+            ),
+        ] {
+            let session = Session {
+                id: Uuid::parse_str(sid).unwrap(),
+                history_record_id: Some(record.id),
+                parent_session_id: None,
+                root_session_id: None,
+                capture_source_id: None,
+                provider: CaptureProvider::Codex,
+                external_session_id: Some(sid.into()),
+                external_agent_id: None,
+                agent_type: AgentType::Primary,
+                role_hint: Some("primary".into()),
+                is_primary: true,
+                status: SessionStatus::Imported,
+                transcript_blob_id: None,
+                started_at: fixed_time(),
+                ended_at: None,
+                timestamps: timestamps(),
+                sync: sync_metadata(),
+            };
+            store.upsert_session(&session).unwrap();
+            store
+                .upsert_event(&Event {
+                    id: Uuid::parse_str(eid).unwrap(),
+                    seq,
+                    history_record_id: Some(record.id),
+                    session_id: Some(session.id),
+                    run_id: None,
+                    event_type: EventType::Message,
+                    role: Some(role),
+                    occurred_at: fixed_time(),
+                    capture_source_id: None,
+                    payload: serde_json::json!({"body":{"text":text}}),
+                    payload_blob_id: None,
+                    dedupe_key: None,
+                    redaction_state: RedactionState::SafePreview,
+                    sync: sync_metadata(),
+                })
+                .unwrap();
+        }
+        store.refresh_search_index().unwrap();
+        let packet = search_packet(
+            &store,
+            "mixed-token",
+            &PacketOptions {
+                limit: 5,
+                result_mode: SearchResultMode::Events,
+                filters: SearchFilters {
+                    roles: vec![EventRole::User],
+                    event_type: Some(EventType::Message),
+                    repo: Some("mixed".into()),
+                    ..SearchFilters::default()
+                },
+                ..PacketOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(packet.results.len(), 1, "{packet:#?}");
+        assert!(packet.results[0]
+            .why_matched
+            .iter()
+            .any(|why| why == "role:user"));
+    }
+
+    #[test]
     fn match_modes_are_semantically_identical_below_at_and_above_fast_threshold() {
         let mut baselines: Option<Vec<(String, SearchMatchMode, Vec<Uuid>)>> = None;
         for count in [
@@ -3183,6 +3942,7 @@ mod tests {
             record_title: None,
             record_kind: None,
             record_workspace: None,
+            tool_names: Vec::new(),
         };
         assert!(event_hit_matches_excluded_provider_session(
             &event_hit, &filters
@@ -3239,6 +3999,7 @@ mod tests {
             record_title: None,
             record_kind: None,
             record_workspace: None,
+            tool_names: Vec::new(),
         };
         assert!(event_hit_matches_excluded_provider_session(
             &root_event_hit,
@@ -3747,7 +4508,8 @@ mod tests {
             result.snippet,
             "large-fast-event-needle from one transcript"
         );
-        assert_eq!(result.why_matched, vec!["message"]);
+        assert!(result.why_matched.iter().any(|why| why == "message"));
+        assert!(result.why_matched.iter().any(|why| why == "role:assistant"));
         assert!(result.citations.iter().any(|citation| {
             citation.citation_type == ContextCitationType::Event
                 && citation.id == target_event_id

@@ -92,6 +92,39 @@ fn import_match_fixture(temp: &TempDir) {
     ]));
 }
 
+fn write_role_noise_fixture(temp: &TempDir) -> String {
+    let path = temp.path().join("role-noise.jsonl");
+    fs::write(
+        &path,
+        [
+            r#"{"record_type":"manifest","schema_version":"ctx-history-jsonl-v1"}"#,
+            r#"{"record_type":"source","source_id":"role-source","provider_key":"role-agent","source_format":"role-jsonl","raw_source_path":"/tmp/role.jsonl","fingerprint":"sha256:role","observed_at":"2026-06-23T12:00:10Z"}"#,
+            r#"{"record_type":"session","source_id":"role-source","session_id":"role-session","native_session_id":"native-role-session","cwd":"/workspace/role","started_at":"2026-06-23T12:00:00Z","agent_type":"primary","role_hint":"developer","is_primary":true,"status":"completed"}"#,
+            r#"{"record_type":"event","source_id":"role-source","session_id":"role-session","event_index":0,"event_id":"role-user","native_cursor":"line:1","event_type":"message","role":"user","occurred_at":"2026-06-23T12:00:01Z","payload":{"text":"Human decision keeps ctx around role-token"},"preview":"Human decision keeps ctx around role-token"}"#,
+            r#"{"record_type":"event","source_id":"role-source","session_id":"role-session","event_index":1,"event_id":"role-assistant","native_cursor":"line:2","event_type":"message","role":"assistant","occurred_at":"2026-06-23T12:00:02Z","payload":{"text":"Assistant confirms role-token"},"preview":"Assistant confirms role-token"}"#,
+            r#"{"record_type":"event","source_id":"role-source","session_id":"role-session","event_index":2,"event_id":"role-ctx-command","native_cursor":"line:3","event_type":"command_started","role":"tool","occurred_at":"2026-06-23T12:00:03Z","payload":{"command":"ctx search role-token"},"preview":"ctx search role-token"}"#,
+            r#"{"record_type":"event","source_id":"role-source","session_id":"role-session","event_index":3,"event_id":"role-tool-output","native_cursor":"line:4","event_type":"tool_output","role":"tool","occurred_at":"2026-06-23T12:00:04Z","payload":{"tool":"shell","output":"role-token from shell output"},"preview":"role-token from shell output"}"#,
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+    path.display().to_string()
+}
+
+fn import_role_noise_fixture(temp: &TempDir) {
+    let fixture = write_role_noise_fixture(temp);
+    json_output(ctx(temp).args([
+        "import",
+        "--format",
+        "ctx-history-jsonl-v1",
+        "--path",
+        &fixture,
+        "--json",
+        "--progress",
+        "none",
+    ]));
+}
+
 #[derive(Debug)]
 struct HistorySourcePluginFixture {
     manifest_dir: PathBuf,
@@ -1253,6 +1286,127 @@ fn search_match_modes_terms_json_and_no_result_suggestion_are_explicit() {
         "{human}"
     );
     assert!(human.contains("no results for"), "{human}");
+}
+
+#[test]
+fn search_role_tool_filters_explain_json_and_verbose_human_matches() {
+    let temp = tempdir();
+    import_role_noise_fixture(&temp);
+
+    let json = json_output(ctx(&temp).args([
+        "search",
+        "role-token",
+        "--events",
+        "--refresh",
+        "off",
+        "--json",
+    ]));
+    let first_why = json["results"][0]["why_matched"].as_array().unwrap();
+    assert!(first_why.iter().any(|why| why == "role:user"));
+    assert!(first_why.iter().any(|why| why == "event_type:message"));
+    assert!(first_why
+        .iter()
+        .any(|why| why == "source_field:message.body"));
+    assert!(json["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|result| result["why_matched"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|why| why.as_str().unwrap_or("").starts_with("relevance_penalty:"))));
+
+    let users = json_output(ctx(&temp).args([
+        "search",
+        "role-token",
+        "--events",
+        "--refresh",
+        "off",
+        "--role",
+        "user",
+        "--json",
+    ]));
+    assert_eq!(users["results"].as_array().unwrap().len(), 1, "{users:#}");
+
+    let no_tools = json_output(ctx(&temp).args([
+        "search",
+        "role-token",
+        "--events",
+        "--refresh",
+        "off",
+        "--exclude-tool-noise",
+        "--json",
+    ]));
+    assert!(no_tools["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|result| result["why_matched"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|why| matches!(why.as_str(), Some("role:user" | "role:assistant")))));
+
+    let no_ctx = json_output(ctx(&temp).args([
+        "search",
+        "role-token",
+        "--events",
+        "--refresh",
+        "off",
+        "--exclude-tool",
+        "ctx",
+        "--json",
+    ]));
+    let snippets = no_ctx["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|result| result["snippet"].as_str().unwrap_or(""))
+        .collect::<Vec<_>>();
+    assert!(snippets
+        .iter()
+        .any(|snippet| snippet.contains("Human decision keeps ctx")));
+    assert!(snippets
+        .iter()
+        .all(|snippet| !snippet.contains("ctx search role-token")));
+
+    let (stdout, _) = success_output(ctx(&temp).args([
+        "search",
+        "role-token",
+        "--events",
+        "--refresh",
+        "off",
+        "--verbose",
+    ]));
+    assert!(stdout.contains("why_matched:"), "{stdout}");
+    assert!(stdout.contains("role:user"), "{stdout}");
+    assert!(stdout.contains("source_field:message.body"), "{stdout}");
+
+    ctx(&temp)
+        .args([
+            "search",
+            "role-token",
+            "--role",
+            "bogus",
+            "--refresh",
+            "off",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--role"));
+    ctx(&temp)
+        .args([
+            "search",
+            "role-token",
+            "--exclude-tool",
+            "",
+            "--refresh",
+            "off",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--exclude-tool cannot be empty"));
 }
 
 #[test]

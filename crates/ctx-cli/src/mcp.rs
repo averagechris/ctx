@@ -7,6 +7,10 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Subcommand};
 use ctx_history_core::{database_path, CtxIdPrefix, EventType, SearchMatchMode};
+use ctx_history_query::{
+    BytePolicy, FieldSet, QueryService, TranscriptMode as QueryTranscriptMode, DEFAULT_ITEM_BYTES,
+    DEFAULT_PAGE_BYTES, MAX_ITEM_BYTES, MAX_PAGE_BYTES, MAX_SHOW_LIMIT,
+};
 use ctx_history_store::{
     IdPrefixResolution, RawSqlOptions, Store, RAW_SQL_DEFAULT_MAX_COLUMNS,
     RAW_SQL_DEFAULT_MAX_ROWS, RAW_SQL_DEFAULT_MAX_SQL_BYTES, RAW_SQL_DEFAULT_MAX_VALUE_BYTES,
@@ -17,11 +21,13 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::{
-    compact_json, config::CONFIG_FILE, discovered_plugin_sources_json, discovered_sources,
-    event_window, event_window_json, mark_share_safe, raw_sql_result_json, search_filters,
-    search_has_intent, session_transcript_json, sources_json, storage_status, OutputFormat,
-    ProviderArg, RefreshArg, SearchDto, SearchFilterInput, SearchIntentInput, SearchRefreshReport,
-    SourceIdentityFilterArgs, TranscriptMode, MAX_SEARCH_LIMIT,
+    command_from_argv, compact_json, config::CONFIG_FILE, discovered_plugin_sources_json,
+    discovered_sources, event_page_json, event_window, event_window_json, mark_share_safe,
+    raw_sql_result_json, search_filters, search_has_intent, search_next_argv, search_page_json,
+    show_session_next_argv, sources_json, storage_status, FieldArg, OutputFormat, ProviderArg,
+    RefreshArg, SearchArgs, SearchFilterInput, SearchIntentInput, SearchMatchArg,
+    SearchRefreshReport, ShowSessionArgs, SourceIdentityFilterArgs, TranscriptMode,
+    MAX_SEARCH_LIMIT,
 };
 
 const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
@@ -206,6 +212,7 @@ fn handle_tools_call(params: Value, data_root: &Path) -> Result<Value, Value> {
                 &arguments,
                 &[
                     "query",
+                    "terms",
                     "limit",
                     "provider",
                     "history_source",
@@ -217,11 +224,19 @@ fn handle_tools_call(params: Value, data_root: &Path) -> Result<Value, Value> {
                     "primary_only",
                     "include_subagents",
                     "event_type",
+                    "roles",
+                    "exclude_roles",
+                    "exclude_tool_noise",
+                    "exclude_tool_name",
                     "file",
                     "session",
                     "events",
                     "include_current_session",
                     "match",
+                    "continue",
+                    "fields",
+                    "max_snippet_bytes",
+                    "max_page_bytes",
                 ],
             )?;
             tool_search(&arguments, data_root)
@@ -241,7 +256,18 @@ fn handle_tools_call(params: Value, data_root: &Path) -> Result<Value, Value> {
             tool_sql(&arguments, data_root)
         }
         "show_session" => {
-            validate_argument_keys(&arguments, &["ctx_session_id", "mode"])?;
+            validate_argument_keys(
+                &arguments,
+                &[
+                    "ctx_session_id",
+                    "mode",
+                    "limit",
+                    "continue",
+                    "fields",
+                    "max_event_bytes",
+                    "max_page_bytes",
+                ],
+            )?;
             tool_show_session(&arguments, data_root)
         }
         "show_event" => {
@@ -282,7 +308,9 @@ fn tool_sources(data_root: &Path) -> Result<Value> {
 }
 
 fn tool_search(arguments: &Value, data_root: &Path) -> Result<Value> {
-    let query = optional_string(arguments, "query")?.unwrap_or_default();
+    let query_input = optional_string(arguments, "query")?;
+    let query = query_input.clone().unwrap_or_default();
+    let terms = optional_string_array(arguments, "terms")?.unwrap_or_default();
     let limit = optional_usize(arguments, "limit")?.unwrap_or(20);
     if !(1..=MAX_SEARCH_LIMIT).contains(&limit) {
         return Err(anyhow!("limit must be between 1 and {MAX_SEARCH_LIMIT}"));
@@ -298,10 +326,14 @@ fn tool_search(arguments: &Value, data_root: &Path) -> Result<Value> {
     let primary_only = optional_bool(arguments, "primary_only")?.unwrap_or(false);
     let include_subagents = optional_bool(arguments, "include_subagents")?.unwrap_or(false);
     let event_type = optional_string(arguments, "event_type")?;
+    let roles = optional_string_array(arguments, "roles")?.unwrap_or_default();
+    let exclude_roles = optional_string_array(arguments, "exclude_roles")?.unwrap_or_default();
+    let exclude_tool_noise = optional_bool(arguments, "exclude_tool_noise")?.unwrap_or(false);
+    let exclude_tool_name = optional_string(arguments, "exclude_tool_name")?;
     let file = optional_string(arguments, "file")?.map(PathBuf::from);
     if !search_has_intent(SearchIntentInput {
         query: Some(&query),
-        terms: &[],
+        terms: &terms,
         file: file.as_deref(),
     }) {
         return Err(anyhow!("search needs a query or file"));
@@ -310,38 +342,48 @@ fn tool_search(arguments: &Value, data_root: &Path) -> Result<Value> {
     let events = optional_bool(arguments, "events")?.unwrap_or(false) || session.is_some();
     let include_current_session =
         optional_bool(arguments, "include_current_session")?.unwrap_or(false);
-    let match_mode = match optional_string(arguments, "match")?
-        .as_deref()
-        .unwrap_or("all")
-    {
-        "all" => SearchMatchMode::All,
-        "any" => SearchMatchMode::Any,
-        "phrase" => SearchMatchMode::Phrase,
+    let match_name = optional_string(arguments, "match")?;
+    let match_name = match_name.as_deref().unwrap_or("all");
+    let (match_mode, match_arg) = match match_name {
+        "all" => (SearchMatchMode::All, SearchMatchArg::All),
+        "any" => (SearchMatchMode::Any, SearchMatchArg::Any),
+        "phrase" => (SearchMatchMode::Phrase, SearchMatchArg::Phrase),
         _ => return Err(anyhow!("match must be one of all, any, phrase")),
     };
+    let (fields, fields_arg) =
+        optional_fields(arguments, "fields")?.unwrap_or((FieldSet::Full, FieldArg::Full));
+    let max_snippet_bytes =
+        optional_usize(arguments, "max_snippet_bytes")?.unwrap_or(DEFAULT_ITEM_BYTES);
+    let max_page_bytes = optional_usize(arguments, "max_page_bytes")?.unwrap_or(DEFAULT_PAGE_BYTES);
+    let byte_policy = BytePolicy {
+        per_item_bytes: max_snippet_bytes,
+        page_bytes: max_page_bytes,
+    }
+    .validate()?;
+    let continuation = optional_string(arguments, "continue")?;
 
     let options = ctx_history_search::PacketOptions {
         limit,
         filters: search_filters(
             SearchFilterInput {
-                session,
+                session: session.clone(),
                 provider,
                 source_identity: SourceIdentityFilterArgs {
-                    history_source,
-                    provider_key,
-                    source_id,
-                    source_format,
+                    history_source: history_source.clone(),
+                    provider_key: provider_key.clone(),
+                    source_id: source_id.clone(),
+                    source_format: source_format.clone(),
                 },
-                workspace,
-                since,
+                workspace: workspace.clone(),
+                since: since.clone(),
                 primary_only,
                 include_subagents,
-                event_type,
-                role: Vec::new(),
-                exclude_role: Vec::new(),
-                exclude_tool_noise: false,
-                exclude_tool_name: None,
-                file,
+                event_type: event_type.clone(),
+                role: roles.clone(),
+                exclude_role: exclude_roles.clone(),
+                exclude_tool_noise,
+                exclude_tool_name: exclude_tool_name.clone(),
+                file: file.clone(),
                 include_current_session,
             },
             Some(&store),
@@ -354,10 +396,66 @@ fn tool_search(arguments: &Value, data_root: &Path) -> Result<Value> {
         match_mode,
         ..ctx_history_search::PacketOptions::default()
     };
-    let packet = ctx_history_search::search_packet(&store, &query, &options)?;
-    let refresh = SearchRefreshReport::skipped(RefreshArg::Off, "skipped");
-    let mut value = SearchDto::packet(&store, &packet, &refresh, Some(&query), Value::Null);
-    mark_share_safe(&mut value);
+    let canonical_since = options.filters.since.map(|value| value.to_rfc3339());
+    let page = QueryService::new(&store).search(
+        &query,
+        &terms,
+        options,
+        continuation.as_deref(),
+        fields,
+        byte_policy,
+    )?;
+    let cli_args = SearchArgs {
+        query: query_input,
+        term: terms,
+        r#match: match_arg,
+        limit,
+        provider,
+        history_source,
+        provider_key,
+        source_id,
+        source_format,
+        workspace,
+        since: canonical_since,
+        primary_only,
+        include_subagents,
+        event_type,
+        role: roles,
+        exclude_role: exclude_roles,
+        exclude_tool_noise,
+        exclude_tool_name,
+        file,
+        session,
+        events: optional_bool(arguments, "events")?.unwrap_or(false),
+        refresh: RefreshArg::Off,
+        include_current_session,
+        json: false,
+        format: OutputFormat::Json,
+        continuation,
+        fields: fields_arg,
+        max_snippet_bytes,
+        max_page_bytes,
+        verbose: false,
+    };
+    let next_argv = search_next_argv(
+        &cli_args,
+        OutputFormat::Json,
+        page.pagination.continuation.as_deref(),
+    );
+    let next_command = next_argv.as_ref().map(|argv| command_from_argv(argv));
+    let mut refresh = SearchRefreshReport::skipped(RefreshArg::Off, "skipped");
+    refresh.reason = "refresh_off";
+    let refresh = refresh.with_index_age(Some(&store));
+    let next_arguments = page
+        .pagination
+        .continuation
+        .as_deref()
+        .map(|continuation| search_next_arguments(&cli_args, continuation));
+    let mut value = search_page_json(&page, &refresh, Value::Null, next_command, next_argv)?;
+    value
+        .as_object_mut()
+        .expect("search page is an object")
+        .insert("next_arguments".to_owned(), json!(next_arguments));
     Ok(value)
 }
 
@@ -394,15 +492,102 @@ fn tool_show_session(arguments: &Value, data_root: &Path) -> Result<Value> {
     let store = open_existing_store(data_root)?;
     let session_id = resolve_session_id_arg(&store, arguments, "ctx_session_id")?;
     let mode = optional_transcript_mode(arguments, "mode")?.unwrap_or(TranscriptMode::Lite);
+    let limit =
+        optional_usize(arguments, "limit")?.unwrap_or(ctx_history_query::DEFAULT_SHOW_LIMIT);
+    if !(1..=MAX_SHOW_LIMIT).contains(&limit) {
+        return Err(anyhow!(
+            "show_session limit must be between 1 and {MAX_SHOW_LIMIT}"
+        ));
+    }
+    let continuation = optional_string(arguments, "continue")?;
+    let (fields, fields_arg) =
+        optional_fields(arguments, "fields")?.unwrap_or((FieldSet::Full, FieldArg::Full));
+    let max_event_bytes =
+        optional_usize(arguments, "max_event_bytes")?.unwrap_or(DEFAULT_ITEM_BYTES);
+    let max_page_bytes = optional_usize(arguments, "max_page_bytes")?.unwrap_or(DEFAULT_PAGE_BYTES);
+    let byte_policy = BytePolicy {
+        per_item_bytes: max_event_bytes,
+        page_bytes: max_page_bytes,
+    }
+    .validate()?;
     let session = store.get_session(session_id)?;
-    let events = store.events_for_session(session.id)?;
-    Ok(session_transcript_json(
-        &store,
-        &session,
-        &events,
+    let page = QueryService::new(&store).session_events(
+        session,
+        QueryTranscriptMode::from(mode),
+        limit,
+        continuation.as_deref(),
+        fields,
+        byte_policy,
+    )?;
+    let cli_args = ShowSessionArgs {
+        id: Some(session_id.to_string()),
+        provider: None,
+        provider_session: None,
         mode,
+        format: OutputFormat::Json,
+        json: false,
+        limit,
+        continuation,
+        fields: fields_arg,
+        max_event_bytes,
+        max_page_bytes,
+        out: None,
+    };
+    let next_argv = show_session_next_argv(
+        &cli_args,
         OutputFormat::Json,
-    ))
+        page.pagination.continuation.as_deref(),
+    );
+    let next_command = next_argv.as_ref().map(|argv| command_from_argv(argv));
+    let next_arguments = page.pagination.continuation.as_deref().map(|continuation| {
+        json!({
+            "ctx_session_id": session_id,
+            "mode": mode.as_str(),
+            "limit": limit,
+            "continue": continuation,
+            "fields": fields_arg.as_str(),
+            "max_event_bytes": max_event_bytes,
+            "max_page_bytes": max_page_bytes,
+        })
+    });
+    let mut value = event_page_json(&page, OutputFormat::Json, next_command, next_argv)?;
+    value
+        .as_object_mut()
+        .expect("event page is an object")
+        .insert("next_arguments".to_owned(), json!(next_arguments));
+    Ok(value)
+}
+
+fn search_next_arguments(args: &SearchArgs, continuation: &str) -> Value {
+    compact_json(json!({
+        "query": args.query,
+        "terms": args.term,
+        "match": args.r#match.as_str(),
+        "limit": args.limit,
+        "provider": args.provider.map(ProviderArg::cli_name),
+        "history_source": args.history_source,
+        "provider_key": args.provider_key,
+        "source_id": args.source_id,
+        "source_format": args.source_format,
+        "workspace": args.workspace,
+        // Relative windows are frozen by tool_search before this projection.
+        "since": args.since,
+        "primary_only": args.primary_only,
+        "include_subagents": args.include_subagents,
+        "event_type": args.event_type,
+        "roles": args.role,
+        "exclude_roles": args.exclude_role,
+        "exclude_tool_noise": args.exclude_tool_noise,
+        "exclude_tool_name": args.exclude_tool_name,
+        "file": args.file.as_ref().map(|path| path.to_string_lossy()),
+        "session": args.session,
+        "events": args.events,
+        "include_current_session": args.include_current_session,
+        "continue": continuation,
+        "fields": args.fields.as_str(),
+        "max_snippet_bytes": args.max_snippet_bytes,
+        "max_page_bytes": args.max_page_bytes,
+    }))
 }
 
 fn tool_show_event(arguments: &Value, data_root: &Path) -> Result<Value> {
@@ -454,7 +639,7 @@ fn tool_result(structured: Value) -> Value {
 }
 
 fn tool_error_result(err: anyhow::Error) -> Value {
-    let error = err.to_string();
+    let error = format!("{err:#}");
     json!({
         "isError": true,
         "content": [
@@ -490,9 +675,14 @@ fn tool_definitions() -> Vec<Value> {
             "title": "Search",
             "description": "Search the existing local ctx index by query text or touched-file path. This does not refresh or import provider history.",
             "inputSchema": object_schema(json!({
-                "query": { "type": "string", "description": "Non-empty text query. Required unless file is provided." },
+                "query": { "type": "string", "maxLength": ctx_history_search::MAX_QUERY_CLAUSE_BYTES, "description": "Non-empty text query. Required unless file is provided." },
+                "terms": { "type": "array", "maxItems": ctx_history_search::MAX_QUERY_CLAUSES, "items": { "type": "string", "maxLength": ctx_history_search::MAX_QUERY_CLAUSE_BYTES }, "default": [], "description": "Additional OR-style query clauses; order and duplicates are preserved. Aggregate query text is limited to 65536 UTF-8 bytes at runtime." },
                 "match": { "type": "string", "enum": ["all", "any", "phrase"], "default": "all", "description": "Within-query word matching: all tokens in one indexed section, any token, or adjacent ordered phrase. Punctuation is normalized as separators and input is literal, not FTS syntax." },
                 "limit": { "type": "integer", "minimum": 1, "maximum": MAX_SEARCH_LIMIT, "default": 20 },
+                "continue": { "type": "string", "description": "Opaque continuation from a previous search response." },
+                "fields": { "type": "string", "enum": ["full", "compact"], "default": "full" },
+                "max_snippet_bytes": { "type": "integer", "minimum": 0, "maximum": MAX_ITEM_BYTES, "default": DEFAULT_ITEM_BYTES },
+                "max_page_bytes": { "type": "integer", "minimum": 0, "maximum": MAX_PAGE_BYTES, "default": DEFAULT_PAGE_BYTES },
                 "provider": { "type": "string", "enum": provider_names() },
                 "history_source": { "type": "string", "description": "Custom history source selector as plugin/source or provider_key/source_id." },
                 "provider_key": { "type": "string", "description": "Custom history provider_key." },
@@ -500,8 +690,13 @@ fn tool_definitions() -> Vec<Value> {
                 "source_format": { "type": "string", "description": "Custom history source_format." },
                 "workspace": { "type": "string", "description": "Workspace path or name text." },
                 "since": { "type": "string", "description": "RFC3339 timestamp or day window such as 30d." },
+                "primary_only": { "type": "boolean", "default": false, "description": "Deprecated compatibility flag for the default primary-agent scope." },
                 "include_subagents": { "type": "boolean", "default": false, "description": "Include subagent sessions in addition to primary-agent sessions." },
                 "event_type": { "type": "string", "enum": event_type_names() },
+                "roles": { "type": "array", "items": { "type": "string", "enum": ["user", "assistant", "tool"] }, "default": [] },
+                "exclude_roles": { "type": "array", "items": { "type": "string", "enum": ["user", "assistant", "tool"] }, "default": [] },
+                "exclude_tool_noise": { "type": "boolean", "default": false },
+                "exclude_tool_name": { "type": "string" },
                 "file": { "type": "string", "description": "Indexed touched-file path. Required unless query is provided." },
                 "session": { "type": "string", "description": "ctx session UUID or unambiguous 8+ hex UUID prefix (compact or canonical-hyphenated)." },
                 "events": { "type": "boolean", "default": false },
@@ -534,7 +729,12 @@ fn tool_definitions() -> Vec<Value> {
             "description": "Return an indexed session transcript by ctx session id.",
             "inputSchema": object_schema(json!({
                 "ctx_session_id": { "type": "string", "description": "ctx session UUID or unambiguous 8+ hex UUID prefix (compact or canonical-hyphenated)." },
-                "mode": { "type": "string", "enum": ["full", "lite", "log"], "default": "lite" }
+                "mode": { "type": "string", "enum": ["full", "lite", "log"], "default": "lite" },
+                "limit": { "type": "integer", "minimum": 1, "maximum": MAX_SHOW_LIMIT, "default": ctx_history_query::DEFAULT_SHOW_LIMIT },
+                "continue": { "type": "string", "description": "Opaque continuation from a previous show_session response." },
+                "fields": { "type": "string", "enum": ["full", "compact"], "default": "full" },
+                "max_event_bytes": { "type": "integer", "minimum": 0, "maximum": MAX_ITEM_BYTES, "default": DEFAULT_ITEM_BYTES },
+                "max_page_bytes": { "type": "integer", "minimum": 0, "maximum": MAX_PAGE_BYTES, "default": DEFAULT_PAGE_BYTES }
             }), vec!["ctx_session_id"]),
             "annotations": { "readOnlyHint": true },
         }),
@@ -633,6 +833,34 @@ fn optional_usize(arguments: &Value, key: &str) -> Result<Option<usize>> {
                 .map_err(|_| anyhow!("{key} is too large"))
         }
         Some(_) => Err(anyhow!("{key} must be a non-negative integer")),
+    }
+}
+
+fn optional_string_array(arguments: &Value, key: &str) -> Result<Option<Vec<String>>> {
+    match arguments.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| anyhow!("{key} must contain only strings"))
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Some),
+        Some(_) => Err(anyhow!("{key} must be an array of strings")),
+    }
+}
+
+fn optional_fields(arguments: &Value, key: &str) -> Result<Option<(FieldSet, FieldArg)>> {
+    let Some(fields) = optional_string(arguments, key)? else {
+        return Ok(None);
+    };
+    match fields.as_str() {
+        "full" => Ok(Some((FieldSet::Full, FieldArg::Full))),
+        "compact" => Ok(Some((FieldSet::Compact, FieldArg::Compact))),
+        _ => Err(anyhow!("fields must be one of full, compact")),
     }
 }
 

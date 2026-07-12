@@ -47,9 +47,15 @@ use ctx_history_capture::{
     OPENCODE_CURSOR_V2_PREFIX,
 };
 use ctx_history_core::{
-    database_path, default_data_root, utc_now, CaptureProvider, ContextCitation,
-    ContextCitationType, CtxHistoryJsonlRecord, CtxIdPrefix, Event, EventRole, EventType,
-    HistoryRecord, ProviderRawRetention, RedactionState, SearchMatchMode, Session,
+    database_path, default_data_root, utc_now, CaptureProvider, CtxHistoryJsonlRecord, CtxIdPrefix,
+    Event, EventRole, EventType, HistoryRecord, ProviderRawRetention, RedactionState,
+    SearchMatchMode, Session,
+};
+use ctx_history_query::{
+    BytePolicy, EventPageV1, EventProjectionV1, FieldSet, QueryError, QueryService,
+    SearchContextProjectionV1, SearchPageV1, SearchResultProjectionV1, SessionProjectionV1,
+    TranscriptMode as QueryTranscriptMode, DEFAULT_ITEM_BYTES, DEFAULT_PAGE_BYTES,
+    DEFAULT_SHOW_LIMIT, MAX_SHOW_LIMIT,
 };
 use ctx_history_store::{
     CatalogSession, CatalogSourceIndexUpdate, IdPrefixResolution, RawSqlOptions, RawSqlResult,
@@ -198,6 +204,19 @@ struct ShowSessionArgs {
     format: OutputFormat,
     #[arg(long)]
     json: bool,
+    #[arg(long, default_value_t = DEFAULT_SHOW_LIMIT, value_parser = parse_show_limit, help = "Maximum events to emit for this page (1..1000)")]
+    limit: usize,
+    #[arg(
+        long = "continue",
+        help = "Opaque continuation from a previous show session page"
+    )]
+    continuation: Option<String>,
+    #[arg(long, value_enum, default_value_t = FieldArg::Full, help = "Output full or compact event fields")]
+    fields: FieldArg,
+    #[arg(long, aliases = ["event-bytes", "item-bytes"], default_value_t = DEFAULT_ITEM_BYTES, help = "Maximum UTF-8 bytes per event (0 allowed)")]
+    max_event_bytes: usize,
+    #[arg(long, alias = "page-bytes", default_value_t = DEFAULT_PAGE_BYTES, help = "Maximum selected event projection JSON bytes per page (0 allowed)")]
+    max_page_bytes: usize,
     #[arg(long)]
     out: Option<PathBuf>,
 }
@@ -256,13 +275,13 @@ struct LocateEventArgs {
     json: bool,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 struct SearchArgs {
     #[arg(help = "Natural-language query to search local agent history")]
     query: Option<String>,
     #[arg(
         long,
-        help = "Add another search query or keyword; repeat to broaden with OR-style merged results"
+        help = "Add another search query or keyword; repeat to broaden with OR-style merged results (maximum 32 clauses, 4096 bytes each, 65536 aggregate query bytes)"
     )]
     term: Vec<String>,
     #[arg(
@@ -377,6 +396,19 @@ struct SearchArgs {
     include_current_session: bool,
     #[arg(long, help = "Print machine-readable JSON")]
     json: bool,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text, help = "Output format: text, markdown, json, or jsonl/NDJSON")]
+    format: OutputFormat,
+    #[arg(
+        long = "continue",
+        help = "Opaque continuation from a previous search page; requires --refresh off"
+    )]
+    continuation: Option<String>,
+    #[arg(long, value_enum, default_value_t = FieldArg::Full, help = "Output full or compact result fields")]
+    fields: FieldArg,
+    #[arg(long, aliases = ["snippet-bytes", "item-bytes"], default_value_t = DEFAULT_ITEM_BYTES, help = "Maximum UTF-8 bytes per result snippet (0 allowed)")]
+    max_snippet_bytes: usize,
+    #[arg(long, alias = "page-bytes", default_value_t = DEFAULT_PAGE_BYTES, help = "Maximum selected result projection JSON bytes per page (0 allowed)")]
+    max_page_bytes: usize,
     #[arg(
         long,
         help = "Print expanded text details such as full ids, provider ids, citations, and next commands"
@@ -389,6 +421,32 @@ enum SearchMatchArg {
     All,
     Any,
     Phrase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum FieldArg {
+    Full,
+    Compact,
+}
+
+impl From<FieldArg> for FieldSet {
+    fn from(value: FieldArg) -> Self {
+        match value {
+            FieldArg::Full => FieldSet::Full,
+            FieldArg::Compact => FieldSet::Compact,
+        }
+    }
+}
+
+fn parse_show_limit(value: &str) -> std::result::Result<usize, String> {
+    let limit = value
+        .parse::<usize>()
+        .map_err(|_| "limit must be a number".to_string())?;
+    if (1..=MAX_SHOW_LIMIT).contains(&limit) {
+        Ok(limit)
+    } else {
+        Err(format!("limit must be between 1 and {MAX_SHOW_LIMIT}"))
+    }
 }
 
 impl From<SearchMatchArg> for SearchMatchMode {
@@ -678,6 +736,16 @@ impl TranscriptMode {
             Self::Full => "full",
             Self::Lite => "lite",
             Self::Log => "log",
+        }
+    }
+}
+
+impl From<TranscriptMode> for QueryTranscriptMode {
+    fn from(value: TranscriptMode) -> Self {
+        match value {
+            TranscriptMode::Full => Self::Full,
+            TranscriptMode::Lite => Self::Lite,
+            TranscriptMode::Log => Self::Log,
         }
     }
 }
@@ -1603,9 +1671,6 @@ fn format_bytes(bytes: u64) -> String {
         format!("{value:.1}{}", UNITS[unit])
     }
 }
-
-struct ShowDto;
-struct SearchDto;
 
 #[derive(Debug)]
 struct SilentExit {
@@ -3075,23 +3140,63 @@ fn available_space_bytes(_path: &Path) -> Option<u64> {
 }
 
 fn run_show(args: ShowArgs, data_root: PathBuf) -> Result<()> {
-    let store = Store::open(database_path(data_root))?;
+    let db_path = database_path(data_root);
     match args.target {
-        ShowTarget::Session(args) => {
-            let session = resolve_session(
+        ShowTarget::Session(mut args) => {
+            let format = effective_format(args.format, args.json);
+            let store = match open_existing_store_read_only(&db_path, "ctx show") {
+                Ok(store) => store,
+                Err(error) => return paged_request_error(format, "store_error", error),
+            };
+            let session = match resolve_session(
                 &store,
-                args.id,
+                args.id.clone(),
                 args.provider.map(ProviderArg::capture_provider),
                 args.provider_session.as_deref(),
-            )?;
-            let events = store.events_for_session(session.id)?;
-            let format = effective_format(args.format, args.json);
-            write_rendered_session(&store, &session, &events, args.mode, format, args.out)?;
+            ) {
+                Ok(session) => session,
+                Err(error) => return paged_request_error(format, "session_lookup_error", error),
+            };
+            args.id = Some(session.id.to_string());
+            let byte_policy = BytePolicy {
+                per_item_bytes: args.max_event_bytes,
+                page_bytes: args.max_page_bytes,
+            };
+            let page = QueryService::new(&store).session_events(
+                session.clone(),
+                args.mode.into(),
+                args.limit,
+                args.continuation.as_deref(),
+                args.fields.into(),
+                byte_policy,
+            );
+            let page = match page {
+                Ok(page) => page,
+                Err(err) => return paged_query_error(format, err),
+            };
+            let result = write_rendered_session_page(&page, &args, format);
+            if args.out.is_none() {
+                finish_paged_stdout(result)?;
+            } else {
+                // Explicit destinations (including FIFOs) are caller-owned;
+                // never reinterpret their I/O failures as stdout early-close.
+                result?;
+            }
         }
         ShowTarget::Event(args) => {
-            let event = resolve_event(&store, &args.id)?;
-            let events = event_window(&store, &event, args.before, args.after, args.window)?;
             let format = effective_format(args.format, args.json);
+            let store = match open_existing_store_read_only(&db_path, "ctx show") {
+                Ok(store) => store,
+                Err(error) => return paged_request_error(format, "store_error", error),
+            };
+            let event = match resolve_event(&store, &args.id) {
+                Ok(event) => event,
+                Err(error) => return paged_request_error(format, "event_lookup_error", error),
+            };
+            let events = match event_window(&store, &event, args.before, args.after, args.window) {
+                Ok(events) => events,
+                Err(error) => return paged_request_error(format, "event_window_error", error),
+            };
             write_rendered_events(&store, &event, &events, format, None)?;
         }
     }
@@ -3108,7 +3213,7 @@ fn event_preview(event: &Event) -> String {
 }
 
 fn run_locate(args: LocateArgs, data_root: PathBuf) -> Result<()> {
-    let store = Store::open(database_path(data_root))?;
+    let store = open_existing_store_read_only(&database_path(data_root), "ctx locate")?;
     match args.target {
         LocateTarget::Session(args) => {
             let session = resolve_session(
@@ -3169,14 +3274,7 @@ fn resolve_session(
         .ok_or_else(|| {
             anyhow!("session lookup requires --provider-session when no ctx session id is provided")
         })?;
-    let matches = store
-        .list_sessions()?
-        .into_iter()
-        .filter(|session| {
-            session.provider == provider
-                && session.external_session_id.as_deref() == Some(provider_session)
-        })
-        .collect::<Vec<_>>();
+    let matches = store.sessions_by_external_session(provider, provider_session, 2)?;
     match matches.as_slice() {
         [session] => Ok(session.clone()),
         [] => Err(anyhow!(
@@ -3195,38 +3293,178 @@ fn event_window(
     after: usize,
     window: Option<usize>,
 ) -> Result<Vec<Event>> {
-    let Some(session_id) = event.session_id else {
-        return Ok(vec![event.clone()]);
-    };
-    let events = store.events_for_session(session_id)?;
-    let Some(index) = events.iter().position(|candidate| candidate.id == event.id) else {
-        return Ok(vec![event.clone()]);
-    };
     let (before, after) = window
         .map(|window| (window, window))
         .unwrap_or((before, after));
-    let start = index.saturating_sub(before);
-    let end = (index + after + 1).min(events.len());
-    Ok(events[start..end].to_vec())
+    Ok(store.event_window_bounded(event.id, before, after)?)
 }
 
-fn write_rendered_session(
-    store: &Store,
-    session: &Session,
-    events: &[Event],
-    mode: TranscriptMode,
+fn write_rendered_session_page(
+    page: &EventPageV1,
+    args: &ShowSessionArgs,
     format: OutputFormat,
-    out: Option<PathBuf>,
 ) -> Result<()> {
-    let body = match format {
-        OutputFormat::Text => render_session_text(store, session, events, mode),
-        OutputFormat::Markdown => render_session_markdown(store, session, events, mode),
-        OutputFormat::Json => serde_json::to_string_pretty(&session_transcript_json(
-            store, session, events, mode, format,
-        ))?,
-        OutputFormat::Jsonl => render_session_jsonl(store, session, events, mode)?,
+    if let Some(path) = &args.out {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)?;
+        }
+        let file = fs::File::create(path).with_context(|| format!("write {}", path.display()))?;
+        let mut writer = std::io::BufWriter::new(file);
+        return write_session_page(&mut writer, page, args, format);
+    }
+    let stdout = std::io::stdout();
+    let mut writer = stdout.lock();
+    write_session_page(&mut writer, page, args, format)
+}
+
+fn write_session_page<W: Write + ?Sized>(
+    writer: &mut W,
+    page: &EventPageV1,
+    args: &ShowSessionArgs,
+    format: OutputFormat,
+) -> Result<()> {
+    let next_argv = show_session_next_argv(args, format, page.pagination.continuation.as_deref());
+    let next_command = next_argv.as_ref().map(|argv| command_from_argv(argv));
+    match format {
+        OutputFormat::Json => {
+            let value = event_page_json(page, format, next_command, next_argv)?;
+            writer.write_all(&serde_json::to_vec_pretty(&value)?)?;
+            writer.write_all(b"\n")?;
+        }
+        OutputFormat::Jsonl => write_session_jsonl(writer, page, next_command, next_argv)?,
+        OutputFormat::Text | OutputFormat::Markdown => {
+            let markdown = format == OutputFormat::Markdown;
+            let rendered = render_event_page(page, markdown, next_command.as_deref());
+            writer.write_all(rendered.as_bytes())?;
+        }
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+pub(crate) fn event_page_json(
+    page: &EventPageV1,
+    format: OutputFormat,
+    next_command: Option<String>,
+    next_argv: Option<Vec<String>>,
+) -> Result<Value> {
+    let mut value = serde_json::to_value(page)?;
+    let object = value
+        .as_object_mut()
+        .expect("query event page serializes as an object");
+    object.insert("target".into(), json!("session"));
+    object.insert("item_type".into(), json!("session_transcript"));
+    object.insert("format".into(), json!(format.as_str()));
+    object.insert("next".into(), json!(page.pagination.continuation));
+    object.insert("next_command".into(), json!(next_command));
+    object.insert("next_argv".into(), json!(next_argv));
+    object.insert("total_events".into(), json!(page.selected_total));
+    object.insert(
+        "omitted_events".into(),
+        json!(page.omitted.before.saturating_add(page.omitted.after)),
+    );
+    if let Some(pagination) = object.get_mut("pagination").and_then(Value::as_object_mut) {
+        pagination.insert("cursor".into(), json!(page.pagination.continuation));
+    }
+    object.insert("share_safe".into(), Value::Bool(false));
+    if let Some(session) = object.get("session") {
+        if let Some(id) = session.get("ctx_session_id").cloned() {
+            object.insert("ctx_session_id".into(), id);
+        }
+    }
+    Ok(value)
+}
+
+fn render_event_page(page: &EventPageV1, markdown: bool, next_command: Option<&str>) -> String {
+    let mut out = String::new();
+    if markdown {
+        out.push_str("# Session transcript\n\n");
+    }
+    render_session_projection(&mut out, &page.session, markdown);
+    if markdown {
+        out.push_str(&format!("- mode: `{:?}`\n\n", page.mode).to_lowercase());
+    } else {
+        out.push_str(&format!("mode: {:?}\n\n", page.mode).to_lowercase());
+    }
+    for event in &page.events {
+        render_event_projection(&mut out, event, markdown);
+    }
+    render_page_summary(
+        &mut out,
+        PageSummary {
+            noun: "events",
+            offset: page.pagination.offset,
+            returned: page.pagination.returned_items,
+            omitted_before: page.omitted.before,
+            omitted_after: page.omitted.after,
+            exact: page.omitted.exact,
+            next_command,
+        },
+        markdown,
+    );
+    out
+}
+
+fn render_session_projection(out: &mut String, session: &SessionProjectionV1, markdown: bool) {
+    let (id, provider, provider_session) = match session {
+        SessionProjectionV1::Full(session) => (
+            session.ctx_session_id,
+            session.provider,
+            session.provider_session_id.as_deref(),
+        ),
+        SessionProjectionV1::Compact(session) => (session.ctx_session_id, session.provider, None),
     };
-    write_output(body, out)
+    if markdown {
+        out.push_str(&format!(
+            "- ctx_session_id: `{id}`\n- provider: `{provider}`\n"
+        ));
+        if let Some(value) = provider_session {
+            out.push_str(&format!("- provider_session_id: `{value}`\n"));
+        }
+        out.push('\n');
+    } else {
+        out.push_str(&format!("ctx_session_id: {id}\nprovider: {provider}\n"));
+        if let Some(value) = provider_session {
+            out.push_str(&format!("provider_session_id: {value}\n"));
+        }
+        out.push('\n');
+    }
+}
+
+fn render_event_projection(out: &mut String, event: &EventProjectionV1, markdown: bool) {
+    let (id, seq, event_type, role, occurred_at, text) = match event {
+        EventProjectionV1::Full(event) => (
+            event.ctx_event_id,
+            event.seq,
+            event.event_type,
+            event.role,
+            event.occurred_at,
+            event.text.as_str(),
+        ),
+        EventProjectionV1::Compact(event) => (
+            event.ctx_event_id,
+            event.seq,
+            event.event_type,
+            event.role,
+            event.occurred_at,
+            event.text.as_str(),
+        ),
+    };
+    let role = role.map(|role| role.as_str()).unwrap_or("-");
+    if markdown {
+        out.push_str(&format!(
+            "## {role} - {} - {occurred_at}\n\nctx_event_id: `{id}`  \nsequence: `{seq}`\n\n{text}\n\n",
+            event_type.as_str()
+        ));
+    } else {
+        out.push_str(&format!(
+            "[{occurred_at}] {role} {} {id} seq={seq}\n{text}\n\n",
+            event_type.as_str()
+        ));
+    }
 }
 
 fn write_rendered_events(
@@ -3260,49 +3498,6 @@ fn write_output(body: String, out: Option<PathBuf>) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn selected_transcript_events(events: &[Event], mode: TranscriptMode) -> Vec<&Event> {
-    match mode {
-        TranscriptMode::Log => events.iter().collect(),
-        TranscriptMode::Full => events.iter().filter(|event| is_message(event)).collect(),
-        TranscriptMode::Lite => lite_transcript_events(events),
-    }
-}
-
-fn lite_transcript_events(events: &[Event]) -> Vec<&Event> {
-    let mut selected = Vec::new();
-    let mut pending_assistant: Option<&Event> = None;
-    for event in events {
-        if is_user_message(event) {
-            if let Some(assistant) = pending_assistant.take() {
-                selected.push(assistant);
-            }
-            selected.push(event);
-        } else if is_assistant_message(event) {
-            pending_assistant = Some(event);
-        }
-    }
-    if let Some(assistant) = pending_assistant {
-        selected.push(assistant);
-    }
-    selected
-}
-
-fn is_message(event: &Event) -> bool {
-    event.event_type == EventType::Message
-        && matches!(
-            event.role,
-            Some(EventRole::User | EventRole::Assistant | EventRole::System)
-        )
-}
-
-fn is_user_message(event: &Event) -> bool {
-    event.event_type == EventType::Message && event.role == Some(EventRole::User)
-}
-
-fn is_assistant_message(event: &Event) -> bool {
-    event.event_type == EventType::Message && event.role == Some(EventRole::Assistant)
 }
 
 fn event_content(event: &Event) -> String {
@@ -3363,94 +3558,6 @@ fn event_value_text(value: &Value) -> Option<String> {
         None
     } else {
         Some(structured.join(" "))
-    }
-}
-
-fn render_session_text(
-    store: &Store,
-    session: &Session,
-    events: &[Event],
-    mode: TranscriptMode,
-) -> String {
-    let mut out = String::new();
-    push_session_header(&mut out, store, session, mode, OutputFormat::Text);
-    for event in selected_transcript_events(events, mode) {
-        push_event_text_block(&mut out, event);
-    }
-    out
-}
-
-fn render_session_markdown(
-    store: &Store,
-    session: &Session,
-    events: &[Event],
-    mode: TranscriptMode,
-) -> String {
-    let mut out = String::new();
-    let label = session
-        .external_session_id
-        .clone()
-        .unwrap_or_else(|| session.id.to_string());
-    out.push_str(&format!("# {} session {}\n\n", session.provider, label));
-    push_session_metadata_markdown(&mut out, store, session, mode, OutputFormat::Markdown);
-    for event in selected_transcript_events(events, mode) {
-        let heading = event
-            .role
-            .map(|role| role.as_str())
-            .unwrap_or(event.event_type.as_str());
-        out.push_str(&format!(
-            "\n## {} - {} - {}\n\n",
-            heading,
-            event.event_type.as_str(),
-            event.occurred_at
-        ));
-        out.push_str(&format!("ctx_event_id: `{}`\n\n", event.id));
-        out.push_str(&event_content(event));
-        out.push('\n');
-    }
-    out
-}
-
-fn push_session_header(
-    out: &mut String,
-    store: &Store,
-    session: &Session,
-    mode: TranscriptMode,
-    format: OutputFormat,
-) {
-    out.push_str(&format!("ctx_session_id: {}\n", session.id));
-    out.push_str(&format!("provider: {}\n", session.provider));
-    if let Some(provider_session_id) = &session.external_session_id {
-        out.push_str(&format!("provider_session_id: {provider_session_id}\n"));
-    }
-    out.push_str(&format!("mode: {}\n", mode.as_str()));
-    out.push_str(&format!("format: {}\n", format.as_str()));
-    if let Some(source) = source_json_for(store, session.capture_source_id) {
-        if let Some(path) = source.get("path").and_then(|value| value.as_str()) {
-            out.push_str(&format!("source_path: {path}\n"));
-        }
-    }
-    out.push('\n');
-}
-
-fn push_session_metadata_markdown(
-    out: &mut String,
-    store: &Store,
-    session: &Session,
-    mode: TranscriptMode,
-    format: OutputFormat,
-) {
-    out.push_str(&format!("- ctx_session_id: `{}`\n", session.id));
-    out.push_str(&format!("- provider: `{}`\n", session.provider));
-    if let Some(provider_session_id) = &session.external_session_id {
-        out.push_str(&format!("- provider_session_id: `{provider_session_id}`\n"));
-    }
-    out.push_str(&format!("- mode: `{}`\n", mode.as_str()));
-    out.push_str(&format!("- format: `{}`\n", format.as_str()));
-    if let Some(source) = source_json_for(store, session.capture_source_id) {
-        if let Some(path) = source.get("path").and_then(|value| value.as_str()) {
-            out.push_str(&format!("- source_path: `{path}`\n"));
-        }
     }
 }
 
@@ -3557,31 +3664,6 @@ fn render_events_markdown(store: &Store, selected: &Event, events: &[Event]) -> 
     out
 }
 
-fn session_transcript_json(
-    store: &Store,
-    session: &Session,
-    events: &[Event],
-    mode: TranscriptMode,
-    format: OutputFormat,
-) -> Value {
-    compact_json(json!({
-        "schema_version": 1,
-        "target": "session",
-        "item_type": "session_transcript",
-        "ctx_session_id": session.id,
-        "provider": session.provider,
-        "provider_session_id": session.external_session_id,
-        "mode": mode.as_str(),
-        "format": format.as_str(),
-        "session": ShowDto::session(store, session),
-        "source": source_json_for(store, session.capture_source_id),
-        "events": selected_transcript_events(events, mode)
-            .into_iter()
-            .map(|event| transcript_event_json(store, event))
-            .collect::<Vec<_>>(),
-    }))
-}
-
 fn event_window_json(
     store: &Store,
     selected: &Event,
@@ -3627,27 +3709,6 @@ fn transcript_event_json(store: &Store, event: &Event) -> Value {
         "text": event_content(event),
         "redaction_state": event.redaction_state,
     }))
-}
-
-fn render_session_jsonl(
-    store: &Store,
-    session: &Session,
-    events: &[Event],
-    mode: TranscriptMode,
-) -> Result<String> {
-    let mut lines = Vec::new();
-    for event in selected_transcript_events(events, mode) {
-        lines.push(serde_json::to_string(&compact_json(json!({
-            "schema_version": 1,
-            "item_type": "session_transcript_event",
-            "mode": mode.as_str(),
-            "ctx_session_id": session.id,
-            "provider": session.provider,
-            "provider_session_id": session.external_session_id,
-            "event": transcript_event_json(store, event),
-        })))?);
-    }
-    Ok(lines.join("\n") + "\n")
 }
 
 fn render_events_jsonl(store: &Store, events: &[Event]) -> Result<String> {
@@ -3818,233 +3879,283 @@ fn print_optional_json_str(value: &Value, key: &str) {
     }
 }
 
-impl ShowDto {
-    fn session(store: &Store, session: &Session) -> Value {
-        let source_path = source_path_for(store, session.capture_source_id);
-        compact_json(json!({
-            "id": session.id,
-            "item_id": session.id,
-            "item_type": "session",
-            "provider": session.provider,
-            "external_session_id": session.external_session_id,
-            "agent_type": session.agent_type,
-            "role": session.role_hint,
-            "is_primary": session.is_primary,
-            "status": session.status,
-            "started_at": session.started_at,
-            "ended_at": session.ended_at,
-            "source_id": session.capture_source_id,
-            "source_path": source_path,
-            "source_exists": source_path_exists(source_path.as_deref()),
-        }))
-    }
+fn write_json_record<W: Write + ?Sized>(writer: &mut W, value: &Value) -> Result<()> {
+    let bytes = serde_json::to_vec(value)?;
+    writer.write_all(&bytes)?;
+    writer.write_all(b"\n")?;
+    Ok(())
 }
 
-impl SearchDto {
-    fn packet(
-        store: &Store,
-        packet: &ctx_history_search::SearchPacket,
-        refresh: &SearchRefreshReport,
-        suggested_next_query: Option<&str>,
-        broadened_search: Value,
-    ) -> Value {
-        compact_json(json!({
-            "schema_version": packet.schema_version,
-            "query": packet.query,
-            "query_plan": packet.query_plan,
-            "filters": packet.filters,
-            "broadened_search": broadened_search,
-            "freshness": refresh.to_json(),
-            "generated_at": packet.generated_at,
-            "results": packet
-                .results
-                .iter()
-                .map(|result| {
-                    compact_json(json!({
-                        "item_id": result.record_id,
-                        "item_type": search_result_item_type(store, result),
-                        "ctx_event_id": result.event_id,
-                        "ctx_session_id": result.session_id,
-                        "session_id": result.session_id,
-                        "event_id": result.event_id,
-                        "event_seq": result.event_seq,
-                        "title": result.title,
-                        "snippet": result.snippet,
-                        "rank": result.rank,
-                        "result_scope": result.result_scope,
-                        "session_importance": (result.result_scope == ctx_history_search::SearchResultScope::Session)
-                            .then_some(result.session_importance),
-                        "more_matches_in_session": (result.result_scope == ctx_history_search::SearchResultScope::Session)
-                            .then_some(result.more_matches_in_session),
-                        "provider": result.provider,
-                        "provider_session_id": result.provider_session_id,
-                        "history_source": result.history_source,
-                        "history_source_plugin": result.history_source_plugin,
-                        "provider_key": result.provider_key,
-                        "source_id": result.source_id,
-                        "source_format": result.source_format,
-                        "timestamp": result.timestamp,
-                        "cwd": result.cwd,
-                        "source_path": result.raw_source_path,
-                        "source_exists": result.raw_source_exists,
-                        "cursor": result.cursor,
-                        "suggested_next_commands": search_next_commands(result, suggested_next_query, packet.query_plan.mode),
-                        "why_matched": result.why_matched,
-                        "citations": public_citations(&result.citations),
-                        "links": result.links,
-                        "visibility": result.visibility,
-                    }))
-                })
-                .collect::<Vec<_>>(),
-            "pagination": packet.pagination,
-            "truncation": packet.truncation,
-        }))
-    }
-}
-
-fn search_result_item_type(
-    store: &Store,
-    result: &ctx_history_search::SearchPacketResult,
-) -> String {
-    if result.result_scope == ctx_history_search::SearchResultScope::Session {
-        return "session_result".to_owned();
-    }
-    if result.event_id == Some(result.record_id) {
-        return "event".to_owned();
-    }
-    if result.session_id == Some(result.record_id) {
-        return "session".to_owned();
-    }
-    item_type_for_id(store, result.record_id)
-}
-
-fn search_next_commands(
-    result: &ctx_history_search::SearchPacketResult,
-    query: Option<&str>,
-    match_mode: SearchMatchMode,
-) -> Vec<String> {
-    let mut commands = Vec::new();
-    if result.result_scope == ctx_history_search::SearchResultScope::Session {
-        if let Some(id) = result.session_id {
-            commands.push(format!("ctx show session {id}"));
-            if let Some(event_id) = result.event_id {
-                commands.push(format!("ctx show event {event_id} --window 10"));
-            }
-            if let Some(query) = query.filter(|query| !query.trim().is_empty()) {
-                commands.push(scoped_search_command(query, id, match_mode));
-            }
-            commands.push(format!("ctx locate session {id}"));
-            if let Some(event_id) = result.event_id {
-                commands.push(format!("ctx locate event {event_id}"));
-            }
+fn write_session_jsonl<W: Write + ?Sized>(
+    writer: &mut W,
+    page: &EventPageV1,
+    next_command: Option<String>,
+    next_argv: Option<Vec<String>>,
+) -> Result<()> {
+    for event in &page.events {
+        let mut record = json!({
+            "schema_version": page.schema_version,
+            "record_type": "event",
+            "item_type": "session_transcript_event",
+            "mode": page.mode,
+            "ctx_session_id": match &page.session {
+                SessionProjectionV1::Full(session) => session.ctx_session_id,
+                SessionProjectionV1::Compact(session) => session.ctx_session_id,
+            },
+            "provider": page.provider,
+            "event": event,
+        });
+        if let (Some(object), Some(provider_session_id)) =
+            (record.as_object_mut(), page.provider_session_id.as_ref())
+        {
+            object.insert("provider_session_id".to_owned(), json!(provider_session_id));
         }
-        return commands;
+        write_json_record(writer, &record)?;
     }
-    if let Some(id) = result.event_id {
-        commands.push(format!("ctx show event {id} --window 10"));
-        commands.push(format!("ctx locate event {id}"));
-    }
-    if result.result_scope != ctx_history_search::SearchResultScope::Session {
-        if let Some(id) = result.session_id {
-            if let Some(query) = query.filter(|query| !query.trim().is_empty()) {
-                commands.push(scoped_search_command(query, id, match_mode));
-            }
-            commands.push(format!("ctx show session {id}"));
-            commands.push(format!("ctx locate session {id}"));
-        }
-    }
-    commands
+    write_json_record(
+        writer,
+        &json!({
+            "schema_version": page.schema_version,
+            "record_type": "completion",
+            "returned": page.pagination.returned_items,
+            "range": page_range_json(page.pagination.offset, page.pagination.returned_items),
+            "omitted": page.omitted,
+            "omitted_before": page.omitted.before,
+            "omitted_after": page.omitted.after,
+            "omitted_exact": page.omitted.exact,
+            "has_more": page.pagination.has_more,
+            "next": page.pagination.continuation,
+            "next_command": next_command,
+            "next_argv": next_argv,
+            "bytes": page.bytes,
+            "fields": page.fields,
+            "selected_total": page.selected_total,
+        }),
+    )?;
+    Ok(())
 }
 
-fn scoped_search_command(query: &str, session_id: Uuid, match_mode: SearchMatchMode) -> String {
-    if match_mode == SearchMatchMode::All {
-        return format!(
-            "ctx search {} --session {session_id}",
-            shell_quote_arg(query)
-        );
+fn write_search_jsonl<W: Write + ?Sized>(
+    writer: &mut W,
+    page: &SearchPageV1,
+    next_command: Option<String>,
+    next_argv: Option<Vec<String>>,
+) -> Result<()> {
+    for result in &page.results {
+        write_json_record(
+            writer,
+            &json!({
+                "schema_version": page.schema_version,
+                "record_type": "result",
+                "result": result,
+            }),
+        )?;
     }
-    let mut parts = vec!["ctx".to_owned(), "search".to_owned()];
-    parts.extend(["--match".to_owned(), match_mode.as_str().to_owned()]);
-    parts.extend([
-        "--session".to_owned(),
-        session_id.to_string(),
-        "--".to_owned(),
-        query.to_owned(),
-    ]);
-    parts
-        .iter()
+    write_json_record(
+        writer,
+        &json!({
+            "schema_version": page.schema_version,
+            "record_type": "completion",
+            "returned": page.pagination.returned_items,
+            "range": page_range_json(page.pagination.offset, page.pagination.returned_items),
+            "omitted": page.omitted,
+            "omitted_before": page.omitted.before,
+            "omitted_after": page.omitted.after,
+            "omitted_exact": page.omitted.exact,
+            "has_more": page.pagination.has_more,
+            "next": page.pagination.continuation,
+            "next_command": next_command,
+            "next_argv": next_argv,
+            "bytes": page.bytes,
+            "fields": page.fields,
+            "pool_total": page.pool_total,
+            "source_truncation": page.source_truncation,
+        }),
+    )?;
+    Ok(())
+}
+
+fn page_range_json(offset: usize, returned: usize) -> Value {
+    if returned == 0 {
+        json!({"start": null, "end": null})
+    } else {
+        json!({"start": offset + 1, "end": offset + returned})
+    }
+}
+
+struct PageSummary<'a> {
+    noun: &'a str,
+    offset: usize,
+    returned: usize,
+    omitted_before: usize,
+    omitted_after: usize,
+    exact: bool,
+    next_command: Option<&'a str>,
+}
+
+fn render_page_summary(out: &mut String, summary: PageSummary<'_>, markdown: bool) {
+    let PageSummary {
+        noun,
+        offset,
+        returned,
+        omitted_before,
+        omitted_after,
+        exact,
+        next_command,
+    } = summary;
+    let prefix = if markdown {
+        "## Page summary\n\n"
+    } else {
+        "page: "
+    };
+    out.push_str(prefix);
+    if returned == 0 {
+        out.push_str(&format!("returned 0 {noun}"));
+    } else {
+        out.push_str(&format!(
+            "returned {} {noun} (range {}-{})",
+            returned,
+            offset + 1,
+            offset + returned
+        ));
+    }
+    out.push_str(&format!(
+        "; omitted before {omitted_before}, after {omitted_after} ({}); {} total {}\n",
+        if exact { "exact" } else { "lower-bound" },
+        if noun == "events" { "selected" } else { "pool" },
+        omitted_before
+            .saturating_add(returned)
+            .saturating_add(omitted_after),
+    ));
+    if let Some(command) = next_command {
+        out.push_str(&format!("continuation: {command}\n"));
+        if noun == "events" {
+            out.push_str("events omitted; continue with --continue\n");
+        }
+    } else {
+        out.push_str(&format!("no more {noun}\n"));
+    }
+}
+
+pub(crate) fn command_from_argv(argv: &[String]) -> String {
+    argv.iter()
         .map(|part| shell_quote_arg(part))
         .collect::<Vec<_>>()
         .join(" ")
 }
 
-fn public_citations(citations: &[ContextCitation]) -> Vec<Value> {
-    citations
-        .iter()
-        .map(|citation| {
-            let ctx_event_id = if citation.citation_type == ContextCitationType::Event {
-                Some(citation.id)
-            } else {
-                None
-            };
-            let ctx_session_id = if citation.citation_type == ContextCitationType::Session {
-                Some(citation.id)
-            } else {
-                citation.session_id
-            };
-            compact_json(json!({
-                "item_id": citation.id,
-                "item_type": public_citation_item_type(citation.citation_type),
-                "ctx_event_id": ctx_event_id,
-                "ctx_session_id": ctx_session_id,
-                "label": citation.label,
-                "time": citation.time,
-                "provider": citation.provider,
-                "session_id": citation.session_id,
-                "event_seq": citation.event_seq,
-                "source_path": citation.raw_source_path,
-                "source_exists": citation.raw_source_exists,
-                "cursor": citation.cursor,
-            }))
-        })
-        .collect()
+pub(crate) fn show_session_next_argv(
+    args: &ShowSessionArgs,
+    format: OutputFormat,
+    continuation: Option<&str>,
+) -> Option<Vec<String>> {
+    let continuation = continuation?;
+    let id = args.id.as_ref()?;
+    Some(vec![
+        "ctx".to_owned(),
+        "show".to_owned(),
+        "session".to_owned(),
+        id.clone(),
+        "--mode".to_owned(),
+        args.mode.as_str().to_owned(),
+        "--fields".to_owned(),
+        args.fields.as_str().to_owned(),
+        "--limit".to_owned(),
+        args.limit.to_string(),
+        "--max-event-bytes".to_owned(),
+        args.max_event_bytes.to_string(),
+        "--max-page-bytes".to_owned(),
+        args.max_page_bytes.to_string(),
+        "--format".to_owned(),
+        format.as_str().to_owned(),
+        "--continue".to_owned(),
+        continuation.to_owned(),
+    ])
 }
 
-fn public_citation_item_type(citation_type: ContextCitationType) -> &'static str {
-    match citation_type {
-        ContextCitationType::HistoryRecord => "indexed_item",
-        ContextCitationType::Session => "session",
-        ContextCitationType::Run => "run",
-        ContextCitationType::Event => "event",
-        ContextCitationType::VcsChange => "vcs_change",
-        ContextCitationType::Artifact => "artifact",
-        ContextCitationType::Summary => "summary",
-        ContextCitationType::File => "file",
+impl FieldArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Compact => "compact",
+        }
     }
 }
 
-fn public_record_item_type(record: &HistoryRecord) -> String {
-    let item_type = record.kind.trim();
-    match item_type {
-        "" | "record" => "indexed_item".to_owned(),
-        value => value.to_owned(),
+fn query_error_kind(error: &QueryError) -> &'static str {
+    match error {
+        QueryError::InvalidBytePolicy { .. } => "invalid_byte_policy",
+        QueryError::InvalidContinuation(_) => "invalid_continuation",
+        QueryError::ContinuationRequestMismatch => "continuation_request_mismatch",
+        QueryError::ContinuationKind { .. } => "continuation_kind_mismatch",
+        QueryError::StaleContinuation => "stale_continuation",
+        QueryError::SnapshotChanged => "snapshot_changed",
+        QueryError::Store(_) => "store_error",
+        QueryError::Search(_) => "search_error",
+        QueryError::ArithmeticOverflow => "arithmetic_overflow",
+        QueryError::InvalidPageSize => "invalid_page_size",
+        QueryError::Serialization(_) => "serialization_error",
+        QueryError::ItemExceedsPageBudget { .. } => "item_exceeds_page_budget",
     }
 }
 
-fn item_type_for_id(store: &Store, item_id: Uuid) -> String {
-    if let Ok(record) = store.get_record(item_id) {
-        return public_record_item_type(&record);
+fn write_ndjson_error<W: Write + ?Sized>(writer: &mut W, kind: &str, message: &str) -> Result<()> {
+    write_json_record(
+        writer,
+        &json!({
+            "schema_version": 1,
+            "record_type": "error",
+            "kind": kind,
+            "message": message,
+        }),
+    )?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn is_broken_pipe(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
+    })
+}
+
+fn finish_paged_stdout(result: Result<()>) -> Result<()> {
+    match result {
+        Err(error) if is_broken_pipe(&error) => Ok(()),
+        other => other,
     }
-    if store.get_event(item_id).is_ok() {
-        return "event".to_owned();
+}
+
+fn paged_query_error<T>(format: OutputFormat, error: QueryError) -> Result<T> {
+    if format == OutputFormat::Jsonl {
+        let stdout = std::io::stdout();
+        let mut writer = stdout.lock();
+        if let Err(write_error) =
+            write_ndjson_error(&mut writer, query_error_kind(&error), &error.to_string())
+        {
+            if is_broken_pipe(&write_error) {
+                return Err(SilentExit { code: 0 }.into());
+            }
+            return Err(write_error);
+        }
     }
-    if store.get_session(item_id).is_ok() {
-        return "session".to_owned();
+    Err(error.into())
+}
+
+fn paged_request_error<T>(format: OutputFormat, kind: &str, error: anyhow::Error) -> Result<T> {
+    if format == OutputFormat::Jsonl {
+        let stdout = std::io::stdout();
+        let mut writer = stdout.lock();
+        if let Err(write_error) = write_ndjson_error(&mut writer, kind, &error.to_string()) {
+            if is_broken_pipe(&write_error) {
+                return Err(SilentExit { code: 0 }.into());
+            }
+            return Err(write_error);
+        }
     }
-    if store.get_run(item_id).is_ok() {
-        return "run".to_owned();
-    }
-    "indexed_item".to_owned()
+    Err(error)
 }
 
 fn source_path_for(store: &Store, source_id: Option<Uuid>) -> Option<String> {
@@ -4426,57 +4537,98 @@ fn csv_escape(value: &str) -> String {
 }
 
 fn run_search(args: SearchArgs, data_root: PathBuf) -> Result<()> {
+    let search_format = effective_format(args.format, args.json);
+    if args.continuation.is_some() && args.refresh != RefreshArg::Off {
+        return paged_request_error(
+            search_format,
+            "continuation_requires_refresh_off",
+            anyhow!(
+                "search continuations require --refresh off so the read-only snapshot is stable"
+            ),
+        );
+    }
+    let byte_policy = match (BytePolicy {
+        per_item_bytes: args.max_snippet_bytes,
+        page_bytes: args.max_page_bytes,
+    })
+    .validate()
+    {
+        Ok(policy) => policy,
+        Err(err) => return paged_query_error(search_format, err),
+    };
     if !search_has_intent(SearchIntentInput {
         query: args.query.as_deref(),
         terms: &args.term,
         file: args.file.as_deref(),
     }) {
-        return Err(missing_search_intent_error());
+        return paged_request_error(
+            search_format,
+            "missing_search_intent",
+            missing_search_intent_error(),
+        );
+    }
+    let query = args.query.clone().unwrap_or_default();
+    if let Err(error) = ctx_history_search::validate_query_request(&query, &args.term) {
+        return paged_request_error(search_format, "invalid_query", error.into());
     }
 
     let db_path = database_path(data_root.clone());
     let had_existing_store = db_path.exists();
-    let refresh = refresh_before_search(&args, &data_root)?;
+    let refresh = match refresh_before_search(&args, &data_root) {
+        Ok(refresh) => refresh,
+        Err(error) => return paged_request_error(search_format, "refresh_error", error),
+    };
     if refresh.status == "failed" && args.refresh == RefreshArg::Auto && !had_existing_store {
-        return Err(anyhow!(
+        return paged_request_error(
+            search_format,
+            "refresh_error",
+            anyhow!(
             "search refresh failed and no existing ctx index is available; run `ctx import` first or retry with `--refresh strict`: {}",
             refresh.error.as_deref().unwrap_or("unknown refresh error")
-        ));
+            ),
+        );
     }
-    let store = if args.refresh == RefreshArg::Off
-        || refresh.status == "failed"
-        || refresh.status == "completed"
-        || had_existing_store
-    {
-        open_existing_store_read_only(&db_path, "ctx search")?
-    } else {
-        Store::open(&db_path)?
+    if !db_path.exists() && args.refresh == RefreshArg::Auto {
+        // Preserve the existing empty-index first-run behavior, but confine
+        // initialization to the refresh phase and reopen read-only to query.
+        if let Err(error) = Store::open(&db_path) {
+            return paged_request_error(search_format, "store_initialization_error", error.into());
+        }
+    }
+    // Refresh owns every intentional write. The query phase always reopens
+    // the resulting store read-only, including a store created by refresh.
+    let store = match open_existing_store_read_only(&db_path, "ctx search") {
+        Ok(store) => store,
+        Err(error) => return paged_request_error(search_format, "store_error", error),
     };
     let refresh = refresh.with_index_age(Some(&store));
     let source_identity = SourceIdentityFilterArgs::from(&args);
-    let query = args.query.clone().unwrap_or_default();
     let event_results = args.events || args.session.is_some();
+    let filters = match search_filters(
+        SearchFilterInput {
+            session: args.session.clone(),
+            provider: args.provider,
+            source_identity,
+            workspace: args.workspace.clone(),
+            since: args.since.clone(),
+            primary_only: args.primary_only,
+            include_subagents: args.include_subagents,
+            event_type: args.event_type.clone(),
+            role: args.role.clone(),
+            exclude_role: args.exclude_role.clone(),
+            exclude_tool_noise: args.exclude_tool_noise,
+            exclude_tool_name: args.exclude_tool_name.clone(),
+            file: args.file.clone(),
+            include_current_session: args.include_current_session,
+        },
+        Some(&store),
+    ) {
+        Ok(filters) => filters,
+        Err(error) => return paged_request_error(search_format, "invalid_filters", error),
+    };
     let options = ctx_history_search::PacketOptions {
         limit: args.limit,
-        filters: search_filters(
-            SearchFilterInput {
-                session: args.session.clone(),
-                provider: args.provider,
-                source_identity,
-                workspace: args.workspace.clone(),
-                since: args.since.clone(),
-                primary_only: args.primary_only,
-                include_subagents: args.include_subagents,
-                event_type: args.event_type.clone(),
-                role: args.role.clone(),
-                exclude_role: args.exclude_role.clone(),
-                exclude_tool_noise: args.exclude_tool_noise,
-                exclude_tool_name: args.exclude_tool_name.clone(),
-                file: args.file.clone(),
-                include_current_session: args.include_current_session,
-            },
-            Some(&store),
-        )?,
+        filters,
         result_mode: if event_results {
             ctx_history_search::SearchResultMode::Events
         } else {
@@ -4485,25 +4637,53 @@ fn run_search(args: SearchArgs, data_root: PathBuf) -> Result<()> {
         match_mode: args.r#match.into(),
         ..ctx_history_search::PacketOptions::default()
     };
+    // Freeze relative windows (for example `30d`) only in replay argv.
+    // Resolving them again in a later process would produce a different bound
+    // request, while broader-search suggestions should preserve user spelling.
+    let mut replay_args = args.clone();
+    replay_args.since = options.filters.since.map(|value| value.to_rfc3339());
     let uses_composed_terms = args.term.iter().any(|term| !term.trim().is_empty());
-    let packet = if uses_composed_terms {
-        ctx_history_search::search_packet_terms(&store, &query, &args.term, &options)?
-    } else {
-        ctx_history_search::search_packet(&store, &query, &options)?
+    let page = QueryService::new(&store).search(
+        &query,
+        &args.term,
+        options,
+        args.continuation.as_deref(),
+        args.fields.into(),
+        byte_policy,
+    );
+    let page = match page {
+        Ok(page) => page,
+        Err(err) => return paged_query_error(search_format, err),
     };
-    if args.json {
-        let suggested_next_query = (!uses_composed_terms).then_some(query.as_str());
-        print_share_safe_value(SearchDto::packet(
-            &store,
-            &packet,
-            &refresh,
-            suggested_next_query,
-            if packet.results.is_empty() {
-                broadened_search_json(&args, &query)
-            } else {
-                Value::Null
-            },
-        ))?;
+    let next_argv = search_next_argv(
+        &replay_args,
+        search_format,
+        page.pagination.continuation.as_deref(),
+    );
+    let next_command = next_argv.as_ref().map(|argv| command_from_argv(argv));
+    if search_format == OutputFormat::Jsonl {
+        let stdout = std::io::stdout();
+        let mut writer = stdout.lock();
+        finish_paged_stdout((|| -> Result<()> {
+            write_search_jsonl(&mut writer, &page, next_command, next_argv)?;
+            writer.flush()?;
+            Ok(())
+        })())?;
+    } else if search_format == OutputFormat::Json {
+        let broadened = if page.results.is_empty() {
+            broadened_search_json(&args, &query)
+        } else {
+            Value::Null
+        };
+        let value = search_page_json(&page, &refresh, broadened, next_command, next_argv)?;
+        let stdout = std::io::stdout();
+        let mut writer = stdout.lock();
+        finish_paged_stdout((|| -> Result<()> {
+            writer.write_all(&serde_json::to_vec_pretty(&value)?)?;
+            writer.write_all(b"\n")?;
+            writer.flush()?;
+            Ok(())
+        })())?;
     } else {
         if refresh.status == "failed" && args.refresh == RefreshArg::Auto {
             if let Some(error) = &refresh.error {
@@ -4516,8 +4696,8 @@ fn run_search(args: SearchArgs, data_root: PathBuf) -> Result<()> {
                 "warning: search refresh detected zero-yield import health anomalies; serving search results; run `ctx doctor` or `ctx import --strict`"
             );
         }
-        println!(
-            "freshness: refresh {} ({}), duration {}ms, index age {}, imported sessions/events/edges {}/{}/{}, skipped {}, unchanged {}, failed {}",
+        let mut output = format!(
+            "freshness: refresh {} ({}), duration {}ms, index age {}, imported sessions/events/edges {}/{}/{}, skipped {}, unchanged {}, failed {}\n",
             refresh.status,
             refresh.reason,
             refresh.duration_ms,
@@ -4532,172 +4712,332 @@ fn run_search(args: SearchArgs, data_root: PathBuf) -> Result<()> {
             refresh.totals.unchanged_sources,
             refresh.totals.failed,
         );
-        if packet.results.is_empty() {
+        if page.results.is_empty() {
             if let Some(file) = args
                 .file
                 .as_deref()
                 .filter(|_| query.trim().is_empty() && !uses_composed_terms)
             {
-                println!("no indexed events touched {}", file.display());
+                output.push_str(&format!("no indexed events touched {}\n", file.display()));
                 let indexed_items = indexed_history_item_count(&store)?;
                 if indexed_items == 0 {
-                    println!("next: ctx import --all");
+                    output.push_str("next: ctx import --all\n");
                 } else {
-                    println!(
-                        "next: ctx search {}",
+                    output.push_str(&format!(
+                        "next: ctx search {}\n",
                         shell_quote_arg(&file.display().to_string())
-                    );
+                    ));
                 }
             } else {
-                println!(
-                    "no results for {}",
+                output.push_str(&format!(
+                    "no results for {}\n",
                     search_no_results_target(&query, &args.term)
-                );
+                ));
                 let indexed_items = indexed_history_item_count(&store)?;
                 if indexed_items == 0 {
-                    println!("next: ctx import --all");
+                    output.push_str("next: ctx import --all\n");
                 } else {
-                    println!("hint: default matching is --match all: all words in one query/--term must appear in one indexed section; repeated --term clauses are OR; filters are AND. Use --match phrase for adjacent ordered words or --match any to broaden.");
+                    output.push_str("hint: default matching is --match all: all words in one query/--term must appear in one indexed section; repeated --term clauses are OR; filters are AND. Use --match phrase for adjacent ordered words or --match any to broaden.\n");
                     if let Some(command) = broader_search_command(&args, &query) {
-                        println!("suggestion (not run): {command}");
+                        output.push_str(&format!("suggestion (not run): {command}\n"));
                     } else {
-                        println!("next: try another query or remove filters");
+                        output.push_str("next: try another query or remove filters\n");
                     }
                 }
             }
         }
-        let suggested_next_query = (!uses_composed_terms).then_some(query.as_str());
-        for (index, result) in packet.results.iter().enumerate() {
-            if args.verbose {
-                print_search_result_verbose(result, suggested_next_query, packet.query_plan.mode);
-            } else {
-                print_search_result_compact(index + 1, result);
-            }
+        let markdown = search_format == OutputFormat::Markdown;
+        for (index, result) in page.results.iter().enumerate() {
+            render_search_result(
+                &mut output,
+                page.pagination.offset + index + 1,
+                result,
+                args.verbose,
+                markdown,
+                args.term.is_empty().then_some(query.as_str()),
+                args.r#match.into(),
+            );
         }
+        render_page_summary(
+            &mut output,
+            PageSummary {
+                noun: "results",
+                offset: page.pagination.offset,
+                returned: page.pagination.returned_items,
+                omitted_before: page.omitted.before,
+                omitted_after: page.omitted.after,
+                exact: page.omitted.exact,
+                next_command: next_command.as_deref(),
+            },
+            markdown,
+        );
+        output.push_str(&format!(
+            "search source truncation: omitted {} ({}){}\n",
+            page.source_truncation.omitted_results,
+            if page.source_truncation.omitted_results_exact {
+                "exact"
+            } else {
+                "lower-bound"
+            },
+            page.source_truncation
+                .reason
+                .as_deref()
+                .map(|reason| format!(", reason {reason}"))
+                .unwrap_or_default()
+        ));
+        let stdout = std::io::stdout();
+        let mut writer = stdout.lock();
+        finish_paged_stdout((|| -> Result<()> {
+            writer.write_all(output.as_bytes())?;
+            writer.flush()?;
+            Ok(())
+        })())?;
     }
     Ok(())
 }
 
-fn print_search_result_compact(index: usize, result: &ctx_history_search::SearchPacketResult) {
-    println!("{index}. {}", result.title);
-    let summary = search_result_summary(result);
-    if !summary.is_empty() {
-        println!("   {}", summary.join(" | "));
+pub(crate) fn search_page_json(
+    page: &SearchPageV1,
+    refresh: &SearchRefreshReport,
+    broadened_search: Value,
+    next_command: Option<String>,
+    next_argv: Option<Vec<String>>,
+) -> Result<Value> {
+    let mut value = serde_json::to_value(page)?;
+    let object = value
+        .as_object_mut()
+        .expect("query search page serializes as an object");
+    object.insert("freshness".into(), refresh.to_json());
+    object.insert("broadened_search".into(), broadened_search);
+    object.insert("next".into(), json!(page.pagination.continuation));
+    object.insert("next_command".into(), json!(next_command));
+    object.insert("next_argv".into(), json!(next_argv));
+    object.insert("share_safe".into(), Value::Bool(false));
+    if let Some(pagination) = object.get_mut("pagination").and_then(Value::as_object_mut) {
+        pagination.insert("cursor".into(), json!(page.pagination.continuation));
     }
-    let snippet = result.snippet.trim();
-    if !snippet.is_empty() {
-        println!("   {snippet}");
-    }
-    if result.result_scope == ctx_history_search::SearchResultScope::Session
-        && result.more_matches_in_session > 0
-    {
-        println!(
-            "   {} more results from this session",
-            result.more_matches_in_session
-        );
-    }
-    if let Some(command) = search_inspect_command(result) {
-        println!("   inspect: {command}");
-    }
-}
-
-fn print_search_result_verbose(
-    result: &ctx_history_search::SearchPacketResult,
-    suggested_next_query: Option<&str>,
-    match_mode: SearchMatchMode,
-) {
-    println!("{}", result.title);
-    if let Some(event_id) = result.event_id {
-        println!("  ctx_event_id: {event_id}");
-    }
-    if let Some(session_id) = result.session_id {
-        println!("  ctx_session_id: {session_id}");
-    }
-    if let Some(provider_session_id) = &result.provider_session_id {
-        println!("  provider_session_id: {provider_session_id}");
-    }
-    if let Some(history_source) = &result.history_source {
-        println!("  history_source: {history_source}");
-    }
-    if let Some(provider_key) = &result.provider_key {
-        println!("  provider_key: {provider_key}");
-    }
-    if let Some(source_id) = &result.source_id {
-        println!("  source_id: {source_id}");
-    }
-    if let Some(source_format) = &result.source_format {
-        println!("  source_format: {source_format}");
-    }
-    println!("  {}", result.snippet);
-    println!("  rank: {:.2}", result.rank);
-    if !result.why_matched.is_empty() {
-        println!("  why_matched: {}", result.why_matched.join(", "));
-    }
-    if result.result_scope == ctx_history_search::SearchResultScope::Session {
-        println!("  session_importance: {:.2}", result.session_importance);
-        if result.more_matches_in_session > 0 {
-            println!(
-                "  more_matches_in_session: {}",
-                result.more_matches_in_session
+    object.insert(
+        "truncation".into(),
+        json!({
+            "truncated": page.source_truncation.truncated,
+            "omitted_results": page.source_truncation.omitted_results,
+            "omitted_results_exact": page.source_truncation.omitted_results_exact,
+            "reason": page.source_truncation.reason,
+        }),
+    );
+    match &page.context {
+        SearchContextProjectionV1::Full(context) => {
+            object.insert("query".into(), json!(page.legacy_query));
+            object.insert("terms".into(), json!(context.terms));
+            object.insert("filters".into(), serde_json::to_value(&context.filters)?);
+            add_full_search_page_compatibility(
+                object,
+                &context.query,
+                context.match_mode,
+                context.terms.is_empty(),
             );
         }
+        SearchContextProjectionV1::Compact(_) => {}
     }
-    for command in search_next_commands(result, suggested_next_query, match_mode)
-        .into_iter()
-        .take(3)
-    {
-        println!("  next: {command}");
-    }
-    for citation in result.citations.iter().take(2) {
-        println!(
-            "  citation: {} {}",
-            public_citation_item_type(citation.citation_type),
-            citation.id
-        );
+    Ok(value)
+}
+
+fn add_full_search_page_compatibility(
+    object: &mut serde_json::Map<String, Value>,
+    _query: &str,
+    _match_mode: SearchMatchMode,
+    _include_scoped_search: bool,
+) {
+    if let Some(filters) = object.get_mut("filters").and_then(Value::as_object_mut) {
+        filters.insert("primary_only".into(), Value::Null);
+        if let Some(excluded) = filters
+            .get_mut("exclude_provider_session")
+            .and_then(Value::as_object_mut)
+        {
+            if let Some(id) = excluded.get("ctx_session_id").cloned() {
+                excluded.insert("session_id".into(), id);
+            }
+        }
     }
 }
 
-fn search_result_summary(result: &ctx_history_search::SearchPacketResult) -> Vec<String> {
-    let mut summary = Vec::new();
-    if let Some(provider) = result.provider {
-        summary.push(provider.as_str().to_owned());
-    }
-    if let Some(history_source) = &result.history_source {
-        summary.push(history_source.clone());
-    } else if let (Some(provider_key), Some(source_id)) = (&result.provider_key, &result.source_id)
-    {
-        summary.push(format!("{provider_key}/{source_id}"));
-    }
-    if result.result_scope == ctx_history_search::SearchResultScope::Session {
-        summary.push(format!("importance {:.2}", result.session_importance));
+fn render_search_result(
+    out: &mut String,
+    index: usize,
+    result: &SearchResultProjectionV1,
+    verbose: bool,
+    markdown: bool,
+    query: Option<&str>,
+    match_mode: SearchMatchMode,
+) {
+    let (title, snippet, rank, scope, importance, session_id, event_id, why, full) = match result {
+        SearchResultProjectionV1::Full(result) => (
+            result.title.as_str(),
+            result.snippet.as_str(),
+            result.rank,
+            result.result_scope,
+            result.session_importance,
+            result.ctx_session_id,
+            result.ctx_event_id,
+            result.why_matched.as_slice(),
+            Some(result.as_ref()),
+        ),
+        SearchResultProjectionV1::Compact(result) => (
+            result.title.as_str(),
+            result.snippet.as_str(),
+            result.rank,
+            result.result_scope,
+            result.session_importance,
+            result.ctx_session_id,
+            result.ctx_event_id,
+            result.why_matched.as_slice(),
+            None,
+        ),
+    };
+    if markdown {
+        out.push_str(&format!("\n## {index}. {title}\n\n"));
     } else {
-        summary.push(format!("rank {:.2}", result.rank));
+        out.push_str(&format!("{index}. {title}\n"));
     }
-    if let Some(session_id) = result.session_id {
-        summary.push(format!("session {}", short_uuid(session_id)));
+    if scope == ctx_history_search::SearchResultScope::Session {
+        out.push_str(&format!("   importance {importance:.2}"));
+    } else {
+        out.push_str(&format!("   rank {rank:.2}"));
     }
-    if let Some(event_id) = result.event_id {
-        summary.push(format!("event {}", short_uuid(event_id)));
+    if let Some(id) = session_id {
+        out.push_str(&format!(" | session {}", short_uuid(id)));
     }
-    if let Some(timestamp) = result.timestamp {
-        summary.push(timestamp.to_rfc3339());
+    if let Some(id) = event_id {
+        out.push_str(&format!(" | event {}", short_uuid(id)));
     }
-    summary
+    out.push('\n');
+    if !snippet.trim().is_empty() {
+        out.push_str(&format!("   {}\n", snippet.trim()));
+    }
+    if full.is_some() {
+        if let Some(id) = event_id {
+            out.push_str(&format!("   inspect: ctx show event {id} --window 10\n"));
+        } else if let Some(id) = session_id {
+            out.push_str(&format!("   inspect: ctx show session {id}\n"));
+        }
+    }
+    if verbose {
+        if let Some(id) = event_id {
+            out.push_str(&format!("   ctx_event_id: {id}\n"));
+        }
+        if let Some(id) = session_id {
+            out.push_str(&format!("   ctx_session_id: {id}\n"));
+        }
+        if !why.is_empty() {
+            out.push_str(&format!("   why_matched: {}\n", why.join(", ")));
+        }
+        if scope == ctx_history_search::SearchResultScope::Session {
+            out.push_str(&format!("   session_importance: {importance:.2}\n"));
+        }
+        if let Some(result) = full {
+            if let Some(value) = &result.provider_session_id {
+                out.push_str(&format!("   provider_session_id: {value}\n"));
+            }
+            if let Some(value) = &result.history_source {
+                out.push_str(&format!("   history_source: {value}\n"));
+            }
+            if let Some(value) = &result.source_path {
+                out.push_str(&format!("   source_path: {value}\n"));
+            }
+        }
+        if full.is_some() {
+            if let Some(id) = event_id {
+                out.push_str(&format!("   next: ctx show event {id} --window 10\n"));
+            }
+            if let Some(id) = session_id {
+                if let Some(query) = query.filter(|query| !query.trim().is_empty()) {
+                    let mut scoped = vec!["ctx".to_owned(), "search".to_owned(), query.to_owned()];
+                    if match_mode != SearchMatchMode::All {
+                        scoped.extend(["--match".to_owned(), match_mode.as_str().to_owned()]);
+                    }
+                    scoped.extend(["--session".to_owned(), id.to_string()]);
+                    out.push_str(&format!("   next: {}\n", command_from_argv(&scoped)));
+                }
+                out.push_str(&format!("   next: ctx show session {id}\n"));
+            }
+        }
+    }
 }
 
 fn short_uuid(id: Uuid) -> String {
     id.to_string().chars().take(8).collect()
 }
 
-fn search_inspect_command(result: &ctx_history_search::SearchPacketResult) -> Option<String> {
-    result
-        .event_id
-        .map(|id| format!("ctx show event {id} --window 10"))
-        .or_else(|| {
-            result
-                .session_id
-                .map(|id| format!("ctx show session {id} --mode lite"))
-        })
+pub(crate) fn search_next_argv(
+    args: &SearchArgs,
+    format: OutputFormat,
+    continuation: Option<&str>,
+) -> Option<Vec<String>> {
+    let continuation = continuation?;
+    let mut argv = vec!["ctx".to_owned(), "search".to_owned()];
+    for term in &args.term {
+        argv.extend(["--term".to_owned(), term.clone()]);
+    }
+    argv.extend(["--match".to_owned(), args.r#match.as_str().to_owned()]);
+    if let Some(provider) = args.provider {
+        argv.extend(["--provider".to_owned(), provider.cli_name().to_owned()]);
+    }
+    for (flag, value) in [
+        ("--history-source", args.history_source.as_deref()),
+        ("--provider-key", args.provider_key.as_deref()),
+        ("--source-id", args.source_id.as_deref()),
+        ("--source-format", args.source_format.as_deref()),
+        ("--workspace", args.workspace.as_deref()),
+        ("--since", args.since.as_deref()),
+        ("--event-type", args.event_type.as_deref()),
+        ("--exclude-tool", args.exclude_tool_name.as_deref()),
+        ("--session", args.session.as_deref()),
+    ] {
+        if let Some(value) = value {
+            argv.extend([flag.to_owned(), value.to_owned()]);
+        }
+    }
+    for role in &args.role {
+        argv.extend(["--role".to_owned(), role.clone()]);
+    }
+    for role in &args.exclude_role {
+        argv.extend(["--exclude-role".to_owned(), role.clone()]);
+    }
+    if let Some(file) = &args.file {
+        argv.extend(["--file".to_owned(), file.to_string_lossy().into_owned()]);
+    }
+    for (enabled, flag) in [
+        (args.primary_only, "--primary-only"),
+        (args.include_subagents, "--include-subagents"),
+        (args.exclude_tool_noise, "--exclude-tool-noise"),
+        (args.events, "--events"),
+        (args.include_current_session, "--include-current-session"),
+        (args.verbose, "--verbose"),
+    ] {
+        if enabled {
+            argv.push(flag.to_owned());
+        }
+    }
+    argv.extend([
+        "--fields".to_owned(),
+        args.fields.as_str().to_owned(),
+        "--limit".to_owned(),
+        args.limit.to_string(),
+        "--max-snippet-bytes".to_owned(),
+        args.max_snippet_bytes.to_string(),
+        "--max-page-bytes".to_owned(),
+        args.max_page_bytes.to_string(),
+        "--format".to_owned(),
+        format.as_str().to_owned(),
+        "--refresh".to_owned(),
+        "off".to_owned(),
+        "--continue".to_owned(),
+        continuation.to_owned(),
+    ]);
+    if let Some(query) = &args.query {
+        argv.extend(["--".to_owned(), query.clone()]);
+    }
+    Some(argv)
 }
 
 fn refresh_before_search(args: &SearchArgs, data_root: &Path) -> Result<SearchRefreshReport> {
@@ -6746,8 +7086,9 @@ fn home_dir() -> Option<PathBuf> {
 mod tests {
     use super::{
         catalog_import_checkpoint_matches, classify_import_health,
-        history_source_plugin_cursor_only, sha256_file_prefix_hex, shell_quote_arg, ImportHealth,
-        ImportHealthClassification, ImportReport, ImportSourceReport, ImportTotals, SourceStats,
+        history_source_plugin_cursor_only, sha256_file_prefix_hex, shell_quote_arg,
+        write_json_record, ImportHealth, ImportHealthClassification, ImportReport,
+        ImportSourceReport, ImportTotals, SourceStats,
     };
     use ctx_history_capture::ProviderImportSummary;
     use std::{fs, io::Write};
@@ -6760,6 +7101,27 @@ mod tests {
             shell_quote_arg("$(touch /tmp/ctx-owned)'s"),
             "'$(touch /tmp/ctx-owned)'\\''s'"
         );
+    }
+
+    struct OtherIoFailure;
+
+    impl Write for OtherIoFailure {
+        fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("not a broken pipe"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn ndjson_writer_propagates_non_broken_pipe_io_errors() {
+        let error =
+            write_json_record(&mut OtherIoFailure, &serde_json::json!({"ok": true})).unwrap_err();
+        assert!(error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::Other));
     }
 
     #[test]

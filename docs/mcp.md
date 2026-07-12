@@ -28,6 +28,31 @@ positions.
 MCP search and SQL query the existing index only. They do not refresh provider
 history, import files, initialize storage, or write provider data.
 
+MCP `search` and `show_session` use the same #195 query-owned pagination as CLI
+JSON. They accept `continue`, `fields`, `max_snippet_bytes`/`max_event_bytes`,
+and `max_page_bytes`, and return one bounded `structuredContent` response with
+the same `pagination`, exact omitted/range fields, byte accounting, `next`,
+`next_command`, and `next_argv` semantics. They also return canonical
+`next_arguments`, which can be passed directly to the same MCP tool. Relative
+search windows such as `30d` are frozen there as absolute RFC3339 timestamps.
+MCP search always behaves like `--refresh off`; generated continuation argv
+also forces `--refresh off`.
+Defaults/caps match the CLI: search limit 20/200, show limit 200/1000,
+per-item bytes 4096/1048576, and page bytes 262144/16777216. The page byte
+budget is only the exact sum of admitted final item JSON bytes, including full
+compatibility aliases and suggested commands; fixed
+response metadata is not capped as a whole-output budget.
+
+Continuation tokens are opaque, bind the complete request and a conservative
+SQLite snapshot, contain no private snippets/paths/query/provider metadata, and
+fail closed when malformed, wrong-kind, mismatched, or stale. `show_session`
+tokens do carry an opaque event ordering key inside the hex token for keyset
+resumption. Read-only MCP opens reject old schemas and never migrate or write.
+
+Repeated search input is limited at schema and runtime to 32 `terms`, 4096
+UTF-8 bytes per query clause, and 65536 aggregate query bytes. Raw duplicate and
+blank repeated clauses count toward the request-level clause limit.
+
 MCP `search` accepts `match: "all"|"any"|"phrase"`, matching the CLI. The
 positional `query` is one clause. `all` is the default and requires every
 normalized token in that clause to appear in one indexed section; order and
@@ -55,3 +80,8 @@ Tool results include MCP text content plus `structuredContent` JSON. Treat all
 MCP output as private local history: it may include absolute paths, source
 metadata, snippets, transcript text, and raw SQL result fields, and the MCP host
 may log or forward tool output.
+
+`fields: "compact"` is structurally smaller but still private. It excludes
+provider-session IDs, source IDs/metadata/path/existence, cwd, cursors,
+citations, raw payload, and suggested commands from the query projections; full
+output can include them.

@@ -3,6 +3,7 @@ members = [
     "crates/ctx-cli",
     "crates/ctx-history-capture",
     "crates/ctx-history-core",
+    "crates/ctx-history-query",
     "crates/ctx-history-search",
     "crates/ctx-history-store",
 ]

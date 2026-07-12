@@ -19,6 +19,9 @@ pub const SEARCH_PACKET_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_RESULT_LIMIT: usize = 10;
 pub const MAX_RESULT_LIMIT: usize = 200;
 pub const DEFAULT_SNIPPET_CHARS: usize = 320;
+pub const MAX_QUERY_CLAUSES: usize = 32;
+pub const MAX_QUERY_CLAUSE_BYTES: usize = 4 * 1024;
+pub const MAX_AGGREGATE_QUERY_BYTES: usize = 64 * 1024;
 const LARGE_EVENT_CORPUS_THRESHOLD: i64 = 1_024;
 const FILTERED_SEARCH_PAGE_SIZE: usize = 500;
 const FILTERED_SEARCH_MAX_PAGES: usize = 20;
@@ -27,6 +30,8 @@ const FILTERED_SEARCH_MAX_PAGES: usize = 20;
 pub enum SearchError {
     #[error("store error: {0}")]
     Store(#[from] ctx_history_store::StoreError),
+    #[error("invalid search request: {0}")]
+    InvalidRequest(String),
 }
 
 pub type Result<T> = std::result::Result<T, SearchError>;
@@ -248,6 +253,7 @@ struct CandidateSearch {
 }
 
 pub fn search_packet(store: &Store, query: &str, options: &PacketOptions) -> Result<SearchPacket> {
+    validate_query_request(query, &[])?;
     search_packet_plan(
         store,
         SearchQueryPlan::new(options.match_mode, [query]),
@@ -290,6 +296,7 @@ fn search_packet_plan(
     if scan_budget_exhausted {
         truncation.truncated = true;
         truncation.omitted_results = 1;
+        truncation.omitted_results_is_lower_bound = true;
         truncation.reason = Some("scan_budget".to_owned());
     } else if candidates.len() > results.len() {
         truncation.truncated = true;
@@ -316,6 +323,7 @@ pub fn search_packet_terms(
     terms: &[String],
     options: &PacketOptions,
 ) -> Result<SearchPacket> {
+    validate_query_request(query, terms)?;
     let options = normalized_options(options);
     let search_terms = composed_search_terms(query, terms)
         .into_iter()
@@ -370,6 +378,7 @@ pub fn search_packet_terms(
             truncated: true,
             reason: Some(if truncated { "source_limit" } else { "limit" }.to_owned()),
             omitted_results: omitted_results.max(1),
+            omitted_results_is_lower_bound: truncated,
         }
     } else {
         ContextTruncation::default()
@@ -389,6 +398,32 @@ pub fn search_packet_terms(
         pagination: pagination(Some(cursor_offset), has_more),
         truncation,
     })
+}
+
+/// Bound public repeated-query work before normalization or deduplication.
+/// Raw duplicate and blank clauses count toward the request-level limit.
+pub fn validate_query_request(query: &str, terms: &[String]) -> Result<()> {
+    if terms.len() > MAX_QUERY_CLAUSES {
+        return Err(SearchError::InvalidRequest(format!(
+            "at most {MAX_QUERY_CLAUSES} repeated query clauses are allowed"
+        )));
+    }
+    for clause in std::iter::once(query).chain(terms.iter().map(String::as_str)) {
+        if clause.len() > MAX_QUERY_CLAUSE_BYTES {
+            return Err(SearchError::InvalidRequest(format!(
+                "each query clause must be at most {MAX_QUERY_CLAUSE_BYTES} UTF-8 bytes"
+            )));
+        }
+    }
+    let aggregate = std::iter::once(query.len())
+        .chain(terms.iter().map(String::len))
+        .try_fold(0usize, |total, bytes| total.checked_add(bytes));
+    if aggregate.map_or(true, |bytes| bytes > MAX_AGGREGATE_QUERY_BYTES) {
+        return Err(SearchError::InvalidRequest(format!(
+            "aggregate query text must be at most {MAX_AGGREGATE_QUERY_BYTES} UTF-8 bytes"
+        )));
+    }
+    Ok(())
 }
 
 fn composed_search_terms(query: &str, terms: &[String]) -> Vec<String> {
@@ -753,12 +788,14 @@ fn fast_event_search_packet(
             truncated: true,
             reason: Some("scan_budget".to_owned()),
             omitted_results: 1,
+            omitted_results_is_lower_bound: true,
         }
     } else if has_more {
         ContextTruncation {
             truncated: true,
             reason: Some("limit".to_owned()),
             omitted_results: 1,
+            omitted_results_is_lower_bound: true,
         }
     } else {
         ContextTruncation::default()
@@ -4533,6 +4570,21 @@ mod tests {
             SearchResultScope::Event
         );
         assert_eq!(event_packet.results[0].event_id, Some(target_event_id));
+
+        let truncated_fast = search_packet(
+            &store,
+            "ordinary large history event",
+            &PacketOptions {
+                limit: 1,
+                result_mode: SearchResultMode::Events,
+                ..PacketOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(truncated_fast.truncation.truncated);
+        assert_eq!(truncated_fast.truncation.reason.as_deref(), Some("limit"));
+        assert_eq!(truncated_fast.truncation.omitted_results, 1);
+        assert!(truncated_fast.truncation.omitted_results_is_lower_bound);
     }
 
     #[test]
@@ -5741,6 +5793,26 @@ mod tests {
         assert_eq!(packet.results.len(), MAX_RESULT_LIMIT);
         assert!(packet.truncation.truncated);
         assert_eq!(packet.truncation.reason.as_deref(), Some("limit"));
+    }
+
+    #[test]
+    fn repeated_query_requests_are_bounded_before_deduplication() {
+        assert!(
+            validate_query_request("q", &vec!["duplicate".to_owned(); MAX_QUERY_CLAUSES]).is_ok()
+        );
+        assert!(matches!(
+            validate_query_request("q", &vec!["duplicate".to_owned(); MAX_QUERY_CLAUSES + 1]),
+            Err(SearchError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            validate_query_request(&"x".repeat(MAX_QUERY_CLAUSE_BYTES + 1), &[]),
+            Err(SearchError::InvalidRequest(_))
+        ));
+        let aggregate_terms = vec!["x".repeat(MAX_QUERY_CLAUSE_BYTES); MAX_QUERY_CLAUSES];
+        assert!(matches!(
+            validate_query_request("q", &aggregate_terms),
+            Err(SearchError::InvalidRequest(_))
+        ));
     }
 
     #[test]

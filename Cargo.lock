@@ -244,6 +244,7 @@ dependencies = [
  "clap_mangen",
  "ctx-history-capture",
  "ctx-history-core",
+ "ctx-history-query",
  "ctx-history-search",
  "ctx-history-store",
  "libc",
@@ -280,6 +281,23 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "ctx-history-query"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "ctx-history-core",
+ "ctx-history-search",
+ "ctx-history-store",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
  "thiserror",
  "uuid",
 ]

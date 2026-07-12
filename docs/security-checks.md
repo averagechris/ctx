@@ -28,6 +28,10 @@ the local retrieval product.
 - Search/show/locate JSON and SQLite search projections preserve local
   transcript text by default, including absolute paths and secret-shaped
   strings. They must be treated as private local data.
+- Search/show continuation tokens are not persisted by ctx, contain no transcript
+  or provider/path/query metadata, and are validated against the current request
+  plus a local SQLite snapshot. Read-only search/show/MCP paths must reject old
+  schemas rather than migrate or write.
 - The legacy `safe_preview` state and `safe_preview_text` columns mean local
   searchable preview text, not share-safe redaction.
 - Unsupported providers remain explicit in the provider support matrix.

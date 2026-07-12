@@ -1,3 +1,4 @@
+use std::io::{Read, Seek, SeekFrom};
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     ffi::CString,
@@ -92,6 +93,8 @@ pub enum StoreError {
     },
     #[error("SQL query timed out after {timeout_ms}ms")]
     RawSqlTimedOut { timeout_ms: u64 },
+    #[error("{field} is outside the supported numeric range")]
+    NumericOutOfRange { field: &'static str },
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -127,7 +130,7 @@ impl IdPrefixAmbiguity {
     }
 }
 
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 1000;
 const BUSY_TIMEOUT: Duration = Duration::from_millis(30_000);
 const OBJECTS_DIR: &str = "objects";
 const SPOOL_DIR: &str = "spool";
@@ -146,6 +149,20 @@ pub const RAW_SQL_DEFAULT_MAX_SQL_BYTES: usize = 64 * 1024;
 pub const RAW_SQL_MAX_SQL_BYTES_CAP: usize = 1_048_576;
 pub const RAW_SQL_DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const RAW_SQL_MAX_TIMEOUT: Duration = Duration::from_secs(60);
+/// Hard bound for every event window/page read performed by the store.
+pub const MAX_BOUNDED_EVENT_READ: usize = 10_000;
+
+/// Store-owned transcript selection, kept independent of presentation crates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectedEventMode {
+    /// Message events whose role is user, assistant, or system.
+    Full,
+    /// User messages plus the final assistant message before the next user or
+    /// session end. Tool, system, and non-message events do not participate.
+    Lite,
+    /// Every event in key order.
+    Log,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawSqlOptions {
@@ -1008,6 +1025,11 @@ CREATE INDEX IF NOT EXISTS idx_local_workspaces_vcs_workspace_id ON local_worksp
 CREATE INDEX IF NOT EXISTS idx_audit_log_source_id ON audit_log(source_id);
 "#;
 
+const V1000_INDEXES_SQL: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_sessions_provider_external_session_started ON sessions(provider, external_session_id, started_at_ms DESC, id);
+CREATE INDEX IF NOT EXISTS idx_events_session_seq_id ON events(session_id, seq, id);
+"#;
+
 // `safe_preview_text` is legacy schema naming. It stores local searchable
 // preview text and must not be interpreted as share-safe redaction.
 const FTS_TABLES_SQL: &str = r#"
@@ -1227,31 +1249,48 @@ impl Store {
     pub fn open_with_busy_timeout(path: impl AsRef<Path>, busy_timeout: Duration) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let mut migrated_legacy_layout = false;
-        if let Some(parent) = path.parent() {
-            migrated_legacy_layout = migrate_legacy_history_layout(parent)?;
-            fs::create_dir_all(parent)?;
-            restrict_private_dir(parent)?;
+        let existed = path.exists();
+        if !existed {
+            if let Some(parent) = path.parent() {
+                // Reject an unsupported legacy database before moving any
+                // legacy files into the current layout.
+                reject_unsupported_schema_at(
+                    &parent.join(LEGACY_HISTORY_DIR_NAME).join("work.sqlite"),
+                )?;
+            }
+        }
+        if !existed {
+            if let Some(parent) = path.parent() {
+                migrated_legacy_layout = migrate_legacy_history_layout(parent)?;
+                fs::create_dir_all(parent)?;
+            }
         }
         let object_dir = path
             .parent()
             .map(|parent| parent.join(OBJECTS_DIR))
             .unwrap_or_else(|| PathBuf::from(OBJECTS_DIR));
-        fs::create_dir_all(&object_dir)?;
-        restrict_private_dir(&object_dir)?;
-        if let Some(spool_dir) = path.parent().map(|parent| parent.join(SPOOL_DIR)) {
-            fs::create_dir_all(&spool_dir)?;
-            restrict_private_dir(&spool_dir)?;
-        }
         let conn = Connection::open(&path)?;
-        restrict_private_file(&path)?;
-        configure_connection(&conn, busy_timeout)?;
         let store = Self {
             path,
             object_dir,
             conn,
             busy_timeout,
         };
+        // Schema validation is deliberately the first operation for an
+        // existing database. Unsupported versions must not trigger chmod,
+        // directory creation, legacy moves, or persistent connection PRAGMAs.
         store.migrate()?;
+        if let Some(parent) = store.path.parent() {
+            fs::create_dir_all(parent)?;
+            restrict_private_dir(parent)?;
+        }
+        fs::create_dir_all(&store.object_dir)?;
+        restrict_private_dir(&store.object_dir)?;
+        if let Some(spool_dir) = store.path.parent().map(|parent| parent.join(SPOOL_DIR)) {
+            fs::create_dir_all(&spool_dir)?;
+            restrict_private_dir(&spool_dir)?;
+        }
+        restrict_private_file(&store.path)?;
         if migrated_legacy_layout {
             store.normalize_legacy_blob_paths()?;
         }
@@ -1424,13 +1463,15 @@ impl Store {
     }
 
     pub fn migrate(&self) -> Result<()> {
-        configure_connection(&self.conn, self.busy_timeout)?;
         let user_version: i64 = self
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if user_version > SCHEMA_VERSION {
+        if user_version > 15 && user_version != SCHEMA_VERSION {
             return Err(StoreError::UnsupportedSchemaVersion(user_version));
         }
+        // Validate the schema before any persistent connection PRAGMA (most
+        // notably journal_mode=WAL) so unsupported databases remain untouched.
+        configure_connection(&self.conn, self.busy_timeout)?;
         if user_version < 1 {
             migrate_to_v1(&self.conn)?;
         }
@@ -1475,6 +1516,9 @@ impl Store {
         }
         if user_version < 15 {
             migrate_to_v15(&self.conn)?;
+        }
+        if user_version < 1000 {
+            migrate_to_v1000(&self.conn)?;
         }
         create_fts_tables_if_supported(&self.conn)?;
         Ok(())
@@ -2404,6 +2448,25 @@ impl Store {
             .map_err(StoreError::from)
     }
 
+    pub fn sessions_by_external_session(
+        &self,
+        provider: CaptureProvider,
+        external_session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<Session>> {
+        let mut stmt = self.conn.prepare(
+            session_select_sql(
+                "WHERE provider = ?1 AND external_session_id = ?2 ORDER BY started_at_ms DESC, id LIMIT ?3",
+            )
+            .as_str(),
+        )?;
+        let rows = stmt.query_map(
+            params![provider.as_str(), external_session_id, limit as i64],
+            session_from_row,
+        )?;
+        collect_rows(rows)
+    }
+
     pub fn existing_external_session_ids(
         &self,
         provider: CaptureProvider,
@@ -2844,6 +2907,209 @@ impl Store {
         )?;
         let rows = stmt.query_map(params![session_id.to_string()], event_from_row)?;
         collect_rows(rows)
+    }
+
+    pub fn event_count_for_session(&self, session_id: Uuid) -> Result<usize> {
+        self.selected_event_count_for_session(session_id, SelectedEventMode::Log)
+    }
+
+    pub fn events_for_session_after(
+        &self,
+        session_id: Uuid,
+        after: Option<(u64, Uuid)>,
+        limit: usize,
+    ) -> Result<Vec<Event>> {
+        self.selected_events_for_session_after(session_id, SelectedEventMode::Log, after, limit)
+    }
+
+    /// Count exactly the events selected by `mode`.
+    pub fn selected_event_count_for_session(
+        &self,
+        session_id: Uuid,
+        mode: SelectedEventMode,
+    ) -> Result<usize> {
+        let sql = format!(
+            "SELECT COUNT(*) FROM events AS e WHERE e.session_id = ?1 AND ({})",
+            selected_event_predicate(mode)
+        );
+        let count = self
+            .conn
+            .query_row(&sql, params![session_id.to_string()], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        usize::try_from(count).map_err(|_| StoreError::NumericOutOfRange {
+            field: "selected event count",
+        })
+    }
+
+    /// Read a bounded keyset page over the events selected by `mode`.
+    ///
+    /// Selection is applied before `LIMIT`, so pages are over selected
+    /// transcript records rather than raw event rows.
+    pub fn selected_events_for_session_after(
+        &self,
+        session_id: Uuid,
+        mode: SelectedEventMode,
+        after: Option<(u64, Uuid)>,
+        limit: usize,
+    ) -> Result<Vec<Event>> {
+        let limit = i64::try_from(limit.min(MAX_BOUNDED_EVENT_READ)).map_err(|_| {
+            StoreError::NumericOutOfRange {
+                field: "event page limit",
+            }
+        })?;
+        let (seq, id) = match after {
+            Some((seq, id)) => (
+                i64::try_from(seq).map_err(|_| StoreError::NumericOutOfRange {
+                    field: "event cursor sequence",
+                })?,
+                id.to_string(),
+            ),
+            None => (-1, String::new()),
+        };
+        let tail = format!(
+            "AS e WHERE e.session_id = ?1 AND ({}) AND (e.seq, e.id) > (?2, ?3) ORDER BY e.seq, e.id LIMIT ?4",
+            selected_event_predicate(mode)
+        );
+        let mut stmt = self.conn.prepare(event_select_sql(&tail).as_str())?;
+        let rows = stmt.query_map(
+            params![session_id.to_string(), seq, id, limit],
+            event_from_row,
+        )?;
+        collect_rows(rows)
+    }
+
+    /// Return the zero-based selected position for an exact event cursor.
+    ///
+    /// Uses the same session/mode selection predicate and `(seq, id)` ordering
+    /// as `selected_events_for_session_after`, so callers can validate cursor
+    /// semantics without duplicating store-layer transcript selection rules.
+    pub fn selected_event_cursor_position(
+        &self,
+        session_id: Uuid,
+        mode: SelectedEventMode,
+        cursor: (u64, Uuid),
+    ) -> Result<Option<usize>> {
+        let seq = i64::try_from(cursor.0).map_err(|_| StoreError::NumericOutOfRange {
+            field: "event cursor sequence",
+        })?;
+        let id = cursor.1.to_string();
+        let selected = selected_event_predicate(mode);
+        let sql = format!(
+            r#"
+            SELECT CASE
+                WHEN EXISTS (
+                    SELECT 1 FROM events AS e
+                    WHERE e.session_id = ?1
+                      AND e.seq = ?2
+                      AND e.id = ?3
+                      AND ({selected})
+                ) THEN (
+                    SELECT COUNT(*) FROM events AS e
+                    WHERE e.session_id = ?1
+                      AND ({selected})
+                      AND (e.seq, e.id) < (?2, ?3)
+                )
+                ELSE NULL
+            END
+            "#
+        );
+        let position: Option<i64> =
+            self.conn
+                .query_row(&sql, params![session_id.to_string(), seq, id], |row| {
+                    row.get(0)
+                })?;
+        position
+            .map(|position| {
+                usize::try_from(position).map_err(|_| StoreError::NumericOutOfRange {
+                    field: "selected event cursor position",
+                })
+            })
+            .transpose()
+    }
+
+    pub fn event_window_bounded(
+        &self,
+        event_id: Uuid,
+        before: usize,
+        after: usize,
+    ) -> Result<Vec<Event>> {
+        let event = self.get_event(event_id)?;
+        let Some(session_id) = event.session_id else {
+            return Ok(vec![event]);
+        };
+        let before = i64::try_from(before.min(MAX_BOUNDED_EVENT_READ)).map_err(|_| {
+            StoreError::NumericOutOfRange {
+                field: "event window before",
+            }
+        })?;
+        let after = i64::try_from(after.min(MAX_BOUNDED_EVENT_READ)).map_err(|_| {
+            StoreError::NumericOutOfRange {
+                field: "event window after",
+            }
+        })?;
+        let event_seq = i64::try_from(event.seq).map_err(|_| StoreError::NumericOutOfRange {
+            field: "event sequence",
+        })?;
+        let mut before_stmt = self.conn.prepare(
+            event_select_sql(
+                "WHERE session_id = ?1 AND (seq, id) < (?2, ?3) ORDER BY seq DESC, id DESC LIMIT ?4",
+            )
+            .as_str(),
+        )?;
+        let before_rows = before_stmt.query_map(
+            params![
+                session_id.to_string(),
+                event_seq,
+                event.id.to_string(),
+                before
+            ],
+            event_from_row,
+        )?;
+        let mut events = collect_rows(before_rows)?;
+        events.reverse();
+        events.push(event.clone());
+        let mut after_stmt = self.conn.prepare(
+            event_select_sql(
+                "WHERE session_id = ?1 AND (seq, id) > (?2, ?3) ORDER BY seq, id LIMIT ?4",
+            )
+            .as_str(),
+        )?;
+        let after_rows = after_stmt.query_map(
+            params![
+                session_id.to_string(),
+                event_seq,
+                event.id.to_string(),
+                after
+            ],
+            event_from_row,
+        )?;
+        events.extend(collect_rows(after_rows)?);
+        Ok(events)
+    }
+
+    pub fn snapshot_fingerprint(&self) -> Result<String> {
+        let mut hasher = Sha256::new();
+        hasher.update(b"ctx-store-physical-snapshot-v1\0");
+        for pragma in [
+            "user_version",
+            "schema_version",
+            "data_version",
+            "page_count",
+            "freelist_count",
+        ] {
+            let value: i64 = self
+                .conn
+                .query_row(&format!("PRAGMA {pragma}"), [], |row| row.get(0))?;
+            hash_tagged_bytes(&mut hasher, pragma.as_bytes());
+            hasher.update(value.to_be_bytes());
+        }
+        fingerprint_file_stable(&self.path, b"main", &mut hasher)?;
+        fingerprint_file_stable(&self.wal_path(), b"wal", &mut hasher)?;
+        let mut shm_path = self.path.as_os_str().to_os_string();
+        shm_path.push("-shm");
+        fingerprint_shm_stable(Path::new(&shm_path), &mut hasher)?;
+        Ok(hex_digest(hasher.finalize().as_slice()))
     }
 
     pub fn events_for_record(&self, record_id: Uuid) -> Result<Vec<Event>> {
@@ -4383,6 +4649,18 @@ fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+fn reject_unsupported_schema_at(path: &Path) -> Result<()> {
+    if !path.is_file() {
+        return Ok(());
+    }
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let user_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if user_version > 15 && user_version != SCHEMA_VERSION {
+        return Err(StoreError::UnsupportedSchemaVersion(user_version));
+    }
+    Ok(())
+}
+
 fn migrate_legacy_history_layout(data_root: &Path) -> Result<bool> {
     let legacy_dir = data_root.join(LEGACY_HISTORY_DIR_NAME);
     if !legacy_dir.is_dir() {
@@ -5226,6 +5504,28 @@ fn migrate_to_v15(conn: &Connection) -> Result<()> {
             }
             if foreign_keys_enabled != 0 {
                 conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+            }
+            Err(err)
+        }
+    }
+}
+
+fn migrate_to_v1000(conn: &Connection) -> Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let migration = (|| -> Result<()> {
+        conn.execute_batch(V1000_INDEXES_SQL)?;
+        conn.execute_batch("PRAGMA user_version = 1000;")?;
+        Ok(())
+    })();
+
+    match migration {
+        Ok(()) => {
+            conn.execute_batch("COMMIT;")?;
+            Ok(())
+        }
+        Err(err) => {
+            if let Err(rollback_err) = conn.execute_batch("ROLLBACK;") {
+                return Err(StoreError::Sql(rollback_err));
             }
             Err(err)
         }
@@ -7342,6 +7642,124 @@ fn event_select_sql(tail: &str) -> String {
     )
 }
 
+fn selected_event_predicate(mode: SelectedEventMode) -> &'static str {
+    match mode {
+        SelectedEventMode::Log => "1 = 1",
+        SelectedEventMode::Full => {
+            "e.event_type = 'message' AND e.role IN ('user', 'assistant', 'system')"
+        }
+        SelectedEventMode::Lite => {
+            r#"e.event_type = 'message' AND (
+                e.role = 'user'
+                OR (
+                    e.role = 'assistant'
+                    AND COALESCE((
+                        SELECT next.role
+                        FROM events AS next
+                        WHERE next.session_id = e.session_id
+                          AND next.event_type = 'message'
+                          AND next.role IN ('user', 'assistant')
+                          AND (next.seq, next.id) > (e.seq, e.id)
+                        ORDER BY next.seq, next.id
+                        LIMIT 1
+                    ), 'user') = 'user'
+                )
+            )"#
+        }
+    }
+}
+
+const FINGERPRINT_SAMPLE_BYTES: usize = 4096;
+
+fn fingerprint_shm_stable(path: &Path, hasher: &mut Sha256) -> Result<()> {
+    hash_tagged_bytes(hasher, b"shm");
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            hasher.update([0]);
+            return Ok(());
+        }
+        Err(err) => return Err(StoreError::Io(err)),
+    };
+    hasher.update([1]);
+    hasher.update(metadata.len().to_be_bytes());
+    // The WAL-index header and nBackfill checkpoint counter occupy the first
+    // 100 bytes. Bytes after that include reader marks and lock bytes which a
+    // read-only open legitimately mutates; hashing those would invalidate a
+    // continuation merely because the previous CLI process exited.
+    let mut header = [0_u8; 100];
+    let mut file = fs::File::open(path)?;
+    let read = file.read(&mut header)?;
+    hash_tagged_bytes(hasher, &header[..read]);
+    Ok(())
+}
+
+fn fingerprint_file_stable(path: &Path, role: &[u8], hasher: &mut Sha256) -> Result<()> {
+    hash_tagged_bytes(hasher, role);
+    let before = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            hasher.update([0]);
+            return Ok(());
+        }
+        Err(err) => return Err(StoreError::Io(err)),
+    };
+    hasher.update([1]);
+    hash_file_metadata(hasher, &before);
+
+    let mut file = fs::File::open(path)?;
+    let mut sample = vec![0_u8; FINGERPRINT_SAMPLE_BYTES];
+    let first_read = file.read(&mut sample)?;
+    hash_tagged_bytes(hasher, &sample[..first_read]);
+    if before.len() > FINGERPRINT_SAMPLE_BYTES as u64 {
+        let tail_start = before.len().saturating_sub(FINGERPRINT_SAMPLE_BYTES as u64);
+        file.seek(SeekFrom::Start(tail_start))?;
+        let tail_read = file.read(&mut sample)?;
+        hash_tagged_bytes(hasher, &sample[..tail_read]);
+    } else {
+        hash_tagged_bytes(hasher, &[]);
+    }
+
+    // A concurrent append/rewrite must not produce a silently hybrid sample.
+    // Hashing both observations is conservative and guarantees a subsequent
+    // before/after query check sees a different physical state.
+    let after = fs::metadata(path)?;
+    hash_file_metadata(hasher, &after);
+    Ok(())
+}
+
+fn hash_file_metadata(hasher: &mut Sha256, metadata: &fs::Metadata) {
+    hasher.update(metadata.len().to_be_bytes());
+    match metadata.modified().ok().and_then(|value| {
+        value
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|duration| (duration.as_secs(), duration.subsec_nanos()))
+    }) {
+        Some((seconds, nanos)) => {
+            hasher.update([1]);
+            hasher.update(seconds.to_be_bytes());
+            hasher.update(nanos.to_be_bytes());
+        }
+        None => hasher.update([0]),
+    }
+}
+
+fn hash_tagged_bytes(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
 fn event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
     Ok(Event {
         id: parse_uuid(row.get::<_, String>(0)?)?,
@@ -8203,6 +8621,15 @@ mod catalog_tests {
             .unwrap()
     }
 
+    fn index_exists(conn: &Connection, index: &str) -> bool {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1)",
+            params![index],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
     fn fixed_time() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-06-23T12:00:00Z")
             .unwrap()
@@ -8225,6 +8652,178 @@ mod catalog_tests {
             deleted_at: None,
             metadata: serde_json::json!({}),
         }
+    }
+
+    #[test]
+    fn schema_v1000_adds_pagination_indexes_and_read_only_rejects_v15() {
+        let temp = tempdir();
+        let path = temp.path().join("work.sqlite");
+        let store = Store::open(&path).unwrap();
+        let user_version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(user_version, 1000);
+        let event_plan = store
+            .conn
+            .prepare("EXPLAIN QUERY PLAN SELECT id FROM events WHERE session_id = ?1 AND (seq, id) > (?2, ?3) ORDER BY seq, id LIMIT ?4")
+            .unwrap()
+            .query_map(params![Uuid::nil().to_string(), 0_i64, "", 10_i64], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            event_plan.contains("idx_events_session_seq_id"),
+            "{event_plan}"
+        );
+        assert!(
+            event_plan.contains("(seq,id)>(?,?)"),
+            "keyset plan did not use the composite range: {event_plan}"
+        );
+        assert!(
+            !event_plan.to_ascii_lowercase().contains("scan events"),
+            "{event_plan}"
+        );
+        let provider_plan = store
+            .conn
+            .prepare("EXPLAIN QUERY PLAN SELECT id FROM sessions WHERE provider = ?1 AND external_session_id = ?2 ORDER BY started_at_ms DESC, id LIMIT ?3")
+            .unwrap()
+            .query_map(params![CaptureProvider::Codex.as_str(), "abc", 2_i64], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            provider_plan.contains("idx_sessions_provider_external_session_started"),
+            "{provider_plan}"
+        );
+        drop(store);
+
+        let legacy = temp.path().join("legacy.sqlite");
+        let conn = Connection::open(&legacy).unwrap();
+        conn.execute_batch(CREATE_TABLES_SQL).unwrap();
+        // CREATE_TABLES_SQL describes a fresh v1000 database. Reconstruct the
+        // actual v15 index set so this test proves the migration creates both
+        // fork indexes rather than merely observing fresh-schema DDL.
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_events_session_seq_id;
+             DROP INDEX IF EXISTS idx_sessions_provider_external_session_started;
+             PRAGMA user_version = 15;",
+        )
+        .unwrap();
+        drop(conn);
+        let err = match Store::open_read_only(&legacy) {
+            Ok(_) => panic!("legacy schema unexpectedly opened read-only"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, StoreError::UnsupportedSchemaVersion(15)));
+        let migrated = Store::open(&legacy).unwrap();
+        let migrated_version: i64 = migrated
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(migrated_version, 1000);
+        for index in [
+            "idx_events_session_seq_id",
+            "idx_sessions_provider_external_session_started",
+        ] {
+            assert!(
+                index_exists(&migrated.conn, index),
+                "migration did not create {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn writable_open_rejects_in_between_fork_schema_versions_without_mutation() {
+        for version in [16_i64, 999] {
+            let temp = tempdir();
+            let db = temp.path().join(format!("v{version}.sqlite"));
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(CREATE_TABLES_SQL).unwrap();
+            conn.execute_batch(&format!(
+                "PRAGMA journal_mode = DELETE; PRAGMA user_version = {version};"
+            ))
+            .unwrap();
+            drop(conn);
+            let modified_before = fs::metadata(&db).unwrap().modified().unwrap();
+            #[cfg(unix)]
+            let mode_before = {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::metadata(&db).unwrap().permissions().mode()
+            };
+
+            let err = match Store::open(&db) {
+                Ok(_) => panic!("unsupported schema v{version} unexpectedly opened"),
+                Err(err) => err,
+            };
+            assert!(matches!(err, StoreError::UnsupportedSchemaVersion(v) if v == version));
+            assert!(!temp.path().join(OBJECTS_DIR).exists());
+            assert!(!temp.path().join(SPOOL_DIR).exists());
+            assert_eq!(
+                fs::metadata(&db).unwrap().modified().unwrap(),
+                modified_before
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(fs::metadata(&db).unwrap().permissions().mode(), mode_before);
+            }
+
+            let conn = Connection::open(&db).unwrap();
+            let unchanged_version: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(unchanged_version, version);
+            let journal_mode: String = conn
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(journal_mode, "delete");
+            assert!(!index_exists(
+                &conn,
+                "idx_sessions_provider_external_session_started"
+            ));
+            assert!(!index_exists(&conn, "idx_events_session_seq_id"));
+        }
+    }
+
+    #[test]
+    fn v1000_migration_rolls_back_index_and_version_on_failure() {
+        let temp = tempdir();
+        let db = temp.path().join("rollback.sqlite");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(CREATE_TABLES_SQL).unwrap();
+        conn.execute_batch(
+            r#"
+            DROP INDEX IF EXISTS idx_sessions_provider_external_session_started;
+            DROP INDEX IF EXISTS idx_events_session_seq_id;
+            CREATE TABLE idx_events_session_seq_id(id TEXT PRIMARY KEY);
+            PRAGMA user_version = 15;
+            "#,
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(Store::open(&db).is_err());
+
+        let conn = Connection::open(&db).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 15);
+        assert!(!index_exists(
+            &conn,
+            "idx_sessions_provider_external_session_started"
+        ));
+        let blocking_table_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'idx_events_session_seq_id')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(blocking_table_exists);
     }
 
     fn catalog_session(
@@ -9556,6 +10155,189 @@ mod catalog_tests {
             )
             .unwrap();
         assert_eq!(store.latest_indexed_source_at_ms().unwrap(), Some(7000));
+    }
+
+    fn pagination_event(
+        session_id: Uuid,
+        seq: u64,
+        event_type: EventType,
+        role: Option<EventRole>,
+    ) -> Event {
+        Event {
+            id: Uuid::from_u128(20_000 + seq as u128),
+            seq,
+            history_record_id: None,
+            session_id: Some(session_id),
+            run_id: None,
+            event_type,
+            role,
+            occurred_at: fixed_time(),
+            capture_source_id: None,
+            payload: serde_json::json!({"text": format!("event-{seq}")}),
+            payload_blob_id: None,
+            dedupe_key: None,
+            redaction_state: RedactionState::LocalPreview,
+            sync: sync_metadata(),
+        }
+    }
+
+    #[test]
+    fn selected_event_modes_share_count_and_bounded_keyset_predicates() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let session = imported_session("selected-mode-session");
+        store.upsert_session(&session).unwrap();
+        let rows = [
+            (EventType::Message, Some(EventRole::System)),
+            (EventType::Message, Some(EventRole::User)),
+            (EventType::Message, Some(EventRole::Assistant)),
+            (EventType::ToolCall, Some(EventRole::Tool)),
+            (EventType::Message, Some(EventRole::Assistant)),
+            (EventType::Message, Some(EventRole::User)),
+            (EventType::Message, Some(EventRole::Assistant)),
+            (EventType::ToolOutput, Some(EventRole::Tool)),
+        ];
+        for (seq, (event_type, role)) in rows.into_iter().enumerate() {
+            store
+                .upsert_event(&pagination_event(session.id, seq as u64, event_type, role))
+                .unwrap();
+        }
+        for (mode, expected) in [
+            (SelectedEventMode::Log, vec![0, 1, 2, 3, 4, 5, 6, 7]),
+            (SelectedEventMode::Full, vec![0, 1, 2, 4, 5, 6]),
+            (SelectedEventMode::Lite, vec![1, 4, 5, 6]),
+        ] {
+            assert_eq!(
+                store
+                    .selected_event_count_for_session(session.id, mode)
+                    .unwrap(),
+                expected.len()
+            );
+            assert!(store
+                .selected_events_for_session_after(session.id, mode, None, 0)
+                .unwrap()
+                .is_empty());
+            let first = store
+                .selected_events_for_session_after(session.id, mode, None, 2)
+                .unwrap();
+            let second = store
+                .selected_events_for_session_after(
+                    session.id,
+                    mode,
+                    first.last().map(|event| (event.seq, event.id)),
+                    usize::MAX,
+                )
+                .unwrap();
+            let actual = first
+                .iter()
+                .chain(&second)
+                .map(|event| event.seq)
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+            for (position, seq) in expected.iter().enumerate() {
+                let id = Uuid::from_u128(20_000 + *seq as u128);
+                assert_eq!(
+                    store
+                        .selected_event_cursor_position(session.id, mode, (*seq, id))
+                        .unwrap(),
+                    Some(position)
+                );
+            }
+        }
+        assert_eq!(
+            store
+                .selected_event_cursor_position(
+                    session.id,
+                    SelectedEventMode::Lite,
+                    (2, Uuid::from_u128(20_002)),
+                )
+                .unwrap(),
+            None
+        );
+
+        let lite_plan = store
+            .conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN SELECT e.id FROM events AS e WHERE e.session_id = ?1 AND ({}) AND (e.seq, e.id) > (?2, ?3) ORDER BY e.seq, e.id LIMIT ?4",
+                selected_event_predicate(SelectedEventMode::Lite)
+            ))
+            .unwrap()
+            .query_map(params![session.id.to_string(), -1_i64, "", 10_i64], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            lite_plan.contains("idx_events_session_seq_id"),
+            "{lite_plan}"
+        );
+    }
+
+    #[test]
+    fn bounded_event_reads_cap_huge_limits_and_keep_sessionless_center() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let session = imported_session("long-session");
+        store.upsert_session(&session).unwrap();
+        let transaction = store.conn.unchecked_transaction().unwrap();
+        {
+            let mut statement = transaction
+                .prepare(
+                    "INSERT INTO events (id, seq, session_id, event_type, role, occurred_at_ms, payload_json) VALUES (?1, ?2, ?3, 'message', 'user', 0, '{}')",
+                )
+                .unwrap();
+            for seq in 0..=MAX_BOUNDED_EVENT_READ {
+                statement
+                    .execute(params![
+                        Uuid::from_u128(1_000_000 + seq as u128).to_string(),
+                        i64::try_from(seq).unwrap(),
+                        session.id.to_string()
+                    ])
+                    .unwrap();
+            }
+        }
+        transaction.commit().unwrap();
+        let bounded = store
+            .selected_events_for_session_after(session.id, SelectedEventMode::Log, None, usize::MAX)
+            .unwrap();
+        assert_eq!(bounded.len(), MAX_BOUNDED_EVENT_READ);
+
+        let mut sessionless = pagination_event(Uuid::nil(), 20_000, EventType::Notice, None);
+        sessionless.id = Uuid::from_u128(8_888_888);
+        sessionless.session_id = None;
+        store.upsert_event(&sessionless).unwrap();
+        assert_eq!(
+            store
+                .event_window_bounded(sessionless.id, usize::MAX, usize::MAX)
+                .unwrap(),
+            vec![sessionless]
+        );
+    }
+
+    #[test]
+    fn snapshot_fingerprint_is_stable_sha256_and_tracks_wal_changes() {
+        let temp = tempdir();
+        let path = temp.path().join("work.sqlite");
+        let store = Store::open(&path).unwrap();
+        let first = store.snapshot_fingerprint().unwrap();
+        let same = store.snapshot_fingerprint().unwrap();
+        assert_eq!(first, same);
+        assert_eq!(first.len(), 64);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+        let session = imported_session("fingerprint-session");
+        store.upsert_session(&session).unwrap();
+        let changed = store.snapshot_fingerprint().unwrap();
+        assert_ne!(first, changed);
+        store.checkpoint_wal_passive().unwrap();
+        let checkpointed = store.snapshot_fingerprint().unwrap();
+        assert_eq!(checkpointed.len(), 64);
+        assert_ne!(
+            changed, checkpointed,
+            "a physical checkpoint transition must conservatively stale tokens"
+        );
     }
 
     #[test]

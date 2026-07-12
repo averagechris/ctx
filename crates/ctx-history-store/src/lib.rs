@@ -445,6 +445,7 @@ pub struct EventSearchHit {
     pub record_title: Option<String>,
     pub record_kind: Option<String>,
     pub record_workspace: Option<String>,
+    pub tool_names: Vec<String>,
 }
 
 /// Agent-scope predicate that can be enforced inside the ranked event-search
@@ -486,18 +487,37 @@ pub enum EventSearchAgentScope {
 ///   representable millisecond (see `event_search_since_threshold_ms`).
 /// - `event_type` matches `e.event_type` (CHECK-constrained text enum).
 /// - `agent_scope` see `EventSearchAgentScope`.
+/// - `roles` / `exclude_roles` match `e.role` (CHECK-constrained text enum or
+///   NULL, the hydrated `hit.role`) through a total CASE-to-bitmask mapping;
+///   NULL maps to no bit, so include sets reject NULL-role rows and exclude
+///   sets keep them, exactly like the Rust `Option<EventRole>` predicate.
+/// - `exclude_tool_noise` drops the fixed tool/command `e.event_type` set the
+///   Rust predicate names (`tool_call`, `tool_output`, `command_started`,
+///   `command_output`, `command_finished`).
 ///
 /// Filters that require request-scoped context (repo substring matching, file
-/// touch scopes, excluded provider sessions, history-source identity) stay in
-/// Rust; callers keep `event_hit_matches_filters` as the final authority over
-/// every returned row.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// touch scopes, excluded provider sessions, history-source identity) or
+/// payload-derived data (`exclude_tool_names`, which parses tool/command
+/// executables out of `payload_json`) stay in Rust; callers keep
+/// `event_hit_matches_filters` as the final authority over every returned
+/// row.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EventSearchSqlFilters {
     pub session_id: Option<Uuid>,
     pub provider: Option<CaptureProvider>,
     pub since: Option<DateTime<Utc>>,
     pub event_type: Option<EventType>,
     pub agent_scope: Option<EventSearchAgentScope>,
+    /// Include only events whose stored `events.role` is one of these roles;
+    /// events with a NULL role never match a non-empty include set (mirrors
+    /// `role.is_some_and(..)` in the Rust predicate).
+    pub roles: Vec<EventRole>,
+    /// Exclude events whose stored `events.role` is one of these roles;
+    /// events with a NULL role are never excluded.
+    pub exclude_roles: Vec<EventRole>,
+    /// Exclude tool/command noise event types (`tool_call`, `tool_output`,
+    /// `command_started`, `command_output`, `command_finished`).
+    pub exclude_tool_noise: bool,
 }
 
 impl EventSearchSqlFilters {
@@ -507,6 +527,9 @@ impl EventSearchSqlFilters {
             && self.since.is_none()
             && self.event_type.is_none()
             && self.agent_scope.is_none()
+            && self.roles.is_empty()
+            && self.exclude_roles.is_empty()
+            && !self.exclude_tool_noise
     }
 }
 
@@ -4356,6 +4379,9 @@ impl Store {
                 filters.since.map(event_search_since_threshold_ms),
                 filters.event_type.map(EventType::as_str),
                 scope_mode,
+                event_role_mask(&filters.roles),
+                event_role_mask(&filters.exclude_roles),
+                i64::from(filters.exclude_tool_noise),
             ],
             event_search_hit_from_row,
         )?;
@@ -4576,6 +4602,15 @@ macro_rules! filtered_event_hits_page_sql {
                OR (?8 = 1
                    AND COALESCE(s.is_primary, rs.is_primary) IS NULL
                    AND COALESCE(s.agent_type, rs.agent_type) IS NULL))
+          AND (?9 = 0 OR (CASE e.role
+               WHEN 'user' THEN 1 WHEN 'assistant' THEN 2 WHEN 'system' THEN 4
+               WHEN 'tool' THEN 8 WHEN 'unknown' THEN 16 ELSE 0 END) & ?9 <> 0)
+          AND (?10 = 0 OR (CASE e.role
+               WHEN 'user' THEN 1 WHEN 'assistant' THEN 2 WHEN 'system' THEN 4
+               WHEN 'tool' THEN 8 WHEN 'unknown' THEN 16 ELSE 0 END) & ?10 = 0)
+          AND (?11 = 0 OR e.event_type NOT IN
+               ('tool_call', 'tool_output', 'command_started', 'command_output',
+                'command_finished'))
         ORDER BY bm25(event_search), e.occurred_at_ms DESC, e.seq DESC, event_search.event_id
         LIMIT ?2 OFFSET ?3"#,
         )
@@ -4619,6 +4654,28 @@ fn event_search_since_threshold_ms(since: DateTime<Utc>) -> i64 {
     }
 }
 
+/// Bit assigned to each `EventRole` variant in the role bitmask predicates of
+/// the filtered page SQL. The CASE expression in
+/// `filtered_event_hits_page_sql!` must map every variant string to exactly
+/// this bit (asserted by `role_mask_sql_case_covers_event_role_domain`); a
+/// NULL role falls through to the CASE ELSE arm (no bit), replicating the
+/// Rust `Option<EventRole>` include/exclude semantics.
+fn event_role_bit(role: EventRole) -> i64 {
+    match role {
+        EventRole::User => 1,
+        EventRole::Assistant => 2,
+        EventRole::System => 4,
+        EventRole::Tool => 8,
+        EventRole::Unknown => 16,
+    }
+}
+
+fn event_role_mask(roles: &[EventRole]) -> i64 {
+    roles
+        .iter()
+        .fold(0_i64, |mask, role| mask | event_role_bit(*role))
+}
+
 fn event_search_hit_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventSearchHit> {
     let payload_json = row.get::<_, String>(18)?;
     let source_metadata_json = row.get::<_, Option<String>>(19)?;
@@ -4651,7 +4708,47 @@ fn event_search_hit_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventS
         record_title: row.get(20)?,
         record_kind: row.get(21)?,
         record_workspace: row.get(22)?,
+        tool_names: event_tool_names_from_payload(&payload_json),
     })
+}
+
+fn event_tool_names_from_payload(payload_json: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload_json) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    collect_tool_names(&value, &mut names);
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn collect_tool_names(value: &serde_json::Value, names: &mut Vec<String>) {
+    let Some(object) = value.as_object() else {
+        return;
+    };
+    for key in ["tool", "name", "executable", "command"] {
+        if let Some(text) = object.get(key).and_then(|value| value.as_str()) {
+            if let Some(name) = executable_name(text) {
+                names.push(name);
+            }
+        }
+    }
+    if let Some(body) = object.get("body") {
+        collect_tool_names(body, names);
+    }
+}
+
+fn executable_name(text: &str) -> Option<String> {
+    let first = text
+        .split_whitespace()
+        .next()?
+        .trim_matches(|c: char| c == '"' || c == '\'' || c == '`' || c == '[' || c == ']');
+    let name = std::path::Path::new(first)
+        .file_name()?
+        .to_str()?
+        .to_ascii_lowercase();
+    (!name.is_empty()).then_some(name)
 }
 
 fn configure_connection(conn: &Connection, busy_timeout: Duration) -> Result<()> {
@@ -9265,6 +9362,7 @@ mod search_order_tests {
                     record_title: row.get(20)?,
                     record_kind: row.get(21)?,
                     record_workspace: row.get(22)?,
+                    tool_names: event_tool_names_from_payload(&payload_json),
                 })
             })
             .unwrap();
@@ -9722,12 +9820,145 @@ mod search_order_tests {
         }
     }
 
+    /// The role bitmask CASE in the filtered SQL must stay a total, exact
+    /// mapping of the `EventRole` domain: one distinct bit per variant string
+    /// (matching `event_role_bit`), covering exactly the values the schema
+    /// CHECK constraint admits, with NULL falling to the ELSE arm. The
+    /// tool-noise NOT IN list must likewise name exactly the event types the
+    /// Rust `event_hit_is_excluded_tool_noise` predicate excludes.
+    #[test]
+    fn role_mask_sql_case_covers_event_role_domain() {
+        let variants = [
+            EventRole::User,
+            EventRole::Assistant,
+            EventRole::System,
+            EventRole::Tool,
+            EventRole::Unknown,
+        ];
+        assert_eq!(
+            variants.map(EventRole::as_str).to_vec(),
+            EventRole::variants().to_vec(),
+            "bitmask coverage must track the EventRole domain"
+        );
+        let mut seen_bits = 0_i64;
+        for role in variants {
+            let bit = event_role_bit(role);
+            assert_eq!(bit.count_ones(), 1, "{role:?} must map to a single bit");
+            assert_eq!(seen_bits & bit, 0, "{role:?} bit must be distinct");
+            seen_bits |= bit;
+            for sql in [
+                SEARCH_EVENT_HITS_PAGE_SCOPED_FILTERED_SQL,
+                SEARCH_EVENT_HITS_PAGE_PROVIDER_FILTERED_SQL,
+            ] {
+                assert_eq!(
+                    sql.matches(&format!("WHEN '{}' THEN {bit}", role.as_str()))
+                        .count(),
+                    2,
+                    "include and exclude CASE arms must both map {role:?} to {bit}"
+                );
+            }
+        }
+        assert_eq!(
+            event_role_mask(&variants),
+            seen_bits,
+            "mask must OR every variant bit"
+        );
+        assert_eq!(event_role_mask(&[]), 0, "empty set must disable the filter");
+
+        // The schema CHECK constraint admits exactly the enum domain (plus
+        // NULL), so the CASE mapping is total over reachable rows.
+        let schema: String = pushdown_corpus()
+            .store
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        for role in EventRole::variants() {
+            assert!(
+                schema.contains(&format!("'{role}'")),
+                "events.role CHECK must admit '{role}'"
+            );
+        }
+
+        let noise_types = [
+            EventType::ToolCall,
+            EventType::ToolOutput,
+            EventType::CommandStarted,
+            EventType::CommandOutput,
+            EventType::CommandFinished,
+        ];
+        let expected_list = format!(
+            "('{}', '{}', '{}', '{}',\n                '{}')",
+            noise_types[0].as_str(),
+            noise_types[1].as_str(),
+            noise_types[2].as_str(),
+            noise_types[3].as_str(),
+            noise_types[4].as_str(),
+        );
+        for sql in [
+            SEARCH_EVENT_HITS_PAGE_SCOPED_FILTERED_SQL,
+            SEARCH_EVENT_HITS_PAGE_PROVIDER_FILTERED_SQL,
+        ] {
+            assert!(
+                sql.contains(&expected_list),
+                "tool-noise NOT IN list must name exactly the Rust-excluded event types"
+            );
+        }
+    }
+
+    /// Hydrated hits expose payload-derived executable names for the
+    /// Rust-side `exclude_tool_name` filter: structured `tool` keys and
+    /// `command` strings normalize to lowercase basenames.
+    #[test]
+    fn event_search_hits_hydrate_tool_names_from_payload() {
+        let corpus = pushdown_corpus();
+        let hits = corpus
+            .store
+            .search_event_hits_page("pushfilter", 100, 0)
+            .unwrap();
+        let by_id = |suffix: &str| {
+            hits.iter()
+                .find(|hit| hit.event_id.to_string().ends_with(suffix))
+                .unwrap()
+        };
+        assert_eq!(by_id("0f0049").tool_names, vec!["shell".to_owned()]);
+        assert_eq!(by_id("0f004a").tool_names, vec!["ctx".to_owned()]);
+        assert!(by_id("0f0041").tool_names.is_empty());
+    }
+
+    /// Executable-name extraction feeding `tool_names`: quoted commands,
+    /// absolute paths, and mixed case normalize to a lowercase basename;
+    /// nested `body` objects are searched; broken payloads yield nothing.
+    #[test]
+    fn event_tool_names_normalize_paths_quotes_case_and_nesting() {
+        assert_eq!(
+            event_tool_names_from_payload(r#"{"command":"/usr/local/bin/CTX search foo"}"#),
+            vec!["ctx".to_owned()]
+        );
+        assert_eq!(
+            event_tool_names_from_payload(r#"{"tool":"'Shell'","command":"`git` status"}"#),
+            vec!["git".to_owned(), "shell".to_owned()]
+        );
+        assert_eq!(
+            event_tool_names_from_payload(r#"{"body":{"executable":"[node]"}}"#),
+            vec!["node".to_owned()]
+        );
+        assert!(event_tool_names_from_payload(r#"{"output":"ctx search"}"#).is_empty());
+        assert!(event_tool_names_from_payload("not json").is_empty());
+        assert!(event_tool_names_from_payload(r#"{"command":"   "}"#).is_empty());
+    }
+
     /// Corpus exercising every fallback chain the pushed-down predicates
     /// touch: direct sessions (primary/subagent/unknown), a run-only session
     /// chain, provider via event-level capture source only, a fully
-    /// sessionless row, and an event whose session identity exists only in
-    /// the event_search projection. Timestamps straddle a millisecond
-    /// boundary for the fractional `since` cases.
+    /// sessionless row, an event whose session identity exists only in
+    /// the event_search projection, and role-varied rows (user, tool with
+    /// structured tool/command payload keys, NULL role, system) for the
+    /// role and tool-noise pushdown predicates. Timestamps straddle a
+    /// millisecond boundary for the fractional `since` cases.
     struct PushdownCorpus {
         store: Store,
         _temp: tempfile::TempDir,
@@ -9955,6 +10186,81 @@ mod search_order_tests {
         for event in &events {
             store.upsert_event(event).unwrap();
         }
+        // Role-varied rows for the role/tool-noise pushdown axes: an explicit
+        // user message, tool-role tool/command events carrying structured
+        // tool/executable payload keys, a NULL-role message (include sets
+        // must reject it, exclude sets must keep it), and a system-role
+        // command output on the subagent session.
+        let mut role_user = event(
+            "018f45d0-0000-7000-8000-0000000f0048",
+            8,
+            Some(s_primary),
+            None,
+            None,
+            EventType::Message,
+            plus_ms(0),
+            "pushfilter role-user",
+        );
+        role_user.role = Some(EventRole::User);
+        let mut tool_shell = event(
+            "018f45d0-0000-7000-8000-0000000f0049",
+            9,
+            Some(s_primary),
+            None,
+            None,
+            EventType::ToolOutput,
+            plus_ms(0),
+            "pushfilter tool-shell",
+        );
+        tool_shell.role = Some(EventRole::Tool);
+        tool_shell.payload =
+            serde_json::json!({ "text": "pushfilter tool-shell", "tool": "shell" });
+        let mut command_ctx = event(
+            "018f45d0-0000-7000-8000-0000000f004a",
+            10,
+            Some(s_primary),
+            None,
+            None,
+            EventType::CommandStarted,
+            plus_ms(0),
+            "pushfilter command-ctx",
+        );
+        command_ctx.role = Some(EventRole::Tool);
+        command_ctx.payload = serde_json::json!({
+            "text": "pushfilter command-ctx",
+            "command": "/usr/bin/CTX search pushfilter",
+        });
+        let mut role_null = event(
+            "018f45d0-0000-7000-8000-0000000f004b",
+            11,
+            Some(s_primary),
+            None,
+            None,
+            EventType::Message,
+            plus_ms(0),
+            "pushfilter role-null",
+        );
+        role_null.role = None;
+        let mut system_output = event(
+            "018f45d0-0000-7000-8000-0000000f004c",
+            12,
+            Some(s_subagent),
+            None,
+            None,
+            EventType::CommandOutput,
+            plus_ms(0),
+            "pushfilter system-output",
+        );
+        system_output.role = Some(EventRole::System);
+        for event in [
+            &role_user,
+            &tool_shell,
+            &command_ctx,
+            &role_null,
+            &system_output,
+        ] {
+            store.upsert_event(event).unwrap();
+        }
         let projection_session = s_primary;
         store
             .conn
@@ -9980,12 +10286,24 @@ mod search_order_tests {
 
     /// Test-side oracle that mirrors the pushed-down subset of
     /// `ctx-history-search::event_hit_matches_filters` (session, provider,
-    /// since, event_type) and `event_hit_matches_agent_scope` (primary /
-    /// primary-or-sessionless) over hydrated hits.
+    /// since, event_type, role include/exclude, tool-noise event types) and
+    /// `event_hit_matches_agent_scope` (primary / primary-or-sessionless)
+    /// over hydrated hits. The role and tool-noise arms are copied verbatim
+    /// from the search crate's `role_matches` /
+    /// `event_hit_is_excluded_tool_noise` Rust predicates so the differential
+    /// proves SQL pushdown equivalence against the real filter semantics.
     fn oracle_matches(hit: &EventSearchHit, filters: &EventSearchSqlFilters) -> bool {
         let primary =
             hit.session_is_primary == Some(true) || hit.agent_type == Some(AgentType::Primary);
         let sessionless = hit.session_is_primary.is_none() && hit.agent_type.is_none();
+        let tool_noise = matches!(
+            hit.event_type,
+            EventType::ToolCall
+                | EventType::ToolOutput
+                | EventType::CommandStarted
+                | EventType::CommandOutput
+                | EventType::CommandFinished
+        );
         filters
             .session_id
             .is_none_or(|id| hit.session_id == Some(id))
@@ -10001,6 +10319,12 @@ mod search_order_tests {
                 Some(EventSearchAgentScope::PrimaryOrSessionless) => primary || sessionless,
                 Some(EventSearchAgentScope::PrimaryOnly) => primary,
             }
+            && (filters.roles.is_empty()
+                || hit.role.is_some_and(|role| filters.roles.contains(&role)))
+            && !hit
+                .role
+                .is_some_and(|role| filters.exclude_roles.contains(&role))
+            && !(filters.exclude_tool_noise && tool_noise)
     }
 
     /// Differential oracle: for every filter combination, the filtered SQL
@@ -10015,7 +10339,7 @@ mod search_order_tests {
         let query = "pushfilter";
 
         let full = store.search_event_hits_page(query, 100, 0).unwrap();
-        assert_eq!(full.len(), 7, "corpus must index all events");
+        assert_eq!(full.len(), 12, "corpus must index all events");
 
         let exact_since = corpus.base;
         let fractional_since = corpus.base + chrono::Duration::microseconds(500);
@@ -10044,6 +10368,18 @@ mod search_order_tests {
             Some(EventSearchAgentScope::PrimaryOrSessionless),
             Some(EventSearchAgentScope::PrimaryOnly),
         ];
+        let role_sets: [Vec<EventRole>; 4] = [
+            Vec::new(),
+            vec![EventRole::User],
+            vec![EventRole::User, EventRole::Assistant],
+            vec![EventRole::Tool],
+        ];
+        let exclude_role_sets: [Vec<EventRole>; 3] = [
+            Vec::new(),
+            vec![EventRole::Tool],
+            vec![EventRole::Assistant, EventRole::System],
+        ];
+        let noise_flags = [false, true];
 
         let mut combos = Vec::new();
         for session_id in sessions {
@@ -10051,13 +10387,22 @@ mod search_order_tests {
                 for since in sinces {
                     for event_type in event_types {
                         for agent_scope in scopes {
-                            combos.push(EventSearchSqlFilters {
-                                session_id,
-                                provider,
-                                since,
-                                event_type,
-                                agent_scope,
-                            });
+                            for roles in &role_sets {
+                                for exclude_roles in &exclude_role_sets {
+                                    for exclude_tool_noise in noise_flags {
+                                        combos.push(EventSearchSqlFilters {
+                                            session_id,
+                                            provider,
+                                            since,
+                                            event_type,
+                                            agent_scope,
+                                            roles: roles.clone(),
+                                            exclude_roles: exclude_roles.clone(),
+                                            exclude_tool_noise,
+                                        });
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -10106,7 +10451,7 @@ mod search_order_tests {
                 },
             )
             .unwrap();
-        assert_eq!(at_exact.len(), 7);
+        assert_eq!(at_exact.len(), 12);
         assert_eq!(at_fractional.len(), 3);
         assert!(at_fractional
             .iter()
@@ -10151,6 +10496,16 @@ mod search_order_tests {
                 event_type: Some(EventType::Message),
                 since: Some(exact_since),
                 agent_scope: Some(EventSearchAgentScope::PrimaryOrSessionless),
+                ..EventSearchSqlFilters::default()
+            },
+            EventSearchSqlFilters {
+                roles: vec![EventRole::User, EventRole::Assistant],
+                agent_scope: Some(EventSearchAgentScope::PrimaryOrSessionless),
+                ..EventSearchSqlFilters::default()
+            },
+            EventSearchSqlFilters {
+                exclude_roles: vec![EventRole::Tool],
+                exclude_tool_noise: true,
                 ..EventSearchSqlFilters::default()
             },
         ];
@@ -10223,6 +10578,15 @@ mod search_order_tests {
             EventSearchSqlFilters {
                 session_id: Some(corpus.s_subagent),
                 event_type: Some(EventType::Message),
+                ..EventSearchSqlFilters::default()
+            },
+            EventSearchSqlFilters {
+                roles: vec![EventRole::User],
+                ..EventSearchSqlFilters::default()
+            },
+            EventSearchSqlFilters {
+                exclude_roles: vec![EventRole::Assistant],
+                exclude_tool_noise: true,
                 ..EventSearchSqlFilters::default()
             },
         ];
@@ -10353,6 +10717,9 @@ mod search_order_tests {
                         Some("codex"),
                         Some(1_i64),
                         Some("message"),
+                        1_i64,
+                        3_i64,
+                        8_i64,
                         1_i64
                     ],
                     |row| {

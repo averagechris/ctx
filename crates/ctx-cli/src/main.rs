@@ -93,7 +93,7 @@ enum CommandRoot {
     #[command(about = "Locate provider/source metadata for an indexed session or event")]
     Locate(LocateArgs),
     #[command(about = "Search indexed agent history")]
-    Search(SearchArgs),
+    Search(Box<SearchArgs>),
     #[command(about = "Run read-only SQL against the local ctx index")]
     Sql(SqlArgs),
     #[command(about = "Read embedded ctx documentation")]
@@ -328,6 +328,26 @@ struct SearchArgs {
     )]
     event_type: Option<String>,
     #[arg(
+        long = "role",
+        help = "Include only events with this role: user, assistant, or tool; repeatable"
+    )]
+    role: Vec<String>,
+    #[arg(
+        long = "exclude-role",
+        help = "Exclude events with this role: user, assistant, or tool; repeatable"
+    )]
+    exclude_role: Vec<String>,
+    #[arg(
+        long,
+        help = "Exclude tool invocations and command output from search results"
+    )]
+    exclude_tool_noise: bool,
+    #[arg(
+        long = "exclude-tool",
+        help = "Exclude tool/command events whose structured tool or command executable is this name, for example ctx; repeatable"
+    )]
+    exclude_tool_name: Vec<String>,
+    #[arg(
         long,
         help = "Filter by indexed touched-file path metadata, not the current filesystem"
     )]
@@ -424,6 +444,10 @@ pub(crate) struct SearchFilterInput {
     primary_only: bool,
     include_subagents: bool,
     event_type: Option<String>,
+    role: Vec<String>,
+    exclude_role: Vec<String>,
+    exclude_tool_noise: bool,
+    exclude_tool_name: Vec<String>,
     file: Option<PathBuf>,
     include_current_session: bool,
 }
@@ -578,6 +602,19 @@ fn broader_search_argv(args: &SearchArgs, query: &str) -> Option<Vec<String>> {
             parts.push(format!("{flag}={value}"));
         }
     }
+    // Repeatable filters are preserved one flag per value, in the order they
+    // were given, so the broadened suggestion keeps the exact filter scope.
+    for (flag, values) in [
+        ("--role", &args.role),
+        ("--exclude-role", &args.exclude_role),
+        ("--exclude-tool", &args.exclude_tool_name),
+    ] {
+        for value in values {
+            if !value.trim().is_empty() {
+                parts.push(format!("{flag}={value}"));
+            }
+        }
+    }
     if let Some(file) = &args.file {
         parts.push(format!("--file={}", file.display()));
     }
@@ -587,6 +624,7 @@ fn broader_search_argv(args: &SearchArgs, query: &str) -> Option<Vec<String>> {
         }
     }
     for (enabled, flag) in [
+        (args.exclude_tool_noise, "--exclude-tool-noise"),
         (args.include_subagents, "--include-subagents"),
         (args.primary_only, "--primary-only"),
         (args.events, "--events"),
@@ -1625,7 +1663,7 @@ fn main_result() -> Result<()> {
         CommandRoot::Import(args) => run_import(args, data_root.clone()),
         CommandRoot::Show(args) => run_show(args, data_root.clone()),
         CommandRoot::Locate(args) => run_locate(args, data_root.clone()),
-        CommandRoot::Search(args) => run_search(args, data_root.clone()),
+        CommandRoot::Search(args) => run_search(*args, data_root.clone()),
         CommandRoot::Sql(args) => run_sql(args, data_root.clone()),
         CommandRoot::Docs(args) => docs::run(args),
         CommandRoot::Mcp(args) => mcp::run(args, data_root.clone()),
@@ -4465,6 +4503,10 @@ fn run_search(args: SearchArgs, data_root: PathBuf) -> Result<()> {
                 primary_only: args.primary_only,
                 include_subagents: args.include_subagents,
                 event_type: args.event_type.clone(),
+                role: args.role.clone(),
+                exclude_role: args.exclude_role.clone(),
+                exclude_tool_noise: args.exclude_tool_noise,
+                exclude_tool_name: args.exclude_tool_name.clone(),
                 file: args.file.clone(),
                 include_current_session: args.include_current_session,
             },
@@ -4623,6 +4665,9 @@ fn print_search_result_verbose(
     }
     println!("  {}", result.snippet);
     println!("  rank: {:.2}", result.rank);
+    if !result.why_matched.is_empty() {
+        println!("  why_matched: {}", result.why_matched.join(", "));
+    }
     if result.result_scope == ctx_history_search::SearchResultScope::Session {
         println!("  session_importance: {:.2}", result.session_importance);
         if result.more_matches_in_session > 0 {
@@ -6612,9 +6657,41 @@ fn search_filters(
             .map(EventType::from_str)
             .transpose()
             .map_err(|err| anyhow!("{err}"))?,
+        roles: parse_event_roles("--role", input.role)?,
+        exclude_roles: parse_event_roles("--exclude-role", input.exclude_role)?,
+        exclude_tool_noise: input.exclude_tool_noise,
+        exclude_tool_names: normalize_cli_filter_list("--exclude-tool", input.exclude_tool_name)?,
         file: input.file.map(|path| path.display().to_string()),
         exclude_provider_session,
     })
+}
+
+fn parse_event_roles(label: &str, values: Vec<String>) -> Result<Vec<EventRole>> {
+    values
+        .into_iter()
+        .map(|value| EventRole::from_str(value.trim()).map_err(|err| anyhow!("{label}: {err}")))
+        .collect()
+}
+
+/// Normalizes a repeatable name-valued filter: values are trimmed, empty
+/// values are rejected, and duplicates (ASCII case-insensitive, matching the
+/// tool-name normalization applied at match time) are dropped while
+/// preserving first-occurrence order.
+fn normalize_cli_filter_list(label: &str, values: Vec<String>) -> Result<Vec<String>> {
+    let mut normalized = Vec::<String>::new();
+    for value in values {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(anyhow!("{label} cannot be empty"));
+        }
+        if !normalized
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(value))
+        {
+            normalized.push(value.to_owned());
+        }
+    }
+    Ok(normalized)
 }
 
 fn normalize_source_identity_filters(

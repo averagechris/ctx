@@ -284,6 +284,9 @@ Filters:
 - `--event-type <event-type>`, one of `message`, `tool_call`, `tool_output`,
   `command_started`, `command_output`, `command_finished`, `file_touched`,
   `vcs_change`, `artifact`, `summary`, or `notice`;
+- `--role user|assistant|tool`, `--exclude-role user|assistant|tool`,
+  `--exclude-tool-noise`, and repeatable `--exclude-tool <name>` for role-aware
+  and tool-noise filtering when event metadata exists;
 - `--file <path>`, indexed touched-file path metadata, not the current
   filesystem;
 - `--session <ctx-session-id-or-prefix>`, for dense event results within one session;

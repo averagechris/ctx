@@ -4,6 +4,22 @@
 
 ### Added
 
+- `ctx search` gains role-aware and tool-noise relevance controls: repeatable
+  `--role` / `--exclude-role` filters (`user`, `assistant`, `tool`),
+  `--exclude-tool-noise` to drop tool/command events, and a repeatable
+  `--exclude-tool <name>` to drop tool/command events whose structured tool or
+  command executable matches a name such as `ctx`. The MCP `search` tool
+  accepts the same filters as optional `role`, `exclude_role`,
+  `exclude_tool_noise`, and `exclude_tool` arguments with permissive defaults.
+  Equivalent user/assistant message matches now rank ahead of incidental
+  tool/command matches by default across every match mode, reranked within the
+  documented bounded candidate pool (`max(limit*8, 50, limit+1)`), and
+  `why_matched` explains the role, event type, source field, and any relevance
+  penalty (human output shows it with `--verbose`). No-result broadening
+  suggestions preserve the new filters in the order they were given. Exactly
+  representable role and tool-noise predicates are pushed into the ranked SQL
+  page alongside the existing filter pushdown; executable-name exclusion
+  stays a Rust-side residual filter under the scan budget.
 - `ctx search --match all|any|phrase` (and the MCP `search` tool's `match`
   argument) makes multiword matching explicit: `all` (default) requires every
   normalized word of a clause in one indexed section, `any` broadens and

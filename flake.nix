@@ -20,6 +20,7 @@
         cliPackage = (fromTOML (builtins.readFile ./crates/ctx-cli/Cargo.toml)).package;
         fleetApps = fleet.lib.fleet.presets.rust {
           inherit pkgs self;
+          srhtPackage = fleet.packages.${system}.srht;
           pname = "ctx";
           binaries = ["ctx"];
           subdir = "ctx";

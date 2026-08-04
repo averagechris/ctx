@@ -3746,45 +3746,7 @@ impl Store {
         let Some(match_query) = fts_match_query(query) else {
             return Ok(Vec::new());
         };
-        let mut stmt = self.conn.prepare(
-            r#"
-            SELECT event_search.event_id,
-                   COALESCE(e.history_record_id, event_search.history_record_id, s.history_record_id, rs.history_record_id),
-                   COALESCE(e.session_id, event_search.session_id, s.id, rs.id),
-                   e.run_id,
-                   e.seq,
-                   e.event_type,
-                   e.role,
-                   e.occurred_at_ms,
-                   event_search.safe_preview_text,
-                   bm25(event_search),
-                   COALESCE(s.provider, rs.provider, event_source.provider, session_source.provider, run_source.provider),
-                   COALESCE(s.external_session_id, rs.external_session_id),
-                   COALESCE(s.parent_session_id, rs.parent_session_id),
-                   COALESCE(s.root_session_id, rs.root_session_id),
-                   COALESCE(s.agent_type, rs.agent_type),
-                   COALESCE(s.is_primary, rs.is_primary),
-                   COALESCE(event_source.cwd, session_source.cwd, run_source.cwd),
-                   COALESCE(event_source.raw_source_path, session_source.raw_source_path, run_source.raw_source_path),
-                   e.payload_json,
-                   COALESCE(event_source.metadata_json, session_source.metadata_json, run_source.metadata_json),
-                   wr.title,
-                   wr.kind,
-                   wr.workspace
-            FROM event_search
-            JOIN events e ON e.id = event_search.event_id
-            LEFT JOIN runs r ON r.id = e.run_id
-            LEFT JOIN sessions s ON s.id = COALESCE(e.session_id, event_search.session_id)
-            LEFT JOIN sessions rs ON rs.id = r.session_id
-            LEFT JOIN capture_sources event_source ON event_source.id = e.capture_source_id
-            LEFT JOIN capture_sources session_source ON session_source.id = COALESCE(s.capture_source_id, rs.capture_source_id)
-            LEFT JOIN capture_sources run_source ON run_source.id = r.source_id
-            LEFT JOIN history_records wr ON wr.id = COALESCE(e.history_record_id, event_search.history_record_id, s.history_record_id, rs.history_record_id, r.history_record_id)
-            WHERE event_search MATCH ?1
-            ORDER BY bm25(event_search), e.occurred_at_ms DESC, e.seq DESC, event_search.event_id
-            LIMIT ?2 OFFSET ?3
-            "#,
-        )?;
+        let mut stmt = self.conn.prepare(SEARCH_EVENT_HITS_PAGE_SQL)?;
         let rows = stmt.query_map(
             params![match_query, limit.max(1) as i64, offset as i64],
             |row| {
@@ -3933,6 +3895,62 @@ impl Store {
     }
 }
 
+// Two-phase ranked event search. Phase one ranks FTS candidates on a narrow
+// projection (event_search rowid, bm25 score, occurred_at_ms/seq/event_id tie
+// keys) and applies LIMIT/OFFSET before anything wide is touched. Phase two
+// re-joins only the selected page rows against the wide tables
+// (runs/sessions/capture_sources/history_records) and hydrates
+// payload/metadata. The outer ORDER BY replays the exact inner sort keys
+// (carried bm25 score plus the same tie-break columns, ending in the unique
+// event_id) so the page order is identical to the pre-refactor single-pass
+// query. The subquery's LIMIT prevents SQLite from flattening it into the
+// outer join, which keeps wide hydration bounded to the selected page; the
+// plan shape is asserted in `search_order_tests`.
+const SEARCH_EVENT_HITS_PAGE_SQL: &str = r#"
+    WITH ranked_page AS (
+        SELECT event_search.rowid AS search_rowid,
+               bm25(event_search) AS score
+        FROM event_search
+        JOIN events e ON e.id = event_search.event_id
+        WHERE event_search MATCH ?1
+        ORDER BY bm25(event_search), e.occurred_at_ms DESC, e.seq DESC, event_search.event_id
+        LIMIT ?2 OFFSET ?3
+    )
+    SELECT event_search.event_id,
+           COALESCE(e.history_record_id, event_search.history_record_id, s.history_record_id, rs.history_record_id),
+           COALESCE(e.session_id, event_search.session_id, s.id, rs.id),
+           e.run_id,
+           e.seq,
+           e.event_type,
+           e.role,
+           e.occurred_at_ms,
+           event_search.safe_preview_text,
+           ranked_page.score,
+           COALESCE(s.provider, rs.provider, event_source.provider, session_source.provider, run_source.provider),
+           COALESCE(s.external_session_id, rs.external_session_id),
+           COALESCE(s.parent_session_id, rs.parent_session_id),
+           COALESCE(s.root_session_id, rs.root_session_id),
+           COALESCE(s.agent_type, rs.agent_type),
+           COALESCE(s.is_primary, rs.is_primary),
+           COALESCE(event_source.cwd, session_source.cwd, run_source.cwd),
+           COALESCE(event_source.raw_source_path, session_source.raw_source_path, run_source.raw_source_path),
+           e.payload_json,
+           COALESCE(event_source.metadata_json, session_source.metadata_json, run_source.metadata_json),
+           wr.title,
+           wr.kind,
+           wr.workspace
+    FROM ranked_page
+    JOIN event_search ON event_search.rowid = ranked_page.search_rowid
+    JOIN events e ON e.id = event_search.event_id
+    LEFT JOIN runs r ON r.id = e.run_id
+    LEFT JOIN sessions s ON s.id = COALESCE(e.session_id, event_search.session_id)
+    LEFT JOIN sessions rs ON rs.id = r.session_id
+    LEFT JOIN capture_sources event_source ON event_source.id = e.capture_source_id
+    LEFT JOIN capture_sources session_source ON session_source.id = COALESCE(s.capture_source_id, rs.capture_source_id)
+    LEFT JOIN capture_sources run_source ON run_source.id = r.source_id
+    LEFT JOIN history_records wr ON wr.id = COALESCE(e.history_record_id, event_search.history_record_id, s.history_record_id, rs.history_record_id, r.history_record_id)
+    ORDER BY ranked_page.score, e.occurred_at_ms DESC, e.seq DESC, event_search.event_id
+    "#;
 fn configure_connection(conn: &Connection, busy_timeout: Duration) -> Result<()> {
     conn.busy_timeout(busy_timeout)?;
     conn.execute_batch(
@@ -7867,6 +7885,521 @@ mod search_order_tests {
             .unwrap();
         assert_eq!(sentinel_count, 1);
         assert_search_order(&store, &[record.id]);
+    }
+
+    fn tie_event(id: &str, seq: u64, occurred_at: DateTime<Utc>, text: &str) -> Event {
+        Event {
+            id: Uuid::parse_str(id).unwrap(),
+            seq,
+            history_record_id: None,
+            session_id: None,
+            run_id: None,
+            event_type: EventType::Message,
+            role: Some(EventRole::User),
+            occurred_at,
+            capture_source_id: None,
+            payload: serde_json::json!({ "text": text }),
+            payload_blob_id: None,
+            dedupe_key: None,
+            redaction_state: RedactionState::SafePreview,
+            sync: sync_metadata(),
+        }
+    }
+
+    // Test-only snapshot of the pre-optimization single-phase query. Keep it
+    // independent from SEARCH_EVENT_HITS_PAGE_SQL: this is the behavioral
+    // oracle for ordering, pagination, fallback joins, and hydrated contents.
+    const LEGACY_SEARCH_EVENT_HITS_PAGE_SQL: &str = r#"
+        SELECT event_search.event_id,
+               COALESCE(e.history_record_id, event_search.history_record_id, s.history_record_id, rs.history_record_id),
+               COALESCE(e.session_id, event_search.session_id, s.id, rs.id),
+               e.run_id,
+               e.seq,
+               e.event_type,
+               e.role,
+               e.occurred_at_ms,
+               event_search.safe_preview_text,
+               bm25(event_search),
+               COALESCE(s.provider, rs.provider, event_source.provider, session_source.provider, run_source.provider),
+               COALESCE(s.external_session_id, rs.external_session_id),
+               COALESCE(s.parent_session_id, rs.parent_session_id),
+               COALESCE(s.root_session_id, rs.root_session_id),
+               COALESCE(s.agent_type, rs.agent_type),
+               COALESCE(s.is_primary, rs.is_primary),
+               COALESCE(event_source.cwd, session_source.cwd, run_source.cwd),
+               COALESCE(event_source.raw_source_path, session_source.raw_source_path, run_source.raw_source_path),
+               e.payload_json,
+               COALESCE(event_source.metadata_json, session_source.metadata_json, run_source.metadata_json),
+               wr.title,
+               wr.kind,
+               wr.workspace
+        FROM event_search
+        JOIN events e ON e.id = event_search.event_id
+        LEFT JOIN runs r ON r.id = e.run_id
+        LEFT JOIN sessions s ON s.id = COALESCE(e.session_id, event_search.session_id)
+        LEFT JOIN sessions rs ON rs.id = r.session_id
+        LEFT JOIN capture_sources event_source ON event_source.id = e.capture_source_id
+        LEFT JOIN capture_sources session_source ON session_source.id = COALESCE(s.capture_source_id, rs.capture_source_id)
+        LEFT JOIN capture_sources run_source ON run_source.id = r.source_id
+        LEFT JOIN history_records wr ON wr.id = COALESCE(e.history_record_id, event_search.history_record_id, s.history_record_id, rs.history_record_id, r.history_record_id)
+        WHERE event_search MATCH ?1
+        ORDER BY bm25(event_search), e.occurred_at_ms DESC, e.seq DESC, event_search.event_id
+        LIMIT ?2 OFFSET ?3
+        "#;
+
+    fn legacy_event_hits_page(
+        store: &Store,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Vec<EventSearchHit> {
+        let mut stmt = store
+            .conn
+            .prepare(LEGACY_SEARCH_EVENT_HITS_PAGE_SQL)
+            .unwrap();
+        let rows = stmt
+            .query_map(params![query, limit.max(1) as i64, offset as i64], |row| {
+                let payload_json = row.get::<_, String>(18)?;
+                let source_metadata_json = row.get::<_, Option<String>>(19)?;
+                let source_identity =
+                    event_search_source_identity(source_metadata_json.as_deref())?;
+                Ok(EventSearchHit {
+                    event_id: parse_uuid(row.get::<_, String>(0)?)?,
+                    history_record_id: parse_optional_uuid(row.get(1)?)?,
+                    session_id: parse_optional_uuid(row.get(2)?)?,
+                    run_id: parse_optional_uuid(row.get(3)?)?,
+                    seq: row.get::<_, i64>(4)? as u64,
+                    event_type: parse_text_enum::<EventType>(row.get::<_, String>(5)?)?,
+                    role: parse_optional_text_enum::<EventRole>(row.get(6)?)?,
+                    occurred_at: ms_to_time(row.get(7)?)?,
+                    preview: row.get(8)?,
+                    score: row.get(9)?,
+                    provider: parse_optional_text_enum::<CaptureProvider>(row.get(10)?)?,
+                    session_external_session_id: row.get(11)?,
+                    history_source: source_identity.history_source,
+                    history_source_plugin: source_identity.history_source_plugin,
+                    provider_key: source_identity.provider_key,
+                    source_id: source_identity.source_id,
+                    source_format: source_identity.source_format,
+                    session_parent_session_id: parse_optional_uuid(row.get(12)?)?,
+                    session_root_session_id: parse_optional_uuid(row.get(13)?)?,
+                    agent_type: parse_optional_text_enum::<AgentType>(row.get(14)?)?,
+                    session_is_primary: row.get::<_, Option<i64>>(15)?.map(|value| value != 0),
+                    cwd: row.get(16)?,
+                    raw_source_path: row.get(17)?,
+                    cursor: event_search_cursor(&payload_json, source_metadata_json.as_deref())?,
+                    record_title: row.get(20)?,
+                    record_kind: row.get(21)?,
+                    record_workspace: row.get(22)?,
+                })
+            })
+            .unwrap();
+        collect_rows(rows).unwrap()
+    }
+
+    /// Exercises every reachable tie-break level of the ranked event page:
+    /// bm25 score, then occurred_at DESC, then seq DESC. (`events.seq` is
+    /// UNIQUE, so the trailing event_id tie key can never be reached through
+    /// real rows; it stays in the ORDER BY purely as a determinism guard.)
+    /// Also proves paged reads are exact slices of the full ordering with
+    /// identical hydrated contents (wide-join fields included).
+    #[test]
+    fn event_hits_page_two_phase_order_and_hydration_equivalence_under_ties() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+
+        let record_id = Uuid::parse_str("018f45d0-0000-7000-8000-0000000d0001").unwrap();
+        let mut record = HistoryRecord::new(
+            "Hydration record title",
+            "hydration record body",
+            vec!["pagetie-test".into()],
+            "task",
+            Some("/workspace/pagetie".into()),
+        );
+        record.id = record_id;
+        record.created_at = fixed_time();
+        record.updated_at = fixed_time();
+        store.insert_record(&record).unwrap();
+
+        let session_id = Uuid::parse_str("018f45d0-0000-7000-8000-0000000d0002").unwrap();
+        store
+            .conn
+            .execute(
+                r#"
+                INSERT INTO sessions
+                (id, history_record_id, provider, external_session_id, agent_type, is_primary,
+                 status, fidelity, started_at_ms, created_at_ms, updated_at_ms)
+                VALUES (?1, ?2, 'codex', 'external-pagetie-session', 'primary', 1,
+                        'imported', 'full', 1, 1, 1)
+                "#,
+                params![session_id.to_string(), record_id.to_string()],
+            )
+            .unwrap();
+        let source_id = Uuid::parse_str("018f45d0-0000-7000-8000-0000000d0003").unwrap();
+        store
+            .conn
+            .execute(
+                r#"
+                INSERT INTO capture_sources
+                (id, kind, provider, machine_id, cwd, raw_source_path, started_at_ms, fidelity,
+                 metadata_json)
+                VALUES (?1, 'provider_import', 'codex', 'test-machine', '/workspace/pagetie',
+                        '/workspace/pagetie/transcript.jsonl', 1, 'full',
+                        '{"source_metadata":{"ctx_history_plugin":{"plugin_name":"fixture-plugin","plugin_source_id":"fixture-source","history_source":"fixture/history"},"ctx_history_jsonl_v1":{"provider_key":"fixture-provider","source_id":"fixture-id","source_format":"ctx-history-jsonl-v1"}},"cursor":{"after":{"cursor":"metadata-cursor"}}}')
+                "#,
+                params![source_id.to_string()],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET capture_source_id = ?1 WHERE id = ?2",
+                params![source_id.to_string(), session_id.to_string()],
+            )
+            .unwrap();
+
+        // A run-only relationship exercises the rs/run_source fallback path
+        // independently of the direct event/session/source path above.
+        let run_source_id = Uuid::parse_str("018f45d0-0000-7000-8000-0000000d0004").unwrap();
+        store
+            .conn
+            .execute(
+                r#"
+                INSERT INTO capture_sources
+                (id, kind, provider, machine_id, cwd, raw_source_path, started_at_ms, fidelity,
+                 metadata_json)
+                VALUES (?1, 'provider_import', 'claude', 'run-machine', '/workspace/run',
+                        '/workspace/run/transcript.jsonl', 1, 'full', '{}')
+                "#,
+                params![run_source_id.to_string()],
+            )
+            .unwrap();
+        let run_session_id = Uuid::parse_str("018f45d0-0000-7000-8000-0000000d0005").unwrap();
+        store
+            .conn
+            .execute(
+                r#"
+                INSERT INTO sessions
+                (id, history_record_id, capture_source_id, provider, external_session_id,
+                 agent_type, is_primary, status, fidelity, started_at_ms, created_at_ms, updated_at_ms)
+                VALUES (?1, ?2, ?3, 'claude', 'external-run-session', 'subagent', 0,
+                        'imported', 'full', 1, 1, 1)
+                "#,
+                params![
+                    run_session_id.to_string(),
+                    record_id.to_string(),
+                    run_source_id.to_string()
+                ],
+            )
+            .unwrap();
+        let run_id = Uuid::parse_str("018f45d0-0000-7000-8000-0000000d0006").unwrap();
+        store
+            .conn
+            .execute(
+                r#"
+                INSERT INTO runs
+                (id, history_record_id, session_id, run_type, status, started_at_ms,
+                 created_at_ms, updated_at_ms, source_id)
+                VALUES (?1, ?2, ?3, 'agent_turn', 'succeeded', 1, 1, 1, ?4)
+                "#,
+                params![
+                    run_id.to_string(),
+                    record_id.to_string(),
+                    run_session_id.to_string(),
+                    run_source_id.to_string()
+                ],
+            )
+            .unwrap();
+
+        let older = fixed_time();
+        let newer = fixed_time() + chrono::Duration::seconds(1);
+        // Better bm25 group (tf=2, same doc length as the tf=1 group) at the
+        // OLDER timestamp: score must dominate recency.
+        let mut hydrated = tie_event(
+            "018f45d0-0000-7000-8000-0000000e0001",
+            5,
+            older,
+            "pagetie pagetie",
+        );
+        hydrated.history_record_id = Some(record_id);
+        hydrated.session_id = Some(session_id);
+        hydrated.capture_source_id = Some(source_id);
+        hydrated.payload = serde_json::json!({
+            "cursor": "payload-cursor",
+            "tool": "/usr/local/bin/FixtureTool --flag",
+            "body": { "text": "pagetie pagetie" }
+        });
+        // Same score and timestamp as `hydrated`, lower seq: seq DESC decides.
+        let score_tie_lower_seq = tie_event(
+            "018f45d0-0000-7000-8000-0000000e0002",
+            4,
+            older,
+            "pagetie pagetie",
+        );
+        // tf=1 group: identical bm25 within the group, so ordering falls
+        // through to occurred_at DESC, then seq DESC.
+        let mut newer_seq7 = tie_event(
+            "018f45d0-0000-7000-8000-0000000e0103",
+            7,
+            newer,
+            "pagetie filler",
+        );
+        newer_seq7.run_id = Some(run_id);
+        let newer_seq2 = tie_event(
+            "018f45d0-0000-7000-8000-0000000e0104",
+            2,
+            newer,
+            "pagetie filler",
+        );
+        // Highest seq of all, but the older timestamp must lose to recency.
+        let older_seq9 = tie_event(
+            "018f45d0-0000-7000-8000-0000000e0105",
+            9,
+            older,
+            "pagetie filler",
+        );
+        for event in [
+            &newer_seq2,
+            &score_tie_lower_seq,
+            &older_seq9,
+            &hydrated,
+            &newer_seq7,
+        ] {
+            store.upsert_event(event).unwrap();
+        }
+
+        // The base event has no record/session IDs; the projection does.
+        // This directly exercises event_search-vs-events fallback fields.
+        store
+            .conn
+            .execute(
+                r#"
+                UPDATE event_search
+                SET history_record_id = ?1, session_id = ?2
+                WHERE event_id = ?3
+                "#,
+                params![
+                    record_id.to_string(),
+                    session_id.to_string(),
+                    score_tie_lower_seq.id.to_string()
+                ],
+            )
+            .unwrap();
+
+        let expected = vec![
+            hydrated.id,
+            score_tie_lower_seq.id,
+            newer_seq7.id,
+            newer_seq2.id,
+            older_seq9.id,
+        ];
+        let full = store.search_event_hits_page("pagetie", 50, 0).unwrap();
+        assert_eq!(
+            full.iter().map(|hit| hit.event_id).collect::<Vec<_>>(),
+            expected
+        );
+
+        // bm25 sanity: the tf=2 group scores strictly better (more negative)
+        // and scores are identical inside each tie group.
+        assert_eq!(full[0].score, full[1].score);
+        assert!(full[1].score < full[2].score);
+        for hit in &full[3..] {
+            assert_eq!(hit.score, full[2].score);
+        }
+
+        // Wide payload/metadata hydration for the top hit survives the
+        // two-phase page, including derived cursor/source fields.
+        let top = &full[0];
+        assert_eq!(top.preview, "pagetie pagetie");
+        assert_eq!(top.history_record_id, Some(record_id));
+        assert_eq!(top.session_id, Some(session_id));
+        assert_eq!(top.provider, Some(CaptureProvider::Codex));
+        assert_eq!(
+            top.session_external_session_id.as_deref(),
+            Some("external-pagetie-session")
+        );
+        assert_eq!(top.cwd.as_deref(), Some("/workspace/pagetie"));
+        assert_eq!(
+            top.raw_source_path.as_deref(),
+            Some("/workspace/pagetie/transcript.jsonl")
+        );
+        assert_eq!(top.record_title.as_deref(), Some("Hydration record title"));
+        assert_eq!(top.record_kind.as_deref(), Some("task"));
+        assert_eq!(top.record_workspace.as_deref(), Some("/workspace/pagetie"));
+        assert_eq!(top.cursor.as_deref(), Some("payload-cursor"));
+        assert_eq!(top.history_source.as_deref(), Some("fixture/history"));
+        assert_eq!(top.history_source_plugin.as_deref(), Some("fixture-plugin"));
+        assert_eq!(top.provider_key.as_deref(), Some("fixture-provider"));
+        assert_eq!(top.source_id.as_deref(), Some("fixture-id"));
+        assert_eq!(top.source_format.as_deref(), Some("ctx-history-jsonl-v1"));
+
+        // Projection-only IDs win when the base event IDs are NULL.
+        let projection_fallback = &full[1];
+        assert_eq!(projection_fallback.history_record_id, Some(record_id));
+        assert_eq!(projection_fallback.session_id, Some(session_id));
+        assert_eq!(projection_fallback.provider, Some(CaptureProvider::Codex));
+        assert_eq!(
+            projection_fallback.record_title.as_deref(),
+            Some("Hydration record title")
+        );
+
+        // With no event/projection session, the run's session and source
+        // supply all wide fallback fields.
+        let run_fallback = &full[2];
+        assert_eq!(run_fallback.run_id, Some(run_id));
+        assert_eq!(run_fallback.session_id, Some(run_session_id));
+        assert_eq!(run_fallback.provider, Some(CaptureProvider::Claude));
+        assert_eq!(
+            run_fallback.session_external_session_id.as_deref(),
+            Some("external-run-session")
+        );
+        assert_eq!(run_fallback.cwd.as_deref(), Some("/workspace/run"));
+        assert_eq!(
+            run_fallback.raw_source_path.as_deref(),
+            Some("/workspace/run/transcript.jsonl")
+        );
+        assert_eq!(
+            run_fallback.record_title.as_deref(),
+            Some("Hydration record title")
+        );
+
+        // Differential oracle: every page returned by the production API is
+        // byte-for-byte equivalent at the EventSearchHit field level to the
+        // legacy single-phase SQL, including scores and ordered hydration.
+        for limit in [0, 1, 2, 3, expected.len(), expected.len() + 2] {
+            for offset in [
+                0,
+                1,
+                2,
+                expected.len() - 1,
+                expected.len(),
+                expected.len() + 2,
+            ] {
+                let legacy = legacy_event_hits_page(&store, "pagetie", limit, offset);
+                let page = store
+                    .search_event_hits_page("pagetie", limit, offset)
+                    .unwrap();
+                assert_eq!(page, legacy, "limit={limit} offset={offset}");
+            }
+        }
+    }
+
+    /// Asserts the two-phase shape of the ranked event page query: the
+    /// LIMIT/OFFSET candidate selection subquery touches only the FTS index
+    /// and the narrow `events` sort keys, while the wide hydration joins
+    /// (runs/sessions/capture_sources/history_records) are indexed lookups
+    /// driven by the already-limited page rows.
+    #[test]
+    fn event_hits_page_query_plan_bounds_wide_hydration_to_ranked_page() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let mut stmt = store
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {SEARCH_EVENT_HITS_PAGE_SQL}"))
+            .unwrap();
+        let rows = stmt
+            .query_map(params!["pagetie", 3_i64, 0_i64], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let plan_text = rows
+            .iter()
+            .map(|(id, parent, detail)| format!("{id} {parent} {detail}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Exactly one subquery node hosts the ranked candidate page.
+        let subquery_roots = rows
+            .iter()
+            .filter(|(_, _, detail)| {
+                detail.starts_with("CO-ROUTINE") || detail.starts_with("MATERIALIZE")
+            })
+            .map(|(id, _, _)| *id)
+            .collect::<Vec<_>>();
+        assert_eq!(subquery_roots.len(), 1, "plan:\n{plan_text}");
+        let mut inside = std::collections::HashSet::from([subquery_roots[0]]);
+        loop {
+            let before = inside.len();
+            for (id, parent, _) in &rows {
+                if inside.contains(parent) {
+                    inside.insert(*id);
+                }
+            }
+            if inside.len() == before {
+                break;
+            }
+        }
+
+        fn table_access(detail: &str) -> Option<(&str, &str)> {
+            let mut parts = detail.split_whitespace();
+            let op = parts.next()?;
+            if op != "SCAN" && op != "SEARCH" {
+                return None;
+            }
+            Some((op, parts.next()?))
+        }
+
+        let mut inner_tables = std::collections::HashSet::new();
+        let mut outer = Vec::new();
+        for (id, _, detail) in &rows {
+            let Some((op, table)) = table_access(detail) else {
+                continue;
+            };
+            if inside.contains(id) {
+                inner_tables.insert(table.to_owned());
+            } else {
+                outer.push((op.to_owned(), table.to_owned()));
+            }
+        }
+
+        // Candidate selection reads only the FTS index plus the narrow
+        // events sort keys; nothing wide is joined before LIMIT/OFFSET.
+        assert_eq!(
+            inner_tables,
+            std::collections::HashSet::from(["event_search".to_owned(), "e".to_owned()]),
+            "plan:\n{plan_text}"
+        );
+
+        // Hydration is driven by the limited page and every wide join is an
+        // indexed SEARCH (per selected row), never a table SCAN.
+        assert!(
+            outer.iter().any(|(_, table)| table == "ranked_page"),
+            "plan:\n{plan_text}"
+        );
+        for wide in [
+            "r",
+            "s",
+            "rs",
+            "event_source",
+            "session_source",
+            "run_source",
+            "wr",
+        ] {
+            assert!(
+                outer
+                    .iter()
+                    .any(|(op, table)| op == "SEARCH" && table == wide),
+                "missing indexed page-bounded lookup for {wide}; plan:\n{plan_text}"
+            );
+            assert!(
+                !outer
+                    .iter()
+                    .any(|(op, table)| op == "SCAN" && table == wide),
+                "wide table {wide} must not be scanned; plan:\n{plan_text}"
+            );
+        }
+        assert!(
+            outer
+                .iter()
+                .any(|(op, table)| op == "SEARCH" && table == "e"),
+            "plan:\n{plan_text}"
+        );
     }
 }
 

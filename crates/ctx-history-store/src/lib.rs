@@ -1497,8 +1497,7 @@ impl Store {
         if !table_exists(&self.conn, "event_search")? {
             return Ok(false);
         }
-        Ok(table_row_count(&self.conn, "events")? > 0
-            && table_row_count(&self.conn, "event_search")? == 0)
+        Ok(table_has_rows(&self.conn, "events")? && !table_has_rows(&self.conn, "event_search")?)
     }
 
     pub fn upsert_capture_source(&self, source: &CaptureSource) -> Result<()> {
@@ -4328,19 +4327,19 @@ fn ensure_search_projection_initialized(conn: &Connection) -> Result<()> {
         return Ok(());
     }
 
-    let mut projection_rows = table_row_count(conn, "ctx_history_search")?;
-    if table_exists(conn, "event_search")? {
-        projection_rows += table_row_count(conn, "event_search")?;
-    }
-    if table_exists(conn, "artifact_search")? {
-        projection_rows += table_row_count(conn, "artifact_search")?;
-    }
-    if projection_rows > 0 {
+    // Emptiness probes only: a full `COUNT(*)` on an FTS5 table scans the
+    // whole content tree, which made every `Store::open` pay O(index size).
+    // Short-circuit existence checks decide the identical conservative
+    // rebuild question ("is every existing projection empty?") in O(1).
+    let projection_has_rows = table_has_rows(conn, "ctx_history_search")?
+        || (table_exists(conn, "event_search")? && table_has_rows(conn, "event_search")?)
+        || (table_exists(conn, "artifact_search")? && table_has_rows(conn, "artifact_search")?);
+    if projection_has_rows {
         return Ok(());
     }
 
-    if table_row_count(conn, "history_records")? > 0
-        || table_row_count(conn, "events")? > 0
+    if table_has_rows(conn, "history_records")?
+        || table_has_rows(conn, "events")?
         || linked_artifact_preview_count(conn)? > 0
     {
         rebuild_search_projection(conn)?;
@@ -4349,14 +4348,15 @@ fn ensure_search_projection_initialized(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn table_row_count(conn: &Connection, table: &str) -> Result<i64> {
+fn table_has_rows(conn: &Connection, table: &str) -> Result<bool> {
     match table {
         "artifacts" | "artifact_search" | "events" | "event_search" | "history_records"
         | "ctx_history_search" => {}
         _ => unreachable!("invalid table {table}"),
     }
-    let sql = format!("SELECT COUNT(*) FROM {table}");
-    Ok(conn.query_row(&sql, [], |row| row.get(0))?)
+    let sql = format!("SELECT EXISTS(SELECT 1 FROM {table} LIMIT 1)");
+    let has_rows: i64 = conn.query_row(&sql, [], |row| row.get(0))?;
+    Ok(has_rows != 0)
 }
 
 fn fixed_count(conn: &Connection, sql: &'static str) -> Result<u64> {
@@ -8399,6 +8399,268 @@ mod search_order_tests {
                 .iter()
                 .any(|(op, table)| op == "SEARCH" && table == "e"),
             "plan:\n{plan_text}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod projection_probe_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use super::*;
+
+    fn tempdir() -> tempfile::TempDir {
+        let root = std::env::current_dir().unwrap().join("target/test-data");
+        fs::create_dir_all(&root).unwrap();
+        tempfile::Builder::new()
+            .prefix("ctx-history-store-projection-probe-")
+            .tempdir_in(root)
+            .unwrap()
+    }
+
+    fn fixed_time() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-06-23T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn sync_metadata() -> SyncMetadata {
+        SyncMetadata {
+            visibility: Visibility::LocalOnly,
+            fidelity: Fidelity::Imported,
+            sync_state: SyncState::LocalOnly,
+            sync_version: 0,
+            deleted_at: None,
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    fn probe_event(seq: u64) -> Event {
+        Event {
+            id: new_id(),
+            seq,
+            history_record_id: None,
+            session_id: None,
+            run_id: None,
+            event_type: EventType::Message,
+            role: Some(EventRole::User),
+            occurred_at: fixed_time(),
+            capture_source_id: None,
+            payload: serde_json::json!({ "text": format!("probe event body {seq:05}") }),
+            payload_blob_id: None,
+            dedupe_key: None,
+            redaction_state: RedactionState::SafePreview,
+            sync: sync_metadata(),
+        }
+    }
+
+    fn probe_record() -> HistoryRecord {
+        let mut record = HistoryRecord::new(
+            "Probe record title",
+            "probe record body",
+            vec!["probe".into()],
+            "task",
+            None,
+        );
+        record.created_at = fixed_time();
+        record.updated_at = fixed_time();
+        record
+    }
+
+    fn projection_count(store: &Store, table: &str) -> i64 {
+        store
+            .conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn event_search_projection_needs_backfill_state_combinations() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+
+        // events empty + projection empty -> no backfill.
+        assert!(!store.event_search_projection_needs_backfill().unwrap());
+
+        // Orphan projection row while events is empty -> no backfill.
+        store
+            .conn
+            .execute(
+                r#"
+                INSERT INTO event_search
+                (event_id, history_record_id, session_id, role, safe_preview_text, rank_bucket)
+                VALUES ('orphan', NULL, NULL, 'user', 'orphan preview', 'message')
+                "#,
+                [],
+            )
+            .unwrap();
+        assert!(!store.event_search_projection_needs_backfill().unwrap());
+        store.conn.execute("DELETE FROM event_search", []).unwrap();
+
+        // events nonempty + projection nonempty -> no backfill.
+        store.upsert_event(&probe_event(1)).unwrap();
+        assert!(!store.event_search_projection_needs_backfill().unwrap());
+
+        // events nonempty + projection empty -> backfill required.
+        store.conn.execute("DELETE FROM event_search", []).unwrap();
+        assert!(store.event_search_projection_needs_backfill().unwrap());
+
+        // Missing event_search table -> never claims backfill.
+        store.conn.execute("DROP TABLE event_search", []).unwrap();
+        assert!(!store.event_search_projection_needs_backfill().unwrap());
+    }
+
+    #[test]
+    fn ensure_search_projection_initialized_state_combinations() {
+        // Everything empty: no rebuild, projections stay empty.
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        store.ensure_search_projection_initialized().unwrap();
+        assert_eq!(projection_count(&store, "ctx_history_search"), 0);
+        assert_eq!(projection_count(&store, "event_search"), 0);
+
+        // Base rows present, every projection empty: rebuild repopulates.
+        let record = probe_record();
+        store.insert_record(&record).unwrap();
+        store.upsert_event(&probe_event(1)).unwrap();
+        for table in ["ctx_history_search", "event_search", "artifact_search"] {
+            store
+                .conn
+                .execute(&format!("DELETE FROM {table}"), [])
+                .unwrap();
+        }
+        store.ensure_search_projection_initialized().unwrap();
+        assert_eq!(projection_count(&store, "ctx_history_search"), 1);
+        assert_eq!(projection_count(&store, "event_search"), 1);
+
+        // Any single nonempty projection short-circuits: event_search kept
+        // its row, ctx_history_search emptied -> conservative skip.
+        store
+            .conn
+            .execute("DELETE FROM ctx_history_search", [])
+            .unwrap();
+        store.ensure_search_projection_initialized().unwrap();
+        assert_eq!(
+            projection_count(&store, "ctx_history_search"),
+            0,
+            "nonempty event_search must skip the rebuild"
+        );
+
+        // Only ctx_history_search nonempty -> same conservative skip.
+        store.refresh_search_index().unwrap();
+        store.conn.execute("DELETE FROM event_search", []).unwrap();
+        store.ensure_search_projection_initialized().unwrap();
+        assert_eq!(
+            projection_count(&store, "event_search"),
+            0,
+            "nonempty ctx_history_search must skip the rebuild"
+        );
+
+        // Only artifact_search nonempty -> same conservative skip.
+        for table in ["ctx_history_search", "event_search"] {
+            store
+                .conn
+                .execute(&format!("DELETE FROM {table}"), [])
+                .unwrap();
+        }
+        store
+            .conn
+            .execute(
+                r#"
+                INSERT INTO artifact_search
+                (artifact_id, history_record_id, safe_preview_text)
+                VALUES ('sentinel-artifact', NULL, 'sentinel preview')
+                "#,
+                [],
+            )
+            .unwrap();
+        store.ensure_search_projection_initialized().unwrap();
+        assert_eq!(projection_count(&store, "ctx_history_search"), 0);
+        assert_eq!(projection_count(&store, "event_search"), 0);
+        store
+            .conn
+            .execute("DELETE FROM artifact_search", [])
+            .unwrap();
+
+        // Events only (no records): rebuild fills event_search.
+        store.ensure_search_projection_initialized().unwrap();
+        assert_eq!(projection_count(&store, "event_search"), 1);
+
+        // Optional projections missing entirely: probe still rebuilds
+        // ctx_history_search from base rows without touching dropped tables.
+        for table in ["event_search", "artifact_search"] {
+            store
+                .conn
+                .execute(&format!("DROP TABLE {table}"), [])
+                .unwrap();
+        }
+        store
+            .conn
+            .execute("DELETE FROM ctx_history_search", [])
+            .unwrap();
+        store.ensure_search_projection_initialized().unwrap();
+        assert_eq!(projection_count(&store, "ctx_history_search"), 1);
+
+        // ctx_history_search missing: whole probe is a no-op.
+        store
+            .conn
+            .execute("DROP TABLE ctx_history_search", [])
+            .unwrap();
+        store.ensure_search_projection_initialized().unwrap();
+    }
+
+    /// Deterministic bounded-work evidence: counts VDBE operations via the
+    /// SQLite progress handler (granularity 1 opcode) for both startup
+    /// probes on a small and a 20x larger indexed corpus. Existence probes
+    /// must not scale with projection size; the previous full FTS
+    /// `COUNT(*)` probes stepped the whole event_search content tree and
+    /// fail this bound.
+    #[test]
+    fn projection_probes_do_bounded_work_independent_of_index_size() {
+        fn probe_ops(event_count: u64) -> (usize, usize) {
+            let temp = tempdir();
+            let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+            for seq in 1..=event_count {
+                store.upsert_event(&probe_event(seq)).unwrap();
+            }
+            assert_eq!(projection_count(&store, "event_search"), event_count as i64);
+
+            let counter = Arc::new(AtomicUsize::new(0));
+            let handler_counter = Arc::clone(&counter);
+            store.conn.progress_handler(
+                1,
+                Some(move || {
+                    handler_counter.fetch_add(1, Ordering::Relaxed);
+                    false
+                }),
+            );
+
+            counter.store(0, Ordering::Relaxed);
+            assert!(!store.event_search_projection_needs_backfill().unwrap());
+            let backfill_ops = counter.load(Ordering::Relaxed);
+
+            counter.store(0, Ordering::Relaxed);
+            store.ensure_search_projection_initialized().unwrap();
+            let ensure_ops = counter.load(Ordering::Relaxed);
+
+            store.conn.progress_handler(0, None::<fn() -> bool>);
+            (backfill_ops, ensure_ops)
+        }
+
+        let (small_backfill, small_ensure) = probe_ops(30);
+        let (large_backfill, large_ensure) = probe_ops(600);
+
+        let slack = 16;
+        assert!(
+            large_backfill <= small_backfill + slack,
+            "needs_backfill probe work scaled with index size: {small_backfill} ops at 30 events vs {large_backfill} ops at 600 events"
+        );
+        assert!(
+            large_ensure <= small_ensure + slack,
+            "ensure_search_projection_initialized probe work scaled with index size: {small_ensure} ops at 30 events vs {large_ensure} ops at 600 events"
         );
     }
 }

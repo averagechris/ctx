@@ -2005,8 +2005,10 @@ fn run_import_internal(
     }
 
     if totals.imported_sessions > 0 || totals.imported_events > 0 || totals.imported_edges > 0 {
-        progress.message("finalizing", "optimizing search index");
-        Store::open(&db_path)?.optimize_search_index()?;
+        progress.message("finalizing", "compacting search index");
+        // One fixed positive FTS merge request instead of a full `optimize`:
+        // ask SQLite for roughly 256 pages of work per existing projection.
+        Store::open(&db_path)?.merge_search_index_bounded()?;
     }
 
     progress.message("finalizing", "checkpointing search database");
@@ -2111,8 +2113,9 @@ fn run_explicit_format_import(
     let mut totals = ImportTotals::default();
     totals.add(&summary, &stats);
     if totals.imported_sessions > 0 || totals.imported_events > 0 || totals.imported_edges > 0 {
-        progress.message("finalizing", "optimizing search index");
-        Store::open(&db_path)?.optimize_search_index()?;
+        progress.message("finalizing", "compacting search index");
+        // One fixed positive FTS merge request (see the normal import path).
+        Store::open(&db_path)?.merge_search_index_bounded()?;
     }
     progress.message("finalizing", "checkpointing search database");
     Store::open(&db_path)?.checkpoint_wal_truncate_if_larger_than(WAL_TRUNCATE_MIN_BYTES)?;

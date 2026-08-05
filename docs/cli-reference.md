@@ -28,8 +28,9 @@ ctx doctor --json
 
 - `setup` creates the data root, opens or creates `work.sqlite`, writes
   `config.toml` when needed, discovers known provider history locations,
-  catalogs Codex sessions, imports discovered native provider sources, optimizes
-  the local search index, and prints next steps. It does not execute
+  catalogs Codex sessions, imports discovered native provider sources, requests
+  one bounded incremental compaction of each local search projection, and prints
+  next steps. It does not execute
   history-source plugin commands.
 - `setup --catalog-only` stops after discovery/cataloging. It is useful for
   fast inventory or troubleshooting, but it does not make history searchable.

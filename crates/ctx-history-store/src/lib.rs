@@ -115,6 +115,12 @@ pub const RAW_SQL_MAX_SQL_BYTES_CAP: usize = 1_048_576;
 pub const RAW_SQL_DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const RAW_SQL_MAX_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The closed set of FTS5 search projection tables. `event_search` and
+/// `artifact_search` are optional (older stores may lack them); every
+/// maintenance entry point probes existence before touching a table.
+const SEARCH_PROJECTION_FTS_TABLES: [&str; 3] =
+    ["ctx_history_search", "event_search", "artifact_search"];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawSqlOptions {
     pub max_rows: usize,
@@ -1209,6 +1215,17 @@ pub struct Store {
 }
 
 impl Store {
+    /// Page budget for one bounded post-import merge pass
+    /// ([`Store::merge_search_index_bounded`]). The unsigned non-zero type
+    /// makes a negative budget unrepresentable: in FTS5 a negative `merge`
+    /// argument switches to "merge everything towards one segment" mode,
+    /// which is the unbounded behavior this API exists to avoid.
+    pub const SEARCH_INDEX_MERGE_PAGES: std::num::NonZeroU16 = match std::num::NonZeroU16::new(256)
+    {
+        Some(pages) => pages,
+        None => unreachable!(),
+    };
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_busy_timeout(path, BUSY_TIMEOUT)
     }
@@ -1547,11 +1564,44 @@ impl Store {
         self.rebuild_search_projection()
     }
 
+    /// Full FTS5 `optimize`: merges every segment of every search projection
+    /// into a single b-tree. Cost is proportional to total index size, so
+    /// this is only appropriate for explicit, offline maintenance. Routine
+    /// post-import upkeep should use [`Store::merge_search_index_bounded`].
     pub fn optimize_search_index(&self) -> Result<()> {
-        for table in ["ctx_history_search", "event_search", "artifact_search"] {
+        for table in SEARCH_PROJECTION_FTS_TABLES {
             if table_exists(&self.conn, table)? {
                 self.conn.execute(
                     format!("INSERT INTO {table}({table}) VALUES ('optimize')").as_str(),
+                    [],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// One fixed positive FTS5 merge request per existing search projection:
+    /// `INSERT INTO t(t, rank) VALUES ('merge', N)`, asking SQLite for roughly
+    /// [`Store::SEARCH_INDEX_MERGE_PAGES`] pages of work per table.
+    ///
+    /// A positive merge argument only considers levels that have accumulated
+    /// at least `usermerge` (default 4) same-level segments. On an
+    /// already-compacted index a tiny increment will usually leave too few
+    /// eligible segments, so this request usually does no merge work. Unlike
+    /// `optimize` (or a negative merge argument), this method does not ask
+    /// SQLite to merge the whole index: it issues exactly one request per
+    /// table, never loops, and never derives the argument from user input.
+    /// SQLite may write somewhat more than N pages while completing a b-tree
+    /// operation; N is a requested amount of merge work, not a strict cap.
+    pub fn merge_search_index_bounded(&self) -> Result<()> {
+        for table in SEARCH_PROJECTION_FTS_TABLES {
+            if table_exists(&self.conn, table)? {
+                self.conn.execute(
+                    format!(
+                        "INSERT INTO {table}({table}, rank) VALUES ('merge', {})",
+                        Self::SEARCH_INDEX_MERGE_PAGES
+                    )
+                    .as_str(),
                     [],
                 )?;
             }
@@ -9565,6 +9615,411 @@ mod projection_probe_tests {
             large_ensure <= small_ensure + slack,
             "ensure_search_projection_initialized probe work scaled with index size: {small_ensure} ops at 30 events vs {large_ensure} ops at 600 events"
         );
+    }
+}
+
+#[cfg(test)]
+mod search_maintenance_tests {
+    use super::*;
+
+    fn tempdir() -> tempfile::TempDir {
+        let root = std::env::current_dir().unwrap().join("target/test-data");
+        fs::create_dir_all(&root).unwrap();
+        tempfile::Builder::new()
+            .prefix("ctx-history-store-search-maintenance-")
+            .tempdir_in(root)
+            .unwrap()
+    }
+
+    fn fixed_time() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-06-23T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn sync_metadata() -> SyncMetadata {
+        SyncMetadata {
+            visibility: Visibility::LocalOnly,
+            fidelity: Fidelity::Imported,
+            sync_state: SyncState::LocalOnly,
+            sync_version: 0,
+            deleted_at: None,
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    fn probe_event(seq: u64) -> Event {
+        Event {
+            id: new_id(),
+            seq,
+            history_record_id: None,
+            session_id: None,
+            run_id: None,
+            event_type: EventType::Message,
+            role: Some(EventRole::User),
+            occurred_at: fixed_time(),
+            capture_source_id: None,
+            payload: serde_json::json!({ "text": format!("maintenance probe body {seq:05}") }),
+            payload_blob_id: None,
+            dedupe_key: None,
+            redaction_state: RedactionState::SafePreview,
+            sync: sync_metadata(),
+        }
+    }
+
+    /// Exact contents of the FTS5 segment b-tree shadow table. Two equal
+    /// snapshots mean the maintenance pass rewrote nothing on disk.
+    fn fts_data_snapshot(store: &Store, table: &str) -> Vec<(i64, Vec<u8>)> {
+        let mut stmt = store
+            .conn
+            .prepare(&format!("SELECT id, block FROM {table}_data ORDER BY id"))
+            .unwrap();
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .unwrap();
+        rows.map(|row| row.unwrap()).collect()
+    }
+
+    fn match_event_ids(store: &Store, query: &str) -> Vec<String> {
+        let mut stmt = store
+            .conn
+            .prepare(
+                "SELECT event_id FROM event_search WHERE event_search MATCH ?1 ORDER BY event_id",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map(params![query], |row| row.get::<_, String>(0))
+            .unwrap();
+        rows.map(|row| row.unwrap()).collect()
+    }
+
+    fn assert_fts_integrity(store: &Store, table: &str) {
+        store
+            .conn
+            .execute(
+                &format!("INSERT INTO {table}({table}) VALUES ('integrity-check')"),
+                [],
+            )
+            .unwrap();
+    }
+
+    fn total_changes(store: &Store) -> i64 {
+        store
+            .conn
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn bulk_insert_events(store: &Store, count: u64) {
+        store.conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        for seq in 1..=count {
+            store.upsert_event(&probe_event(seq)).unwrap();
+        }
+        store.conn.execute_batch("COMMIT;").unwrap();
+    }
+
+    #[test]
+    fn bounded_merge_budget_is_positive_and_negative_is_unrepresentable() {
+        // FTS5 interprets a negative `merge` argument as "merge the whole
+        // index towards one segment" (unbounded, optimize-like). The budget
+        // is a NonZeroU16, so neither zero nor a negative value can be
+        // expressed, and the method takes no user input that could alter it.
+        assert_eq!(Store::SEARCH_INDEX_MERGE_PAGES.get(), 256);
+        assert!(i64::from(Store::SEARCH_INDEX_MERGE_PAGES.get()) > 0);
+    }
+
+    #[test]
+    fn tiny_increment_fixture_has_no_eligible_positive_merge_work() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        for seq in 1..=20 {
+            store.upsert_event(&probe_event(seq)).unwrap();
+        }
+        store.optimize_search_index().unwrap();
+
+        // Tiny increment: one autocommit insert -> one small level-0 segment.
+        store.upsert_event(&probe_event(21)).unwrap();
+
+        let hits_before = match_event_ids(&store, "maintenance");
+        assert_eq!(hits_before.len(), 21);
+        let segments_before = fts_data_snapshot(&store, "event_search");
+
+        store.merge_search_index_bounded().unwrap();
+
+        // In this deterministic fixture, one sub-`usermerge` level-0 segment
+        // is not eligible for a positive merge, so the segment b-tree is
+        // byte-identical. Real tiny increments will usually behave this way,
+        // but may encounter eligible fragmentation left by earlier imports.
+        let segments_after = fts_data_snapshot(&store, "event_search");
+        assert_eq!(
+            segments_before, segments_after,
+            "this optimized-baseline fixture must have no eligible merge work"
+        );
+        assert_eq!(match_event_ids(&store, "maintenance"), hits_before);
+        assert_fts_integrity(&store, "event_search");
+    }
+
+    #[test]
+    fn bounded_merge_compacts_fragmented_segments_and_preserves_matches() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        // Each autocommit upsert flushes its own level-0 segment, mirroring
+        // repeated small imports; 12 segments exceed the FTS5 `usermerge`
+        // eligibility threshold (default 4).
+        for seq in 1..=12 {
+            store.upsert_event(&probe_event(seq)).unwrap();
+        }
+        // artifact_search is intentionally not populated by current store
+        // write paths. Seed a representative row directly so maintenance
+        // identity/integrity coverage includes this optional projection.
+        store
+            .conn
+            .execute(
+                "INSERT INTO artifact_search
+                 (artifact_id, history_record_id, safe_preview_text)
+                 VALUES ('artifact-maintenance-sentinel', NULL, 'maintenance artifact sentinel')",
+                [],
+            )
+            .unwrap();
+
+        let hits_before = match_event_ids(&store, "maintenance");
+        assert_eq!(hits_before.len(), 12);
+        let exact_before = match_event_ids(&store, "\"maintenance probe body 00007\"");
+        assert_eq!(exact_before.len(), 1);
+        let artifact_before: String = store
+            .conn
+            .query_row(
+                "SELECT artifact_id FROM artifact_search
+                 WHERE artifact_search MATCH 'maintenance'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let segments_before = fts_data_snapshot(&store, "event_search");
+
+        store.merge_search_index_bounded().unwrap();
+
+        // Eligible fragmentation performs real, bounded compaction work.
+        let segments_after = fts_data_snapshot(&store, "event_search");
+        assert_ne!(
+            segments_before, segments_after,
+            "bounded merge must compact eligible fragmented segments"
+        );
+        assert!(
+            segments_after.len() <= segments_before.len(),
+            "compaction must not grow the segment b-tree: {} -> {}",
+            segments_before.len(),
+            segments_after.len()
+        );
+
+        // MATCH identities and index integrity are unchanged.
+        assert_eq!(match_event_ids(&store, "maintenance"), hits_before);
+        assert_eq!(
+            match_event_ids(&store, "\"maintenance probe body 00007\""),
+            exact_before
+        );
+        let artifact_after: String = store
+            .conn
+            .query_row(
+                "SELECT artifact_id FROM artifact_search
+                 WHERE artifact_search MATCH 'maintenance'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(artifact_after, artifact_before);
+        assert_fts_integrity(&store, "event_search");
+        assert_fts_integrity(&store, "ctx_history_search");
+        assert_fts_integrity(&store, "artifact_search");
+    }
+
+    /// Deterministic cheap-request evidence via `total_changes()`, which
+    /// counts every row FTS5 rewrites in its shadow tables on this
+    /// connection. After a tiny increment on an optimized baseline, the
+    /// positive merge request usually has no eligible work, while a full
+    /// `optimize` rewrites the whole index. This is not a saturated-merge
+    /// proof or a strict upper bound on SQLite's page writes.
+    #[test]
+    fn tiny_increment_merge_request_stays_cheap_as_index_grows() {
+        fn maintenance_changes(event_count: u64, full_optimize: bool) -> i64 {
+            let temp = tempdir();
+            let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+            bulk_insert_events(&store, event_count);
+            store.optimize_search_index().unwrap();
+            store.upsert_event(&probe_event(event_count + 1)).unwrap();
+
+            let before = total_changes(&store);
+            if full_optimize {
+                store.optimize_search_index().unwrap();
+            } else {
+                store.merge_search_index_bounded().unwrap();
+            }
+            total_changes(&store) - before
+        }
+
+        let small_merge = maintenance_changes(30, false);
+        let large_merge = maintenance_changes(600, false);
+        let large_optimize = maintenance_changes(600, true);
+
+        let slack = 8;
+        assert!(
+            large_merge <= small_merge + slack,
+            "tiny-increment merge request became unexpectedly expensive: {small_merge} shadow-table changes at 30 events vs {large_merge} at 600 events"
+        );
+        assert!(
+            large_optimize > large_merge + slack,
+            "full optimize should rewrite the whole index ({large_optimize} changes) while this tiny-increment merge request stays cheap ({large_merge} changes)"
+        );
+    }
+
+    #[test]
+    fn bounded_merge_handles_missing_optional_fts_tables() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        for seq in 1..=5 {
+            store.upsert_event(&probe_event(seq)).unwrap();
+        }
+
+        // Optional projections may be absent on older stores.
+        store
+            .conn
+            .execute("DROP TABLE artifact_search", [])
+            .unwrap();
+        store.merge_search_index_bounded().unwrap();
+
+        store.conn.execute("DROP TABLE event_search", []).unwrap();
+        store.merge_search_index_bounded().unwrap();
+
+        // Even the record projection missing is tolerated, matching
+        // optimize_search_index.
+        store
+            .conn
+            .execute("DROP TABLE ctx_history_search", [])
+            .unwrap();
+        store.merge_search_index_bounded().unwrap();
+    }
+}
+
+/// Retained benchmark evidence for the post-import maintenance change. Run
+/// explicitly with:
+///
+/// ```text
+/// cargo test --release -p ctx-history-store -- --ignored --nocapture --test-threads=1 bench_post_import
+/// ```
+#[cfg(test)]
+mod search_maintenance_benches {
+    use super::*;
+
+    fn tempdir() -> tempfile::TempDir {
+        let root = std::env::current_dir().unwrap().join("target/test-data");
+        fs::create_dir_all(&root).unwrap();
+        tempfile::Builder::new()
+            .prefix("ctx-history-store-maintenance-bench-")
+            .tempdir_in(root)
+            .unwrap()
+    }
+
+    fn sync_metadata() -> SyncMetadata {
+        SyncMetadata {
+            visibility: Visibility::LocalOnly,
+            fidelity: Fidelity::Imported,
+            sync_state: SyncState::LocalOnly,
+            sync_version: 0,
+            deleted_at: None,
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    fn bench_event(seq: u64) -> Event {
+        Event {
+            id: new_id(),
+            seq,
+            history_record_id: None,
+            session_id: None,
+            run_id: None,
+            event_type: EventType::Message,
+            role: Some(EventRole::User),
+            occurred_at: DateTime::parse_from_rfc3339("2026-06-23T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            capture_source_id: None,
+            payload: serde_json::json!({
+                "text": format!(
+                    "bench transcript event {seq:07}: the agent inspected the store, \
+                     compared segment layouts, and reported deterministic merge \
+                     behavior across repeated incremental import batches {seq:07}"
+                )
+            }),
+            payload_blob_id: None,
+            dedupe_key: None,
+            redaction_state: RedactionState::SafePreview,
+            sync: sync_metadata(),
+        }
+    }
+
+    fn build_corpus(size: u64) -> (tempfile::TempDir, Store, Duration) {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let started = Instant::now();
+        store.conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        for seq in 1..=size {
+            store.upsert_event(&bench_event(seq)).unwrap();
+        }
+        store.conn.execute_batch("COMMIT;").unwrap();
+        let generation = started.elapsed();
+        store.optimize_search_index().unwrap();
+        (temp, store, generation)
+    }
+
+    #[test]
+    #[ignore = "benchmark: cargo test --release -p ctx-history-store -- --ignored --nocapture --test-threads=1 bench_post_import"]
+    fn bench_post_import_full_optimize_vs_bounded_merge() {
+        for &size in &[10_000u64, 50_000] {
+            let (_temp_a, optimize_store, gen_a) = build_corpus(size);
+            let (_temp_b, merge_store, gen_b) = build_corpus(size);
+            println!(
+                "corpus {size}: generation {:?} / {:?} (excluded from maintenance timings)",
+                gen_a, gen_b
+            );
+
+            // One tiny increment, then a single maintenance pass.
+            optimize_store.upsert_event(&bench_event(size + 1)).unwrap();
+            merge_store.upsert_event(&bench_event(size + 1)).unwrap();
+            let started = Instant::now();
+            optimize_store.optimize_search_index().unwrap();
+            let optimize_once = started.elapsed();
+            let started = Instant::now();
+            merge_store.merge_search_index_bounded().unwrap();
+            let merge_once = started.elapsed();
+            println!(
+                "corpus {size}: tiny increment -> full optimize {optimize_once:?} vs bounded merge {merge_once:?}"
+            );
+
+            // Repeated small increments with maintenance after each, the
+            // steady-state import pattern.
+            let increments = 100u64;
+            let started = Instant::now();
+            for step in 0..increments {
+                optimize_store
+                    .upsert_event(&bench_event(size + 2 + step))
+                    .unwrap();
+                optimize_store.optimize_search_index().unwrap();
+            }
+            let optimize_repeated = started.elapsed();
+            let started = Instant::now();
+            for step in 0..increments {
+                merge_store
+                    .upsert_event(&bench_event(size + 2 + step))
+                    .unwrap();
+                merge_store.merge_search_index_bounded().unwrap();
+            }
+            let merge_repeated = started.elapsed();
+            println!(
+                "corpus {size}: {increments} increments -> full optimize {optimize_repeated:?} vs bounded merge {merge_repeated:?}"
+            );
+        }
     }
 }
 

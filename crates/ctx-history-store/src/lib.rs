@@ -2704,118 +2704,138 @@ impl Store {
     }
 
     pub fn upsert_event(&self, event: &Event) -> Result<Uuid> {
-        let event_id = if let Some(dedupe_key) = &event.dedupe_key {
-            reject_provider_event_hash_conflict(&self.conn, dedupe_key)?;
-            if let Some(existing_id) = self
-                .conn
-                .query_row(
-                    "SELECT id FROM events WHERE dedupe_key = ?1",
-                    params![dedupe_key],
-                    |row| parse_uuid(row.get::<_, String>(0)?),
-                )
-                .optional()?
-            {
-                return Ok(existing_id);
-            }
-            event.id
-        } else {
-            event.id
-        };
+        // Dedupe probe, id-existence probe, base upsert, and projection
+        // maintenance all run as one atomic write unit: the write
+        // transaction takes the write lock before the probes in autocommit
+        // mode and nests inside existing capture-harness batches. An event
+        // id proven absent by the indexed primary-key probe takes the
+        // insert-only projection path (skipping the full-scan FTS DELETE);
+        // an existing id keeps the delete + insert path, which also removes
+        // the projection row when the new preview is blank.
+        with_write_transaction(&self.conn, "upsert_event", || {
+            let event_id = if let Some(dedupe_key) = &event.dedupe_key {
+                reject_provider_event_hash_conflict(&self.conn, dedupe_key)?;
+                if let Some(existing_id) = self
+                    .conn
+                    .query_row(
+                        "SELECT id FROM events WHERE dedupe_key = ?1",
+                        params![dedupe_key],
+                        |row| parse_uuid(row.get::<_, String>(0)?),
+                    )
+                    .optional()?
+                {
+                    return Ok(existing_id);
+                }
+                event.id
+            } else {
+                event.id
+            };
 
-        self.conn.execute(
-            r#"
-            INSERT INTO events
-            (id, seq, history_record_id, session_id, run_id, event_type, role, occurred_at_ms, capture_source_id, payload_json, payload_blob_id, dedupe_key, visibility, redaction_state, fidelity, sync_state, sync_version, deleted_at_ms, metadata_json)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
-            ON CONFLICT(id) DO UPDATE SET
-                seq = excluded.seq,
-                history_record_id = excluded.history_record_id,
-                session_id = excluded.session_id,
-                run_id = excluded.run_id,
-                event_type = excluded.event_type,
-                role = excluded.role,
-                occurred_at_ms = excluded.occurred_at_ms,
-                capture_source_id = excluded.capture_source_id,
-                payload_json = excluded.payload_json,
-                payload_blob_id = excluded.payload_blob_id,
-                dedupe_key = excluded.dedupe_key,
-                visibility = excluded.visibility,
-                redaction_state = excluded.redaction_state,
-                fidelity = excluded.fidelity,
-                sync_state = excluded.sync_state,
-                sync_version = excluded.sync_version,
-                deleted_at_ms = excluded.deleted_at_ms,
-                metadata_json = excluded.metadata_json
-            "#,
-            params![
-                event_id.to_string(),
-                event.seq as i64,
-                optional_uuid_string(event.history_record_id),
-                optional_uuid_string(event.session_id),
-                optional_uuid_string(event.run_id),
-                event.event_type.as_str(),
-                event.role.map(|role| role.as_str()),
-                timestamp_ms(event.occurred_at),
-                optional_uuid_string(event.capture_source_id),
-                serde_json::to_string(&event.payload)?,
-                optional_uuid_string(event.payload_blob_id),
-                event.dedupe_key.as_deref(),
-                event.sync.visibility.as_str(),
-                event.redaction_state.as_str(),
-                event.sync.fidelity.as_str(),
-                event.sync.sync_state.as_str(),
-                event.sync.sync_version as i64,
-                optional_timestamp_ms(event.sync.deleted_at),
-                serde_json::to_string(&event.sync.metadata)?,
-            ],
-        )?;
-        upsert_event_search_projection_for_event(&self.conn, event_id, event)?;
-        if let Some(dedupe_key) = &event.dedupe_key {
-            return self.event_id_by_dedupe_key(dedupe_key);
-        }
-        Ok(event_id)
+            let existed = event_row_exists(&self.conn, event_id)?;
+            self.conn.execute(
+                r#"
+                INSERT INTO events
+                (id, seq, history_record_id, session_id, run_id, event_type, role, occurred_at_ms, capture_source_id, payload_json, payload_blob_id, dedupe_key, visibility, redaction_state, fidelity, sync_state, sync_version, deleted_at_ms, metadata_json)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+                ON CONFLICT(id) DO UPDATE SET
+                    seq = excluded.seq,
+                    history_record_id = excluded.history_record_id,
+                    session_id = excluded.session_id,
+                    run_id = excluded.run_id,
+                    event_type = excluded.event_type,
+                    role = excluded.role,
+                    occurred_at_ms = excluded.occurred_at_ms,
+                    capture_source_id = excluded.capture_source_id,
+                    payload_json = excluded.payload_json,
+                    payload_blob_id = excluded.payload_blob_id,
+                    dedupe_key = excluded.dedupe_key,
+                    visibility = excluded.visibility,
+                    redaction_state = excluded.redaction_state,
+                    fidelity = excluded.fidelity,
+                    sync_state = excluded.sync_state,
+                    sync_version = excluded.sync_version,
+                    deleted_at_ms = excluded.deleted_at_ms,
+                    metadata_json = excluded.metadata_json
+                "#,
+                params![
+                    event_id.to_string(),
+                    event.seq as i64,
+                    optional_uuid_string(event.history_record_id),
+                    optional_uuid_string(event.session_id),
+                    optional_uuid_string(event.run_id),
+                    event.event_type.as_str(),
+                    event.role.map(|role| role.as_str()),
+                    timestamp_ms(event.occurred_at),
+                    optional_uuid_string(event.capture_source_id),
+                    serde_json::to_string(&event.payload)?,
+                    optional_uuid_string(event.payload_blob_id),
+                    event.dedupe_key.as_deref(),
+                    event.sync.visibility.as_str(),
+                    event.redaction_state.as_str(),
+                    event.sync.fidelity.as_str(),
+                    event.sync.sync_state.as_str(),
+                    event.sync.sync_version as i64,
+                    optional_timestamp_ms(event.sync.deleted_at),
+                    serde_json::to_string(&event.sync.metadata)?,
+                ],
+            )?;
+            if existed {
+                upsert_event_search_projection_for_event(&self.conn, event_id, event)?;
+            } else {
+                insert_event_search_projection_for_event_id(&self.conn, event_id, event)?;
+            }
+            if let Some(dedupe_key) = &event.dedupe_key {
+                return self.event_id_by_dedupe_key(dedupe_key);
+            }
+            Ok(event_id)
+        })
     }
 
     pub fn insert_event_if_absent(&self, event: &Event) -> Result<bool> {
-        let changed = self
-            .conn
-            .prepare_cached(
-                r#"
-                INSERT OR IGNORE INTO events
-                (id, seq, history_record_id, session_id, run_id, event_type, role, occurred_at_ms, capture_source_id, payload_json, payload_blob_id, dedupe_key, visibility, redaction_state, fidelity, sync_state, sync_version, deleted_at_ms, metadata_json)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
-                "#,
-            )?
-            .execute(params![
-                event.id.to_string(),
-                event.seq as i64,
-                optional_uuid_string(event.history_record_id),
-                optional_uuid_string(event.session_id),
-                optional_uuid_string(event.run_id),
-                event.event_type.as_str(),
-                event.role.map(|role| role.as_str()),
-                timestamp_ms(event.occurred_at),
-                optional_uuid_string(event.capture_source_id),
-                serde_json::to_string(&event.payload)?,
-                optional_uuid_string(event.payload_blob_id),
-                event.dedupe_key.as_deref(),
-                event.sync.visibility.as_str(),
-                event.redaction_state.as_str(),
-                event.sync.fidelity.as_str(),
-                event.sync.sync_state.as_str(),
-                event.sync.sync_version as i64,
-                optional_timestamp_ms(event.sync.deleted_at),
-                serde_json::to_string(&event.sync.metadata)?,
-            ])?;
-        if changed == 0 {
-            if let Some(dedupe_key) = &event.dedupe_key {
-                reject_provider_event_hash_conflict(&self.conn, dedupe_key)?;
+        // Same insert-only projection contract as before; the shared write
+        // transaction additionally makes base insert + projection atomic
+        // without changing the return value or dedupe semantics.
+        with_write_transaction(&self.conn, "insert_event_if_absent", || {
+            let changed = self
+                .conn
+                .prepare_cached(
+                    r#"
+                    INSERT OR IGNORE INTO events
+                    (id, seq, history_record_id, session_id, run_id, event_type, role, occurred_at_ms, capture_source_id, payload_json, payload_blob_id, dedupe_key, visibility, redaction_state, fidelity, sync_state, sync_version, deleted_at_ms, metadata_json)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+                    "#,
+                )?
+                .execute(params![
+                    event.id.to_string(),
+                    event.seq as i64,
+                    optional_uuid_string(event.history_record_id),
+                    optional_uuid_string(event.session_id),
+                    optional_uuid_string(event.run_id),
+                    event.event_type.as_str(),
+                    event.role.map(|role| role.as_str()),
+                    timestamp_ms(event.occurred_at),
+                    optional_uuid_string(event.capture_source_id),
+                    serde_json::to_string(&event.payload)?,
+                    optional_uuid_string(event.payload_blob_id),
+                    event.dedupe_key.as_deref(),
+                    event.sync.visibility.as_str(),
+                    event.redaction_state.as_str(),
+                    event.sync.fidelity.as_str(),
+                    event.sync.sync_state.as_str(),
+                    event.sync.sync_version as i64,
+                    optional_timestamp_ms(event.sync.deleted_at),
+                    serde_json::to_string(&event.sync.metadata)?,
+                ])?;
+            if changed == 0 {
+                if let Some(dedupe_key) = &event.dedupe_key {
+                    reject_provider_event_hash_conflict(&self.conn, dedupe_key)?;
+                }
             }
-        }
-        if changed > 0 {
-            insert_event_search_projection_for_event(&self.conn, event)?;
-        }
-        Ok(changed > 0)
+            if changed > 0 {
+                insert_event_search_projection_for_event(&self.conn, event)?;
+            }
+            Ok(changed > 0)
+        })
     }
 
     pub fn event_id_by_dedupe_key(&self, dedupe_key: &str) -> Result<Uuid> {
@@ -3581,59 +3601,92 @@ impl Store {
     }
 
     pub fn insert_record(&self, record: &HistoryRecord) -> Result<()> {
-        let created_at_ms = timestamp_ms(record.created_at);
-        let updated_at_ms = timestamp_ms(record.updated_at);
-        self.conn.execute(
-            r#"
-            INSERT INTO history_records
-            (
-                id, title, summary, status, started_at_ms, last_activity_at_ms,
-                created_at_ms, updated_at_ms, body, tags_json, kind, workspace,
-                created_at, updated_at
-            )
-            VALUES (?1, ?2, ?3, 'open', ?4, ?5, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-            "#,
-            params![
-                record.id.to_string(),
-                record.title,
-                record.body,
-                created_at_ms,
-                updated_at_ms,
-                record.body,
-                serde_json::to_string(&record.tags)?,
-                record.kind,
-                record.workspace,
-                record.created_at.to_rfc3339(),
-                record.updated_at.to_rfc3339(),
-            ],
-        )?;
-        upsert_record_search_projection(&self.conn, record)?;
-        Ok(())
+        // The plain INSERT (no conflict clause) fails on a duplicate primary
+        // key, so reaching the projection write proves the record id is new
+        // and the insert-only projection can skip the full-scan FTS DELETE.
+        // The write transaction makes base row + projection one atomic unit
+        // both in autocommit mode and nested inside a caller batch.
+        with_write_transaction(&self.conn, "insert_record", || {
+            let created_at_ms = timestamp_ms(record.created_at);
+            let updated_at_ms = timestamp_ms(record.updated_at);
+            self.conn.execute(
+                r#"
+                INSERT INTO history_records
+                (
+                    id, title, summary, status, started_at_ms, last_activity_at_ms,
+                    created_at_ms, updated_at_ms, body, tags_json, kind, workspace,
+                    created_at, updated_at
+                )
+                VALUES (?1, ?2, ?3, 'open', ?4, ?5, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                "#,
+                params![
+                    record.id.to_string(),
+                    record.title,
+                    record.body,
+                    created_at_ms,
+                    updated_at_ms,
+                    record.body,
+                    serde_json::to_string(&record.tags)?,
+                    record.kind,
+                    record.workspace,
+                    record.created_at.to_rfc3339(),
+                    record.updated_at.to_rfc3339(),
+                ],
+            )?;
+            insert_record_search_projection(&self.conn, record)
+        })
     }
 
     pub fn upsert_record(&self, record: &HistoryRecord) -> Result<()> {
-        self.upsert_record_row(record)?;
-        upsert_record_search_projection(&self.conn, record)?;
-        Ok(())
+        // Probe, base upsert, and projection maintenance must see one
+        // consistent snapshot and apply atomically: the write transaction
+        // acquires the write lock before the probe in autocommit mode and
+        // nests inside existing harness batches. A record proven absent by
+        // the indexed primary-key probe takes the insert-only projection
+        // path; an existing record keeps the delete + insert path so its
+        // old projection row is replaced.
+        with_write_transaction(&self.conn, "upsert_record", || {
+            let existed = history_record_row_exists(&self.conn, record.id)?;
+            self.upsert_record_row(record)?;
+            if existed {
+                upsert_record_search_projection(&self.conn, record)
+            } else {
+                insert_record_search_projection(&self.conn, record)
+            }
+        })
     }
 
     pub fn upsert_records(&self, records: &[HistoryRecord]) -> Result<()> {
         if records.is_empty() {
             return Ok(());
         }
+        // Base rows and projection rows commit in the same immediate
+        // transaction: any projection error rolls back the whole batch, and
+        // readers never observe base rows without their search projections
+        // (previously projections were written after the batch commit).
+        // Per-row novelty comes from an indexed primary-key probe inside the
+        // transaction, so an id repeated within one batch is new for its
+        // first occurrence and existing for later ones.
         self.begin_immediate_batch()?;
-        for record in records {
-            if let Err(err) = self.upsert_record_row(record) {
-                let _ = self.rollback_batch();
-                return Err(err);
+        let body = (|| -> Result<()> {
+            for record in records {
+                let existed = history_record_row_exists(&self.conn, record.id)?;
+                self.upsert_record_row(record)?;
+                if existed {
+                    upsert_record_search_projection(&self.conn, record)?;
+                } else {
+                    insert_record_search_projection(&self.conn, record)?;
+                }
             }
+            Ok(())
+        })();
+        if let Err(err) = body {
+            let _ = self.rollback_batch();
+            return Err(err);
         }
         if let Err(err) = self.commit_batch() {
             let _ = self.rollback_batch();
             return Err(err);
-        }
-        for record in records {
-            upsert_record_search_projection(&self.conn, record)?;
         }
         Ok(())
     }
@@ -4531,48 +4584,92 @@ fn object_relative_path(hash: &str) -> String {
     format!("{OBJECTS_DIR}/{shard}/{hash}")
 }
 
-/// Atomic full rebuild of every FTS search projection from the base tables.
+/// Runs `body` as one atomic write unit on `conn`, choosing the transaction
+/// shape by context.
 ///
-/// The delete + repopulate sequence runs inside a SQLite SAVEPOINT rather
-/// than `BEGIN`: callers invoke this both from autocommit mode
-/// (`Store::refresh_search_index`, post-import archive rebuilds,
-/// `ensure_search_projection_initialized`) and from inside already-open
-/// migration transactions (`migrate_to_v11`/`migrate_to_v12`). A savepoint
-/// opens an implicit transaction when none is active and nests inside an
-/// existing one otherwise, so in every context the rebuild commits as one
-/// unit — no per-row autocommit overhead — and any failure rolls back to
-/// the previous complete projection instead of leaving it empty or partial.
-fn rebuild_search_projection(conn: &Connection) -> Result<()> {
-    conn.execute_batch("SAVEPOINT rebuild_search_projection;")?;
-    match rebuild_search_projection_body(conn) {
-        Ok(()) => match conn.execute_batch("RELEASE SAVEPOINT rebuild_search_projection;") {
-            Ok(()) => Ok(()),
+/// In autocommit mode this takes `BEGIN IMMEDIATE` *before* the body runs,
+/// so read probes and the writes they guard hold the write lock together
+/// from the start. A bare SAVEPOINT here would open a deferred transaction:
+/// the probe would read under a shared snapshot and the later write would
+/// have to upgrade mid-body, which under WAL can fail immediately with
+/// SQLITE_BUSY_SNAPSHOT (bypassing the busy timeout) when another
+/// connection commits in between — and would let the probe's answer go
+/// stale before the write. With BEGIN IMMEDIATE the lock acquisition waits
+/// under the configured busy timeout up front and probe answers stay true
+/// for the writes that depend on them. COMMIT is the success point; on body
+/// or COMMIT failure a best-effort ROLLBACK runs and the original
+/// body/commit error is the one surfaced.
+///
+/// Inside an already-open caller transaction (migration transactions,
+/// capture-harness batches) the caller already holds the write lock, so
+/// this nests as a named SAVEPOINT with the cleanup semantics of the
+/// projection-rebuild hardening:
+/// - On body failure, ROLLBACK TO rewinds the body but keeps the savepoint
+///   on the stack; the RELEASE then drops it, leaving the enclosing
+///   transaction open and usable. The cleanup is best-effort and the
+///   original body error is always the one surfaced.
+/// - On success, if the RELEASE itself fails, a best-effort attempt
+///   restores/drops the savepoint before surfacing that exact release
+///   error.
+///
+/// `name` must be a trusted static identifier: it is interpolated into the
+/// SAVEPOINT statements verbatim.
+fn with_write_transaction<T>(
+    conn: &Connection,
+    name: &'static str,
+    body: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if conn.is_autocommit() {
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        return match body() {
+            Ok(value) => match conn.execute_batch("COMMIT;") {
+                Ok(()) => Ok(value),
+                Err(commit_err) => {
+                    let _ = conn.execute_batch("ROLLBACK;");
+                    Err(StoreError::Sql(commit_err))
+                }
+            },
+            Err(err) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                Err(err)
+            }
+        };
+    }
+    conn.execute_batch(&format!("SAVEPOINT {name};"))?;
+    match body() {
+        Ok(value) => match conn.execute_batch(&format!("RELEASE SAVEPOINT {name};")) {
+            Ok(()) => Ok(value),
             Err(release_err) => {
-                // RELEASE is the commit point for autocommit callers. If it
-                // fails, make a best-effort attempt to restore/drop the
-                // savepoint before surfacing that exact release error.
-                let _ = conn.execute_batch(
-                    "ROLLBACK TO SAVEPOINT rebuild_search_projection; \
-                     RELEASE SAVEPOINT rebuild_search_projection;",
-                );
+                let _ = conn.execute_batch(&format!(
+                    "ROLLBACK TO SAVEPOINT {name}; RELEASE SAVEPOINT {name};"
+                ));
                 Err(StoreError::Sql(release_err))
             }
         },
         Err(err) => {
-            // ROLLBACK TO rewinds the rebuild but keeps the savepoint on the
-            // stack; the RELEASE then drops it (ending the implicit
-            // transaction for autocommit callers, and leaving an enclosing
-            // migration/import transaction open and usable). The rollback is
-            // best-effort: the original rebuild error is always the one
-            // surfaced, and if the rollback itself failed the connection is
-            // broken in a way the caller's own error path will hit anyway.
-            let _ = conn.execute_batch(
-                "ROLLBACK TO SAVEPOINT rebuild_search_projection; \
-                 RELEASE SAVEPOINT rebuild_search_projection;",
-            );
+            let _ = conn.execute_batch(&format!(
+                "ROLLBACK TO SAVEPOINT {name}; RELEASE SAVEPOINT {name};"
+            ));
             Err(err)
         }
     }
+}
+
+/// Atomic full rebuild of every FTS search projection from the base tables.
+///
+/// Callers invoke this both from autocommit mode
+/// (`Store::refresh_search_index`, post-import archive rebuilds,
+/// `ensure_search_projection_initialized`) and from inside already-open
+/// migration transactions (`migrate_to_v11`/`migrate_to_v12`).
+/// [`with_write_transaction`] covers both: an immediate transaction in
+/// autocommit mode and a nested savepoint otherwise, so in every context
+/// the rebuild commits as one unit — no per-row autocommit overhead — and
+/// any failure rolls back to the previous complete projection instead of
+/// leaving it empty or partial.
+fn rebuild_search_projection(conn: &Connection) -> Result<()> {
+    with_write_transaction(conn, "rebuild_search_projection", || {
+        rebuild_search_projection_body(conn)
+    })
 }
 
 /// Projection rebuild statements, identical contents and order to the
@@ -4620,6 +4717,12 @@ fn rebuild_search_projection_body(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Delete-then-insert projection maintenance for a history record that may
+/// already be projected. `record_id` is an UNINDEXED FTS5 column, so the
+/// DELETE cannot use an index: SQLite scans the entire projection to find
+/// the old row, making this O(index size) per call. Write paths that can
+/// prove the base row is newly inserted must call
+/// [`insert_record_search_projection`] instead and skip that scan.
 fn upsert_record_search_projection(conn: &Connection, record: &HistoryRecord) -> Result<()> {
     if !table_exists(conn, "ctx_history_search")? {
         return Ok(());
@@ -4628,22 +4731,55 @@ fn upsert_record_search_projection(conn: &Connection, record: &HistoryRecord) ->
         "DELETE FROM ctx_history_search WHERE record_id = ?1",
         params![record.id.to_string()],
     )?;
-    conn.execute(
+    insert_record_search_projection(conn, record)
+}
+
+/// Insert-only projection write for a history record proven absent from the
+/// projection, mirroring the event-side insert/upsert projection split.
+/// Novelty must be proven against the base table in the same transaction —
+/// a successful plain `INSERT` on the primary key, or an indexed
+/// pre-existence probe — never assumed from UUID uniqueness. Callers are
+/// responsible for wrapping base write + projection write atomically.
+fn insert_record_search_projection(conn: &Connection, record: &HistoryRecord) -> Result<()> {
+    if !table_exists(conn, "ctx_history_search")? {
+        return Ok(());
+    }
+    conn.prepare_cached(
         r#"
         INSERT INTO ctx_history_search
         (record_id, title, summary, primary_user_text, decision_text, context_text, tag_text)
         VALUES (?1, ?2, ?3, ?4, '', ?5, ?6)
         "#,
-        params![
-            record.id.to_string(),
-            local_preview(&record.title, 512),
-            local_preview(&record.body, 2048),
-            local_preview(&record.body, 2048),
-            "",
-            local_preview(&record.tags.join(" "), 1024),
-        ],
-    )?;
+    )?
+    .execute(params![
+        record.id.to_string(),
+        local_preview(&record.title, 512),
+        local_preview(&record.body, 2048),
+        local_preview(&record.body, 2048),
+        "",
+        local_preview(&record.tags.join(" "), 1024),
+    ])?;
     Ok(())
+}
+
+/// Indexed pre-existence probe on the `history_records` primary key. Runs
+/// inside the caller's transaction so the answer stays true for the
+/// projection decision that follows it.
+fn history_record_row_exists(conn: &Connection, id: Uuid) -> Result<bool> {
+    let exists: i64 = conn
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM history_records WHERE id = ?1)")?
+        .query_row(params![id.to_string()], |row| row.get(0))?;
+    Ok(exists != 0)
+}
+
+/// Indexed pre-existence probe on the `events` primary key. Runs inside the
+/// caller's transaction so the answer stays true for the projection
+/// decision that follows it.
+fn event_row_exists(conn: &Connection, id: Uuid) -> Result<bool> {
+    let exists: i64 = conn
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM events WHERE id = ?1)")?
+        .query_row(params![id.to_string()], |row| row.get(0))?;
+    Ok(exists != 0)
 }
 
 fn ensure_search_projection_initialized(conn: &Connection) -> Result<()> {
@@ -4760,6 +4896,12 @@ fn insert_event_search_projection_for_event(conn: &Connection, event: &Event) ->
     insert_event_search_projection_for_event_id(conn, event.id, event)
 }
 
+/// Delete-then-insert projection maintenance for an event that may already
+/// be projected (including removing the row entirely when the new preview
+/// is blank). `event_id` is an UNINDEXED FTS5 column, so the DELETE scans
+/// the whole projection — O(index size) per call. Write paths that can
+/// prove the event id is new must call
+/// [`insert_event_search_projection_for_event_id`] instead.
 fn upsert_event_search_projection_for_event(
     conn: &Connection,
     event_id: Uuid,
@@ -10337,7 +10479,7 @@ mod projection_rebuild_atomicity_tests {
         );
 
         // The previous complete projection is back, not empty or partial,
-        // and the connection is back in autocommit (no dangling savepoint).
+        // and the connection is back in autocommit (no dangling transaction).
         assert_eq!(projection_snapshot(&store), before);
         assert_eq!(
             match_ids(&store, "event_search", "event_id", "rebuild"),
@@ -10435,7 +10577,7 @@ mod projection_rebuild_benches {
 
     #[test]
     #[ignore = "benchmark: cargo test --release -p ctx-history-store -- --ignored --nocapture --test-threads=1 bench_rebuild"]
-    fn bench_rebuild_search_projection_savepoint_vs_autocommit() {
+    fn bench_rebuild_search_projection_transactional_vs_autocommit() {
         for &size in &[10_000u64, 50_000] {
             let temp = tempdir();
             let store = Store::open(temp.path().join("work.sqlite")).unwrap();
@@ -10479,13 +10621,747 @@ mod projection_rebuild_benches {
             rebuild_search_projection_body(&store.conn).unwrap();
             let autocommit = started.elapsed();
 
-            // New behavior: the same statements inside one savepoint.
+            // New behavior: the same statements inside one write transaction.
             let started = Instant::now();
             rebuild_search_projection(&store.conn).unwrap();
-            let savepoint = started.elapsed();
+            let transactional = started.elapsed();
 
             println!(
-                "corpus {size}: rebuild autocommit (per-row) {autocommit:?} vs savepoint (atomic) {savepoint:?}"
+                "corpus {size}: rebuild autocommit (per-row) {autocommit:?} vs transactional (atomic) {transactional:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod projection_write_path_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{mpsc, Arc, OnceLock};
+
+    use super::*;
+
+    fn tempdir() -> tempfile::TempDir {
+        let root = std::env::current_dir().unwrap().join("target/test-data");
+        fs::create_dir_all(&root).unwrap();
+        tempfile::Builder::new()
+            .prefix("ctx-history-store-write-path-")
+            .tempdir_in(root)
+            .unwrap()
+    }
+
+    fn fixed_time() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-06-23T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn sync_metadata() -> SyncMetadata {
+        SyncMetadata {
+            visibility: Visibility::LocalOnly,
+            fidelity: Fidelity::Imported,
+            sync_state: SyncState::LocalOnly,
+            sync_version: 0,
+            deleted_at: None,
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    fn record_with(id: Uuid, body: &str) -> HistoryRecord {
+        let mut record = HistoryRecord::new(
+            "Write path record title",
+            body,
+            vec!["writepath".into()],
+            "task",
+            None,
+        );
+        record.id = id;
+        record.created_at = fixed_time();
+        record.updated_at = fixed_time();
+        record
+    }
+
+    fn event_with(id: Uuid, seq: u64, payload: serde_json::Value) -> Event {
+        Event {
+            id,
+            seq,
+            history_record_id: None,
+            session_id: None,
+            run_id: None,
+            event_type: EventType::Message,
+            role: Some(EventRole::User),
+            occurred_at: fixed_time(),
+            capture_source_id: None,
+            payload,
+            payload_blob_id: None,
+            dedupe_key: None,
+            redaction_state: RedactionState::SafePreview,
+            sync: sync_metadata(),
+        }
+    }
+
+    fn text_event(id: Uuid, seq: u64, text: &str) -> Event {
+        event_with(id, seq, serde_json::json!({ "text": text }))
+    }
+
+    fn count(store: &Store, sql: &str) -> i64 {
+        store.conn.query_row(sql, [], |row| row.get(0)).unwrap()
+    }
+
+    fn record_projection_rows(store: &Store, id: Uuid) -> Vec<String> {
+        let mut stmt = store
+            .conn
+            .prepare("SELECT summary FROM ctx_history_search WHERE record_id = ?1")
+            .unwrap();
+        let rows = stmt
+            .query_map(params![id.to_string()], |row| row.get::<_, String>(0))
+            .unwrap();
+        rows.map(|row| row.unwrap()).collect()
+    }
+
+    fn event_projection_rows(store: &Store, id: Uuid) -> Vec<String> {
+        let mut stmt = store
+            .conn
+            .prepare("SELECT safe_preview_text FROM event_search WHERE event_id = ?1")
+            .unwrap();
+        let rows = stmt
+            .query_map(params![id.to_string()], |row| row.get::<_, String>(0))
+            .unwrap();
+        rows.map(|row| row.unwrap()).collect()
+    }
+
+    /// Counts VDBE operations for `work` via the SQLite progress handler
+    /// (granularity 1 opcode). The full-scan FTS DELETE steps the virtual
+    /// table row by row (one VNext per projected row), so its opcode count
+    /// scales with index size; the insert-only projection path compiles to
+    /// a constant opcode sequence regardless of index size.
+    fn vdbe_ops(store: &Store, work: impl FnOnce()) -> usize {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let handler_counter = Arc::clone(&counter);
+        store.conn.progress_handler(
+            1,
+            Some(move || {
+                handler_counter.fetch_add(1, Ordering::Relaxed);
+                false
+            }),
+        );
+        work();
+        store.conn.progress_handler(0, None::<fn() -> bool>);
+        counter.load(Ordering::Relaxed)
+    }
+
+    fn populated_record_store(temp: &tempfile::TempDir, size: u64) -> Store {
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let records = (0..size)
+            .map(|index| record_with(new_id(), &format!("seed record body {index:05}")))
+            .collect::<Vec<_>>();
+        store.upsert_records(&records).unwrap();
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM ctx_history_search"),
+            size as i64
+        );
+        store
+    }
+
+    fn populated_event_store(temp: &tempfile::TempDir, size: u64) -> Store {
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        store.begin_immediate_batch().unwrap();
+        for seq in 1..=size {
+            store
+                .upsert_event(&text_event(
+                    new_id(),
+                    seq,
+                    &format!("seed event body {seq:05}"),
+                ))
+                .unwrap();
+        }
+        store.commit_batch().unwrap();
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM event_search"),
+            size as i64
+        );
+        store
+    }
+
+    /// Deterministic bounded-work evidence for #186: writing provably new
+    /// records must not pay the O(index size) full-scan FTS DELETE, so the
+    /// VDBE opcode count of every fresh-row write path stays flat between a
+    /// small and a 20x larger index. Updates of existing rows intentionally
+    /// keep the scan (asserted relationally below, not as an exact bound).
+    #[test]
+    fn fresh_record_write_work_stays_bounded_as_index_grows() {
+        fn ops_at(size: u64) -> (usize, usize, usize, usize) {
+            let temp = tempdir();
+            let store = populated_record_store(&temp, size);
+
+            let insert_ops = vdbe_ops(&store, || {
+                store
+                    .insert_record(&record_with(new_id(), "fresh insert body"))
+                    .unwrap();
+            });
+            let upsert_ops = vdbe_ops(&store, || {
+                store
+                    .upsert_record(&record_with(new_id(), "fresh upsert body"))
+                    .unwrap();
+            });
+            let batch = (0..3)
+                .map(|index| record_with(new_id(), &format!("fresh batch body {index}")))
+                .collect::<Vec<_>>();
+            let batch_ops = vdbe_ops(&store, || {
+                store.upsert_records(&batch).unwrap();
+            });
+            let existing = record_with(batch[0].id, "updated existing body");
+            let update_ops = vdbe_ops(&store, || {
+                store.upsert_record(&existing).unwrap();
+            });
+            (insert_ops, upsert_ops, batch_ops, update_ops)
+        }
+
+        let (small_insert, small_upsert, small_batch, _) = ops_at(30);
+        let (large_insert, large_upsert, large_batch, large_update) = ops_at(600);
+
+        let slack = 32;
+        assert!(
+            large_insert <= small_insert + slack,
+            "insert_record work scaled with index size: {small_insert} ops at 30 records vs {large_insert} ops at 600"
+        );
+        assert!(
+            large_upsert <= small_upsert + slack,
+            "upsert_record (new id) work scaled with index size: {small_upsert} ops at 30 records vs {large_upsert} ops at 600"
+        );
+        assert!(
+            large_batch <= small_batch + slack,
+            "upsert_records (all new ids) work scaled with index size: {small_batch} ops at 30 records vs {large_batch} ops at 600"
+        );
+        // The existing-row arm still walks the projection (documented #186
+        // caveat): it must dominate the bounded fresh-row path at scale.
+        assert!(
+            large_update > large_upsert + 600,
+            "existing-id upsert unexpectedly stopped scanning the projection: {large_update} ops vs fresh {large_upsert}"
+        );
+    }
+
+    /// Event-side twin of the record bound: fresh event ids through both
+    /// upsert_event and insert_event_if_absent stay flat as event_search
+    /// grows; only existing ids pay the delete scan.
+    #[test]
+    fn fresh_event_write_work_stays_bounded_as_index_grows() {
+        fn ops_at(size: u64) -> (usize, usize, usize) {
+            let temp = tempdir();
+            let store = populated_event_store(&temp, size);
+
+            let upsert_id = new_id();
+            let upsert_ops = vdbe_ops(&store, || {
+                store
+                    .upsert_event(&text_event(upsert_id, size + 1, "fresh upsert event"))
+                    .unwrap();
+            });
+            let insert_ops = vdbe_ops(&store, || {
+                assert!(store
+                    .insert_event_if_absent(&text_event(
+                        new_id(),
+                        size + 2,
+                        "fresh insert-if-absent event"
+                    ))
+                    .unwrap());
+            });
+            let update_ops = vdbe_ops(&store, || {
+                store
+                    .upsert_event(&text_event(upsert_id, size + 1, "updated existing event"))
+                    .unwrap();
+            });
+            (upsert_ops, insert_ops, update_ops)
+        }
+
+        let (small_upsert, small_insert, _) = ops_at(30);
+        let (large_upsert, large_insert, large_update) = ops_at(600);
+
+        let slack = 32;
+        assert!(
+            large_upsert <= small_upsert + slack,
+            "upsert_event (new id) work scaled with index size: {small_upsert} ops at 30 events vs {large_upsert} ops at 600"
+        );
+        assert!(
+            large_insert <= small_insert + slack,
+            "insert_event_if_absent work scaled with index size: {small_insert} ops at 30 events vs {large_insert} ops at 600"
+        );
+        assert!(
+            large_update > large_upsert + 600,
+            "existing-id upsert_event unexpectedly stopped scanning the projection: {large_update} ops vs fresh {large_upsert}"
+        );
+    }
+
+    #[test]
+    fn same_id_updates_keep_exactly_one_projection_row_with_updated_text() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+
+        let record_id = new_id();
+        store
+            .insert_record(&record_with(record_id, "original searchable alpha"))
+            .unwrap();
+        store
+            .upsert_record(&record_with(record_id, "revised searchable bravo"))
+            .unwrap();
+        assert_eq!(
+            record_projection_rows(&store, record_id),
+            vec!["revised searchable bravo".to_owned()]
+        );
+        // Batch update of the same id again: still exactly one row.
+        store
+            .upsert_records(&[record_with(record_id, "batched searchable charlie")])
+            .unwrap();
+        assert_eq!(
+            record_projection_rows(&store, record_id),
+            vec!["batched searchable charlie".to_owned()]
+        );
+        assert_eq!(
+            store.search_records("charlie", 10).unwrap()[0].id,
+            record_id
+        );
+        assert!(store.search_records("alpha", 10).unwrap().is_empty());
+        assert!(store.search_records("bravo", 10).unwrap().is_empty());
+
+        let event_id = new_id();
+        store
+            .upsert_event(&text_event(event_id, 1, "original event delta"))
+            .unwrap();
+        store
+            .upsert_event(&text_event(event_id, 1, "revised event echo"))
+            .unwrap();
+        assert_eq!(
+            event_projection_rows(&store, event_id),
+            vec!["revised event echo".to_owned()]
+        );
+
+        // A batch that repeats one id must not double-project it: the first
+        // occurrence is new (insert-only), later ones are existing
+        // (delete + insert).
+        let repeated = new_id();
+        store
+            .upsert_records(&[
+                record_with(repeated, "repeat one"),
+                record_with(repeated, "repeat two"),
+            ])
+            .unwrap();
+        assert_eq!(
+            record_projection_rows(&store, repeated),
+            vec!["repeat two".to_owned()]
+        );
+    }
+
+    #[test]
+    fn event_preview_blank_transitions_maintain_projection() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let event_id = new_id();
+
+        // Fresh insert with a blank preview projects nothing.
+        store
+            .upsert_event(&event_with(event_id, 1, serde_json::json!("")))
+            .unwrap();
+        assert!(event_projection_rows(&store, event_id).is_empty());
+
+        // blank -> nonblank: existing id, projection row appears once.
+        store
+            .upsert_event(&text_event(event_id, 1, "now searchable foxtrot"))
+            .unwrap();
+        assert_eq!(
+            event_projection_rows(&store, event_id),
+            vec!["now searchable foxtrot".to_owned()]
+        );
+
+        // nonblank -> blank: the delete + (skipped) insert removes the row.
+        store
+            .upsert_event(&event_with(event_id, 1, serde_json::json!("")))
+            .unwrap();
+        assert!(event_projection_rows(&store, event_id).is_empty());
+
+        // blank -> nonblank again: exactly one row returns.
+        store
+            .upsert_event(&text_event(event_id, 1, "searchable again golf"))
+            .unwrap();
+        assert_eq!(
+            event_projection_rows(&store, event_id),
+            vec!["searchable again golf".to_owned()]
+        );
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM event_search"), 1);
+    }
+
+    /// Signal channel for [`signal_busy_then_retry`]. rusqlite's
+    /// `busy_handler` takes a plain fn pointer, so the barrier sender lives
+    /// in a static; only the contention test below uses it.
+    static CONTENTION_SIGNAL: OnceLock<mpsc::Sender<()>> = OnceLock::new();
+
+    /// Busy handler for the contender connection: report the observed
+    /// contention to the test thread, then keep retrying (bounded, with a
+    /// tiny backoff, purely as hang protection).
+    fn signal_busy_then_retry(attempts: i32) -> bool {
+        if let Some(sender) = CONTENTION_SIGNAL.get() {
+            let _ = sender.send(());
+        }
+        std::thread::sleep(Duration::from_millis(1));
+        attempts < 60_000
+    }
+
+    /// Deterministic two-connection WAL contention: while a writer
+    /// connection holds the write lock, an autocommit upsert on a second
+    /// connection must wait in `BEGIN IMMEDIATE` — before its existence
+    /// probe runs, so the probe can never go stale — and complete once the
+    /// writer commits, landing exactly one base row and one projection row.
+    ///
+    /// Determinism comes from a lock-order barrier, not timing: while the
+    /// writer transaction is open, the contender's `BEGIN IMMEDIATE` is
+    /// guaranteed to hit SQLITE_BUSY, so the busy-handler signal always
+    /// arrives before the test releases the lock. The only timeouts are
+    /// generous overall hang guards, never minimum-delay assertions.
+    #[test]
+    fn contended_autocommit_upsert_waits_for_writer_then_lands_exactly_once() {
+        let temp = tempdir();
+        let path = temp.path().join("work.sqlite");
+        let writer = Store::open(&path).unwrap();
+        let contender = Store::open(&path).unwrap();
+
+        let (busy_tx, busy_rx) = mpsc::channel();
+        CONTENTION_SIGNAL.set(busy_tx).ok();
+        contender
+            .conn
+            .busy_handler(Some(signal_busy_then_retry))
+            .unwrap();
+
+        let held_id = new_id();
+        writer.begin_immediate_batch().unwrap();
+        writer
+            .insert_record(&record_with(held_id, "writer held body"))
+            .unwrap();
+
+        let contended_id = new_id();
+        let contended = record_with(contended_id, "contended upsert body");
+        let contender_thread = std::thread::spawn(move || {
+            let result = contender.upsert_record(&contended);
+            (contender, result)
+        });
+
+        // Barrier: the contender observed the writer's lock and is waiting.
+        busy_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("contender never blocked on the writer's write lock");
+        writer.commit_batch().unwrap();
+
+        let (contender, result) = contender_thread.join().unwrap();
+        result.unwrap();
+        assert!(contender.conn.is_autocommit());
+
+        // Both writes landed exactly once, base and projection in step.
+        assert_eq!(count(&writer, "SELECT COUNT(*) FROM history_records"), 2);
+        assert_eq!(count(&writer, "SELECT COUNT(*) FROM ctx_history_search"), 2);
+        assert_eq!(
+            record_projection_rows(&writer, held_id),
+            vec!["writer held body".to_owned()]
+        );
+        assert_eq!(
+            record_projection_rows(&writer, contended_id),
+            vec!["contended upsert body".to_owned()]
+        );
+        assert_eq!(
+            contender.get_record(contended_id).unwrap().body,
+            "contended upsert body"
+        );
+    }
+
+    /// The write transactions must nest as savepoints inside a
+    /// caller-managed transaction: rolling
+    /// the outer transaction back rewinds base rows and projections together,
+    /// leaving nothing orphaned on either side.
+    #[test]
+    fn outer_transaction_rollback_rewinds_base_and_projection_together() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+
+        store.begin_immediate_batch().unwrap();
+        store
+            .insert_record(&record_with(new_id(), "rollback insert body"))
+            .unwrap();
+        store
+            .upsert_record(&record_with(new_id(), "rollback upsert body"))
+            .unwrap();
+        store
+            .upsert_event(&text_event(new_id(), 1, "rollback event body"))
+            .unwrap();
+        assert!(store
+            .insert_event_if_absent(&text_event(new_id(), 2, "rollback if-absent body"))
+            .unwrap());
+        assert!(!store.conn.is_autocommit());
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM ctx_history_search"), 2);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM event_search"), 2);
+        store.rollback_batch().unwrap();
+
+        assert!(store.conn.is_autocommit());
+        for sql in [
+            "SELECT COUNT(*) FROM history_records",
+            "SELECT COUNT(*) FROM ctx_history_search",
+            "SELECT COUNT(*) FROM events",
+            "SELECT COUNT(*) FROM event_search",
+        ] {
+            assert_eq!(count(&store, sql), 0, "{sql}");
+        }
+
+        // The connection stays fully usable in autocommit afterwards.
+        let record_id = new_id();
+        store
+            .insert_record(&record_with(record_id, "post rollback body"))
+            .unwrap();
+        assert_eq!(record_projection_rows(&store, record_id).len(), 1);
+    }
+
+    /// Replaces a search projection FTS table with a plain table whose CHECK
+    /// constraint rejects every INSERT while still accepting DELETEs: the
+    /// projection write fails after the base write succeeded, which must
+    /// roll the base write back too and preserve the original error.
+    fn poison_projection_inserts(store: &Store, table: &str, columns: &str) {
+        store
+            .conn
+            .execute_batch(&format!(
+                "DROP TABLE {table}; CREATE TABLE {table} ({columns}, CHECK (0 = 1));"
+            ))
+            .unwrap();
+    }
+
+    #[test]
+    fn injected_projection_failure_rolls_back_base_and_fts_writes() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let existing_id = new_id();
+        store
+            .insert_record(&record_with(existing_id, "pre poison body"))
+            .unwrap();
+        let existing_event = new_id();
+        store
+            .upsert_event(&text_event(existing_event, 1, "pre poison event"))
+            .unwrap();
+
+        poison_projection_inserts(
+            &store,
+            "ctx_history_search",
+            "record_id, title, summary, primary_user_text, decision_text, context_text, tag_text",
+        );
+
+        // Fresh insert: base INSERT succeeded inside the write transaction,
+        // the
+        // projection INSERT fails, and both roll back.
+        let fresh = record_with(new_id(), "poisoned insert body");
+        let err = store.insert_record(&fresh).unwrap_err();
+        assert!(
+            err.to_string().contains("CHECK constraint"),
+            "original projection error was not preserved: {err}"
+        );
+        assert!(matches!(
+            store.get_record(fresh.id).unwrap_err(),
+            StoreError::NotFound(_)
+        ));
+        assert!(store.conn.is_autocommit());
+
+        // Existing-id upsert: the base row keeps its previous contents.
+        let err = store
+            .upsert_record(&record_with(existing_id, "poisoned update body"))
+            .unwrap_err();
+        assert!(err.to_string().contains("CHECK constraint"), "{err}");
+        assert_eq!(
+            store.get_record(existing_id).unwrap().body,
+            "pre poison body"
+        );
+
+        // Batch: an all-or-nothing rollback, no partial base rows.
+        let batch = vec![
+            record_with(new_id(), "poisoned batch one"),
+            record_with(new_id(), "poisoned batch two"),
+        ];
+        let err = store.upsert_records(&batch).unwrap_err();
+        assert!(err.to_string().contains("CHECK constraint"), "{err}");
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM history_records"), 1);
+        assert!(store.conn.is_autocommit());
+
+        poison_projection_inserts(
+            &store,
+            "event_search",
+            "event_id, history_record_id, session_id, role, safe_preview_text, rank_bucket",
+        );
+
+        let fresh_event = text_event(new_id(), 2, "poisoned event body");
+        let err = store.upsert_event(&fresh_event).unwrap_err();
+        assert!(err.to_string().contains("CHECK constraint"), "{err}");
+        assert!(matches!(
+            store.get_event(fresh_event.id).unwrap_err(),
+            StoreError::NotFound(_)
+        ));
+
+        let err = store
+            .insert_event_if_absent(&text_event(new_id(), 3, "poisoned if-absent body"))
+            .unwrap_err();
+        assert!(err.to_string().contains("CHECK constraint"), "{err}");
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM events"), 1);
+
+        // Existing-id event upsert rolls back to the previous payload.
+        let err = store
+            .upsert_event(&text_event(existing_event, 1, "poisoned event update"))
+            .unwrap_err();
+        assert!(err.to_string().contains("CHECK constraint"), "{err}");
+        assert_eq!(
+            store.get_event(existing_event).unwrap().payload,
+            serde_json::json!({ "text": "pre poison event" })
+        );
+        assert!(store.conn.is_autocommit());
+    }
+
+    /// Capture-harness shape: an immediate batch of upsert_record +
+    /// insert_event_if_absent, committed, then replayed verbatim. Replays
+    /// must be projection no-ops for events and exact one-row replacements
+    /// for records, with base/FTS parity throughout.
+    #[test]
+    fn repeated_harness_batch_replay_keeps_projection_parity() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let record_id = new_id();
+        let event_ids = [new_id(), new_id(), new_id()];
+
+        let run_batch = |body: &str| {
+            store.begin_immediate_batch().unwrap();
+            store.upsert_record(&record_with(record_id, body)).unwrap();
+            for (index, event_id) in event_ids.iter().enumerate() {
+                store
+                    .insert_event_if_absent(&text_event(
+                        *event_id,
+                        index as u64 + 1,
+                        &format!("harness event body {index}"),
+                    ))
+                    .unwrap();
+            }
+            store.commit_batch().unwrap();
+        };
+
+        run_batch("harness record body v1");
+        run_batch("harness record body v1");
+        run_batch("harness record body v2");
+
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM history_records"), 1);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM ctx_history_search"), 1);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM events"), 3);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM event_search"), 3);
+        assert_eq!(
+            record_projection_rows(&store, record_id),
+            vec!["harness record body v2".to_owned()]
+        );
+        for (index, event_id) in event_ids.iter().enumerate() {
+            assert_eq!(
+                event_projection_rows(&store, *event_id),
+                vec![format!("harness event body {index}")]
+            );
+        }
+        // Search sees exactly the current contents.
+        assert_eq!(store.search_records("v2", 10).unwrap()[0].id, record_id);
+        assert!(store.search_records("v1", 10).unwrap().is_empty());
+    }
+}
+
+/// Retained benchmark evidence for the fresh-row FTS write paths. Run
+/// explicitly with:
+///
+/// ```text
+/// cargo test --release -p ctx-history-store -- --ignored --nocapture --test-threads=1 bench_fresh_row
+/// ```
+#[cfg(test)]
+mod projection_write_path_benches {
+    use super::*;
+
+    fn tempdir() -> tempfile::TempDir {
+        let root = std::env::current_dir().unwrap().join("target/test-data");
+        fs::create_dir_all(&root).unwrap();
+        tempfile::Builder::new()
+            .prefix("ctx-history-store-fresh-row-bench-")
+            .tempdir_in(root)
+            .unwrap()
+    }
+
+    fn bench_record(index: u64, body_tag: &str) -> HistoryRecord {
+        let mut record = HistoryRecord::new(
+            format!("Bench record {index:07}"),
+            format!(
+                "bench {body_tag} record {index:07}: deterministic transcript payload for \
+                 fresh-row projection timing {index:07}"
+            ),
+            vec!["bench".into()],
+            "task",
+            None,
+        );
+        record.created_at = DateTime::parse_from_rfc3339("2026-06-23T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        record.updated_at = record.created_at;
+        record
+    }
+
+    #[test]
+    #[ignore = "benchmark: cargo test --release -p ctx-history-store -- --ignored --nocapture --test-threads=1 bench_fresh_row"]
+    fn bench_fresh_row_fts_maintenance_vs_full_scan_delete() {
+        const FRESH_ROWS: u64 = 200;
+        const UPDATE_ROWS: usize = 50;
+        for &size in &[10_000u64, 30_000] {
+            let temp = tempdir();
+            let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+
+            let started = Instant::now();
+            let seed = (0..size)
+                .map(|index| bench_record(index, "seed"))
+                .collect::<Vec<_>>();
+            store.upsert_records(&seed).unwrap();
+            println!(
+                "corpus {size}: seed ingestion {:?} (excluded from arm timings)",
+                started.elapsed()
+            );
+
+            // Old behavior for provably new rows: delete + insert projection
+            // maintenance per row, exactly the statements upsert_record ran
+            // before the novelty probe existed, in one immediate batch.
+            let fresh_old = (0..FRESH_ROWS)
+                .map(|index| bench_record(size + index, "old-arm"))
+                .collect::<Vec<_>>();
+            let started = Instant::now();
+            store.begin_immediate_batch().unwrap();
+            for record in &fresh_old {
+                store.upsert_record_row(record).unwrap();
+                upsert_record_search_projection(&store.conn, record).unwrap();
+            }
+            store.commit_batch().unwrap();
+            let old_arm = started.elapsed();
+
+            // New behavior: the probe proves novelty and the insert-only
+            // projection skips the full-scan delete.
+            let fresh_new = (0..FRESH_ROWS)
+                .map(|index| bench_record(size + FRESH_ROWS + index, "new-arm"))
+                .collect::<Vec<_>>();
+            let started = Instant::now();
+            store.upsert_records(&fresh_new).unwrap();
+            let new_arm = started.elapsed();
+
+            println!(
+                "corpus {size}: {FRESH_ROWS} fresh rows -> delete+insert {old_arm:?} vs insert-only {new_arm:?}"
+            );
+
+            // Update arm, intentionally unchanged: existing ids still pay
+            // the O(index size) projection scan per row.
+            let updates = seed
+                .iter()
+                .take(UPDATE_ROWS)
+                .map(|record| {
+                    let mut updated = record.clone();
+                    updated.body = format!("updated {}", record.body);
+                    updated
+                })
+                .collect::<Vec<_>>();
+            let started = Instant::now();
+            store.upsert_records(&updates).unwrap();
+            let update_arm = started.elapsed();
+            println!(
+                "corpus {size}: {UPDATE_ROWS} existing-row updates (unchanged full-scan path) {update_arm:?}"
             );
         }
     }

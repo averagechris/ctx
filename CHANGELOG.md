@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+
+## v1.0.2 - 2026-08-05
+
+### Changed
+
+- Refreshed compatible Cargo dependencies and the Nix flake inputs, including
+  the fleet release tooling and its SourceHut integration.
+- Reduced search and index-maintenance work by filtering before hydration,
+  avoiding full FTS counts, bounding post-import merges, and rebuilding FTS
+  projections atomically.
+- Added a streaming large-index profiling harness and expanded the downloads
+  site with overview and example pages.
+- Standardized the release workflow, reduced the release closure, and enabled
+  CI cache warming and static checks.
+
+### Fixed
+
+- Corrected SourceHut release authentication and CI provisioning, including
+  the approved release channel, OAuth grants, Cachix secret, and Python path.
+
 ## v1.0.1 - 2026-07-03
 
 ### Added

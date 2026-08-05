@@ -10,7 +10,9 @@ use ctx_history_core::{
     ContextTruncation, Event, EventType, FileTouched, HistoryRecord, RedactionState, Run, Session,
     Summary, VcsChange, Visibility,
 };
-use ctx_history_store::{EventSearchHit, FileTouchScope, Store};
+use ctx_history_store::{
+    EventSearchAgentScope, EventSearchHit, EventSearchSqlFilters, FileTouchScope, Store,
+};
 use serde::Serialize;
 use thiserror::Error;
 use uuid::Uuid;
@@ -604,11 +606,16 @@ fn fast_event_search_packet(
     }
 
     let target_results = options.limit.saturating_add(1);
-    let filtered = has_filters(&options.filters);
+    // Exact-semantics filters are pushed into the ranked SQL page; only the
+    // filters below still require Rust-side scanning across candidate pages
+    // (with the scan budget). `event_hit_matches_filters` stays the final
+    // authority over every hit either way.
+    let sql_filters = sql_pushdown_filters(&options.filters);
+    let residual_filtered = has_residual_event_filters(&options.filters, file_scope);
     let clustered = options.result_mode == SearchResultMode::Sessions;
     let page_size = if clustered {
         FILTERED_SEARCH_PAGE_SIZE.max(target_results.saturating_mul(8).max(50))
-    } else if filtered {
+    } else if residual_filtered {
         FILTERED_SEARCH_PAGE_SIZE.max(target_results)
     } else {
         target_results
@@ -622,7 +629,7 @@ fn fast_event_search_packet(
 
     loop {
         pages_scanned = pages_scanned.saturating_add(1);
-        let hits = store.search_event_hits_page(query, page_size, offset)?;
+        let hits = store.search_event_hits_page_filtered(query, page_size, offset, &sql_filters)?;
         let page_len = hits.len();
 
         for hit in hits {
@@ -665,7 +672,7 @@ fn fast_event_search_packet(
         } else {
             results.len() >= target_results
         };
-        if (!filtered && !clustered) || enough_results || page_len < page_size {
+        if (!residual_filtered && !clustered) || enough_results || page_len < page_size {
             break;
         }
         if pages_scanned >= FILTERED_SEARCH_MAX_PAGES {
@@ -726,6 +733,57 @@ fn empty_search_packet(query: &str, options: &PacketOptions) -> SearchPacket {
         pagination: pagination(Some(0), false),
         truncation: ContextTruncation::default(),
     }
+}
+
+/// Builds the exact-semantics store-level filters that are pushed into the
+/// ranked SQL page. Each pushed predicate is provably equivalent to the
+/// corresponding branch of `event_hit_matches_filters` /
+/// `event_hit_matches_agent_scope`, so pushing it can never change which hits
+/// survive Rust filtering — it only stops non-matching rows from being
+/// hydrated and scanned.
+fn sql_pushdown_filters(filters: &SearchFilters) -> EventSearchSqlFilters {
+    let agent_scope = if filters.session.is_some() {
+        // An explicit session filter makes the Rust agent-scope check vacuous:
+        // `event_hit_matches_agent_scope` accepts any hit of that session
+        // before consulting primary/subagent state. Pushing a scope predicate
+        // here would wrongly drop subagent rows of the requested session, so
+        // scope pushdown is disabled and only session equality is pushed.
+        None
+    } else if filters.primary_only {
+        Some(EventSearchAgentScope::PrimaryOnly)
+    } else if filters.include_subagents {
+        None
+    } else {
+        Some(EventSearchAgentScope::PrimaryOrSessionless)
+    };
+    EventSearchSqlFilters {
+        session_id: filters.session,
+        provider: filters.provider,
+        since: filters.since,
+        event_type: filters.event_type,
+        agent_scope,
+    }
+}
+
+/// Filters that cannot be pushed into the ranked SQL page and still require
+/// Rust-side scanning over candidate pages: repo substring matching over
+/// cwd/raw-source/workspace, file-touch scopes, excluded provider sessions,
+/// and history-source identity. The scan budget continues to bound these.
+/// The history-source branch is defensive today: the fast event path returns
+/// before reaching this helper whenever `has_history_source_filter` is true,
+/// but keeping it here makes residual classification safe if that guard is
+/// ever relaxed or this helper is reused.
+fn has_residual_event_filters(
+    filters: &SearchFilters,
+    file_scope: Option<&FileTouchScope>,
+) -> bool {
+    filters
+        .repo
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        || file_scope.is_some()
+        || filters.exclude_provider_session.is_some()
+        || has_history_source_filter(filters)
 }
 
 fn event_hit_matches_filters(
@@ -6976,6 +7034,514 @@ mod tests {
         assert_eq!(
             packet_without_generated_at(&first_search),
             packet_without_generated_at(&second_search)
+        );
+    }
+
+    /// Frozen copy of the pre-pushdown `fast_event_search_packet` loop: pages
+    /// through the *unfiltered* ranked stream and applies
+    /// `event_hit_matches_filters` in Rust, with the original page sizing and
+    /// scan-budget semantics but no upper page bound (so it is an exhaustive
+    /// reference when the budget would not have been exhausted). Returns the
+    /// packet plus the number of ranked page queries it needed.
+    fn reference_fast_event_packet(
+        store: &ctx_history_store::Store,
+        query: &str,
+        options: &PacketOptions,
+    ) -> (SearchPacket, usize) {
+        let options = normalized_options(options);
+        let target_results = options.limit.saturating_add(1);
+        let filtered = has_filters(&options.filters);
+        let clustered = options.result_mode == SearchResultMode::Sessions;
+        let page_size = if clustered {
+            FILTERED_SEARCH_PAGE_SIZE.max(target_results.saturating_mul(8).max(50))
+        } else if filtered {
+            FILTERED_SEARCH_PAGE_SIZE.max(target_results)
+        } else {
+            target_results
+        };
+        let mut results = Vec::new();
+        let mut clustered_results = Vec::<SearchPacketResult>::new();
+        let mut clustered_index = BTreeMap::<Uuid, usize>::new();
+        let mut offset = 0_usize;
+        let mut pages_scanned = 0_usize;
+
+        loop {
+            pages_scanned += 1;
+            let hits = store
+                .search_event_hits_page(query, page_size, offset)
+                .unwrap();
+            let page_len = hits.len();
+            for hit in hits {
+                if !event_hit_matches_filters(&hit, &options.filters, None) {
+                    continue;
+                }
+                if clustered {
+                    let cluster_id = hit.session_id.unwrap_or(hit.event_id);
+                    if let Some(index) = clustered_index.get(&cluster_id).copied() {
+                        let existing = &mut clustered_results[index];
+                        existing.more_matches_in_session =
+                            existing.more_matches_in_session.saturating_add(1);
+                        existing.session_importance =
+                            session_importance(existing.rank, existing.more_matches_in_session);
+                    } else {
+                        let mut result = event_search_result(&hit, query, options.snippet_chars);
+                        result.result_scope = if result.session_id.is_some() {
+                            SearchResultScope::Session
+                        } else {
+                            SearchResultScope::Event
+                        };
+                        result.session_importance = session_importance(result.rank, 0);
+                        clustered_index.insert(cluster_id, clustered_results.len());
+                        clustered_results.push(result);
+                    }
+                    if clustered_results.len() >= target_results {
+                        break;
+                    }
+                } else {
+                    let result = event_search_result(&hit, query, options.snippet_chars);
+                    results.push(result);
+                    if results.len() >= target_results {
+                        break;
+                    }
+                }
+            }
+            let enough_results = if clustered {
+                clustered_results.len() >= target_results
+            } else {
+                results.len() >= target_results
+            };
+            if (!filtered && !clustered) || enough_results || page_len < page_size {
+                break;
+            }
+            offset += page_size;
+        }
+
+        if clustered {
+            results = clustered_results;
+        }
+        let has_more = results.len() > options.limit;
+        if results.len() > options.limit {
+            results.truncate(options.limit);
+        }
+        normalize_search_result_ranks(&mut results);
+        let truncation = if has_more {
+            ContextTruncation {
+                truncated: true,
+                reason: Some("limit".to_owned()),
+                omitted_results: 1,
+            }
+        } else {
+            ContextTruncation::default()
+        };
+        let cursor_offset = results.len();
+        (
+            SearchPacket {
+                schema_version: SEARCH_PACKET_SCHEMA_VERSION,
+                query: query.to_owned(),
+                filters: options.filters.clone(),
+                generated_at: utc_now(),
+                results,
+                pagination: pagination(Some(cursor_offset), has_more),
+                truncation,
+            },
+            pages_scanned,
+        )
+    }
+
+    struct PushdownSearchCorpus {
+        _temp: tempfile::TempDir,
+        store: ctx_history_store::Store,
+        primary_session: Uuid,
+        subagent_session: Uuid,
+        target_event: Uuid,
+        base: chrono::DateTime<Utc>,
+        decoys: usize,
+    }
+
+    /// At least `LARGE_EVENT_CORPUS_THRESHOLD` events so the fast event path
+    /// runs. 2,000 subagent decoys outrank (newer, equal bm25) a single rare
+    /// primary-scope target event, three sessionless events, and one primary
+    /// tool-call event, so default-scope matches are deeply ranked behind the
+    /// decoys in the unfiltered stream.
+    fn pushdown_search_corpus() -> PushdownSearchCorpus {
+        let (temp, store) = test_store();
+        let base = fixed_time();
+        let record_id = Uuid::parse_str("018f45d0-0000-7000-8000-0000000a0001").unwrap();
+        let mut record = HistoryRecord::new(
+            "Pushdown search record",
+            "no needle in record body",
+            Vec::new(),
+            "task",
+            Some("/workspace/pushdown".into()),
+        );
+        record.id = record_id;
+        record.created_at = base;
+        record.updated_at = base;
+        store.insert_record(&record).unwrap();
+
+        let session = |id: &str,
+                       provider: CaptureProvider,
+                       agent_type: AgentType,
+                       is_primary: bool| Session {
+            id: Uuid::parse_str(id).unwrap(),
+            history_record_id: Some(record_id),
+            parent_session_id: None,
+            root_session_id: None,
+            capture_source_id: None,
+            provider,
+            external_session_id: Some(format!("external-{id}")),
+            external_agent_id: None,
+            agent_type,
+            role_hint: None,
+            is_primary,
+            status: SessionStatus::Imported,
+            transcript_blob_id: None,
+            started_at: base,
+            ended_at: None,
+            timestamps: timestamps(),
+            sync: sync_metadata(),
+        };
+        let primary_session = session(
+            "018f45d0-0000-7000-8000-0000000a0011",
+            CaptureProvider::Codex,
+            AgentType::Primary,
+            true,
+        );
+        let subagent_session = session(
+            "018f45d0-0000-7000-8000-0000000a0012",
+            CaptureProvider::Claude,
+            AgentType::Subagent,
+            false,
+        );
+        store.upsert_session(&primary_session).unwrap();
+        store.upsert_session(&subagent_session).unwrap();
+
+        let event = |index: u64,
+                     session: Option<Uuid>,
+                     event_type: EventType,
+                     at: chrono::DateTime<Utc>,
+                     text: String| Event {
+            id: Uuid::parse_str(&format!("018f45d0-0000-7000-8000-0000ee{index:06x}")).unwrap(),
+            seq: index,
+            history_record_id: Some(record_id),
+            session_id: session,
+            run_id: None,
+            event_type,
+            role: Some(EventRole::Assistant),
+            occurred_at: at,
+            capture_source_id: None,
+            payload: serde_json::json!({ "text": text }),
+            payload_blob_id: None,
+            dedupe_key: None,
+            redaction_state: RedactionState::SafePreview,
+            sync: sync_metadata(),
+        };
+
+        let decoys = 2_000_usize;
+        store.begin_immediate_batch().unwrap();
+        for index in 0..decoys as u64 {
+            store
+                .upsert_event(&event(
+                    index,
+                    Some(subagent_session.id),
+                    EventType::Message,
+                    base + chrono::Duration::milliseconds(index as i64),
+                    format!("pushdownneedle decoy {index:06}"),
+                ))
+                .unwrap();
+        }
+        // Sessionless events between decoys and target in the ranking.
+        for index in 0..3_u64 {
+            store
+                .upsert_event(&event(
+                    100_000 + index,
+                    None,
+                    EventType::Message,
+                    base - chrono::Duration::milliseconds(500),
+                    format!("pushdownneedle sessionless {index:06}"),
+                ))
+                .unwrap();
+        }
+        // A primary tool call for event_type/provider combinations.
+        store
+            .upsert_event(&event(
+                100_010,
+                Some(primary_session.id),
+                EventType::ToolCall,
+                base - chrono::Duration::seconds(2),
+                "pushdownneedle tooling 000000".to_owned(),
+            ))
+            .unwrap();
+        // The rare default-scope target, ranked below every decoy.
+        let target = event(
+            100_011,
+            Some(primary_session.id),
+            EventType::Message,
+            base - chrono::Duration::seconds(4),
+            "pushdownneedle target 000000".to_owned(),
+        );
+        store.upsert_event(&target).unwrap();
+        store.commit_batch().unwrap();
+
+        assert!(store
+            .has_at_least_events(LARGE_EVENT_CORPUS_THRESHOLD)
+            .unwrap());
+        PushdownSearchCorpus {
+            _temp: temp,
+            store,
+            primary_session: primary_session.id,
+            subagent_session: subagent_session.id,
+            target_event: target.id,
+            base,
+            decoys,
+        }
+    }
+
+    /// The default include_subagents=false search must find a rare
+    /// primary-scope result ranked behind 2,000 subagent decoys with a single
+    /// ranked page query (filters pushed into SQL), while producing exactly
+    /// the packet the legacy Rust-filtered page loop produces. Stable page
+    /// execution counters are asserted instead of timing.
+    #[test]
+    fn fast_event_search_pushdown_finds_deep_default_scope_result_in_one_page() {
+        let corpus = pushdown_search_corpus();
+        let store = &corpus.store;
+
+        // Sessions (default/clustered) mode.
+        let options = PacketOptions {
+            limit: 10,
+            snippet_chars: 200,
+            ..PacketOptions::default()
+        };
+        let before = store.event_search_page_executions();
+        let packet = search_packet(store, "pushdownneedle", &options).unwrap();
+        let pushdown_pages = store.event_search_page_executions() - before;
+
+        assert!(packet
+            .results
+            .iter()
+            .any(|result| result.session_id == Some(corpus.primary_session)));
+        assert!(packet
+            .results
+            .iter()
+            .all(|result| result.session_id != Some(corpus.subagent_session)));
+        assert_eq!(
+            pushdown_pages, 1,
+            "pushdown must locate the deep result in one ranked page query"
+        );
+
+        let before = store.event_search_page_executions();
+        let (reference, reference_pages) =
+            reference_fast_event_packet(store, "pushdownneedle", &options);
+        let after = store.event_search_page_executions();
+        assert_eq!((after - before) as usize, reference_pages);
+        assert_eq!(
+            reference_pages,
+            corpus.decoys.div_ceil(FILTERED_SEARCH_PAGE_SIZE) + 1,
+            "reference loop must page across every unfiltered candidate"
+        );
+        assert_eq!(
+            packet_without_generated_at(&packet),
+            packet_without_generated_at(&reference)
+        );
+
+        // Events (unclustered) mode pages shrink to limit+1.
+        let options = PacketOptions {
+            limit: 5,
+            snippet_chars: 200,
+            result_mode: SearchResultMode::Events,
+            ..PacketOptions::default()
+        };
+        let before = store.event_search_page_executions();
+        let packet = search_packet(store, "pushdownneedle", &options).unwrap();
+        assert_eq!(store.event_search_page_executions() - before, 1);
+        assert!(
+            packet
+                .results
+                .iter()
+                .any(|result| result.event_id == Some(corpus.target_event)),
+            "the deeply ranked primary target must surface in the first page"
+        );
+        let (reference, _) = reference_fast_event_packet(store, "pushdownneedle", &options);
+        assert_eq!(
+            packet_without_generated_at(&packet),
+            packet_without_generated_at(&reference)
+        );
+    }
+
+    /// Differential equality between the pushdown fast path and the legacy
+    /// Rust-filtered reference loop across every pushdown-relevant filter
+    /// shape: provider, fractional/exact since boundaries, event_type,
+    /// explicit session (including the subagent session whose scope check is
+    /// vacuous), primary_only, include_subagents, and combinations, in both
+    /// result modes.
+    #[test]
+    fn fast_event_search_pushdown_packets_match_reference_loop_across_filters() {
+        let corpus = pushdown_search_corpus();
+        let store = &corpus.store;
+        let sessionless_at = corpus.base - chrono::Duration::milliseconds(500);
+
+        let filter_cases = vec![
+            ("default", SearchFilters::default()),
+            (
+                "provider codex",
+                SearchFilters {
+                    provider: Some(CaptureProvider::Codex),
+                    ..SearchFilters::default()
+                },
+            ),
+            (
+                "provider claude default scope",
+                SearchFilters {
+                    provider: Some(CaptureProvider::Claude),
+                    ..SearchFilters::default()
+                },
+            ),
+            (
+                "provider claude include subagents",
+                SearchFilters {
+                    provider: Some(CaptureProvider::Claude),
+                    include_subagents: true,
+                    ..SearchFilters::default()
+                },
+            ),
+            (
+                "explicit subagent session keeps subagent rows",
+                SearchFilters {
+                    session: Some(corpus.subagent_session),
+                    ..SearchFilters::default()
+                },
+            ),
+            (
+                "primary only",
+                SearchFilters {
+                    primary_only: true,
+                    ..SearchFilters::default()
+                },
+            ),
+            (
+                "primary only overrides include subagents",
+                SearchFilters {
+                    primary_only: true,
+                    include_subagents: true,
+                    ..SearchFilters::default()
+                },
+            ),
+            (
+                "explicit session makes primary only scope vacuous",
+                SearchFilters {
+                    session: Some(corpus.subagent_session),
+                    primary_only: true,
+                    ..SearchFilters::default()
+                },
+            ),
+            (
+                "include subagents",
+                SearchFilters {
+                    include_subagents: true,
+                    ..SearchFilters::default()
+                },
+            ),
+            (
+                "since exact millisecond boundary",
+                SearchFilters {
+                    since: Some(sessionless_at),
+                    include_subagents: true,
+                    ..SearchFilters::default()
+                },
+            ),
+            (
+                "since fractional millisecond boundary",
+                SearchFilters {
+                    since: Some(sessionless_at + chrono::Duration::microseconds(500)),
+                    include_subagents: true,
+                    ..SearchFilters::default()
+                },
+            ),
+            (
+                "event type + provider + since",
+                SearchFilters {
+                    provider: Some(CaptureProvider::Codex),
+                    event_type: Some(EventType::ToolCall),
+                    since: Some(corpus.base - chrono::Duration::seconds(3)),
+                    ..SearchFilters::default()
+                },
+            ),
+        ];
+
+        for (name, filters) in &filter_cases {
+            for result_mode in [SearchResultMode::Sessions, SearchResultMode::Events] {
+                let options = PacketOptions {
+                    limit: 10,
+                    snippet_chars: 200,
+                    filters: filters.clone(),
+                    result_mode,
+                };
+                let packet = search_packet(store, "pushdownneedle", &options).unwrap();
+                let (reference, _) = reference_fast_event_packet(store, "pushdownneedle", &options);
+                assert_eq!(
+                    packet_without_generated_at(&packet),
+                    packet_without_generated_at(&reference),
+                    "case: {name} ({result_mode:?})"
+                );
+            }
+        }
+
+        // Guard against vacuity: the explicit-session case must actually
+        // return subagent rows (scope pushdown disabled), and the exact vs
+        // fractional since cases must differ at the boundary.
+        let subagent_packet = search_packet(
+            store,
+            "pushdownneedle",
+            &PacketOptions {
+                limit: 10,
+                snippet_chars: 200,
+                filters: SearchFilters {
+                    session: Some(corpus.subagent_session),
+                    ..SearchFilters::default()
+                },
+                result_mode: SearchResultMode::Events,
+            },
+        )
+        .unwrap();
+        assert!(!subagent_packet.results.is_empty());
+        assert!(subagent_packet
+            .results
+            .iter()
+            .all(|result| result.session_id == Some(corpus.subagent_session)));
+
+        let since_events = |since: chrono::DateTime<Utc>| {
+            search_packet(
+                store,
+                "pushdownneedle",
+                &PacketOptions {
+                    limit: 200,
+                    snippet_chars: 200,
+                    filters: SearchFilters {
+                        since: Some(since),
+                        include_subagents: true,
+                        ..SearchFilters::default()
+                    },
+                    result_mode: SearchResultMode::Events,
+                },
+            )
+            .unwrap()
+            .results
+            .len()
+        };
+        // Decoys sit at whole milliseconds base+0..base+1999ms. A fractional
+        // since between base+1998ms and base+1999ms must behave exactly like
+        // base+1999ms (ceil), not like base+1998ms (floor).
+        let penultimate = corpus.base + chrono::Duration::milliseconds(1998);
+        assert_eq!(since_events(penultimate), 2);
+        assert_eq!(
+            since_events(penultimate + chrono::Duration::microseconds(500)),
+            1,
+            "fractional since must exclude the boundary-millisecond event"
+        );
+        assert_eq!(
+            since_events(corpus.base + chrono::Duration::milliseconds(1999)),
+            1
         );
     }
 }

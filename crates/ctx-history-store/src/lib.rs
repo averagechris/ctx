@@ -365,6 +365,69 @@ pub struct EventSearchHit {
     pub record_workspace: Option<String>,
 }
 
+/// Agent-scope predicate that can be enforced inside the ranked event-search
+/// SQL page. For schema-valid rows produced by supported store write paths,
+/// both variants mirror `event_hit_matches_agent_scope` in
+/// `ctx-history-search` on the exact hit columns
+/// (`COALESCE(s.is_primary, rs.is_primary)` / `COALESCE(s.agent_type,
+/// rs.agent_type)`), so a row passes the SQL predicate if and only if the
+/// hydrated `EventSearchHit` passes the Rust check. Out-of-band database
+/// corruption is outside this equivalence claim and may fail hydration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventSearchAgentScope {
+    /// Default scope (`include_subagents = false`): keep rows whose session is
+    /// primary, whose agent type is `primary`, or that carry no session
+    /// identity at all (both scope columns NULL).
+    PrimaryOrSessionless,
+    /// `primary_only`: keep only rows proven primary; sessionless rows drop.
+    PrimaryOnly,
+}
+
+/// Exact-semantics subset of the event-search filters that
+/// `search_event_hits_page_filtered` pushes into the ranked SQL page query.
+///
+/// Every predicate is expressed on the same COALESCE fallback chains that
+/// hydrate the corresponding `EventSearchHit` field, so for schema-valid rows
+/// produced by supported store write paths SQL filtering is equivalent to
+/// filtering the unfiltered hit stream in Rust:
+/// - `session_id` matches `COALESCE(e.session_id, event_search.session_id,
+///   s.id, rs.id)` (the hydrated `hit.session_id`). Supported writes persist
+///   UUIDs using `Uuid::to_string()`'s canonical lowercase hyphenated text, so
+///   SQL text equality and parsed `Uuid` equality agree.
+/// - `provider` matches the five-way provider fallback chain
+///   (`hit.provider`); provider strings are CHECK-constrained under the store
+///   schema, so string equality agrees with `CaptureProvider` equality for
+///   reachable rows. Corrupt/out-of-band values are not covered and fail enum
+///   hydration rather than silently participating in Rust filtering.
+/// - `since` keeps rows with `occurred_at >= since`. Stored timestamps are
+///   whole milliseconds, so a sub-millisecond `since` is ceiled to the next
+///   representable millisecond (see `event_search_since_threshold_ms`).
+/// - `event_type` matches `e.event_type` (CHECK-constrained text enum).
+/// - `agent_scope` see `EventSearchAgentScope`.
+///
+/// Filters that require request-scoped context (repo substring matching, file
+/// touch scopes, excluded provider sessions, history-source identity) stay in
+/// Rust; callers keep `event_hit_matches_filters` as the final authority over
+/// every returned row.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EventSearchSqlFilters {
+    pub session_id: Option<Uuid>,
+    pub provider: Option<CaptureProvider>,
+    pub since: Option<DateTime<Utc>>,
+    pub event_type: Option<EventType>,
+    pub agent_scope: Option<EventSearchAgentScope>,
+}
+
+impl EventSearchSqlFilters {
+    pub fn is_empty(&self) -> bool {
+        self.session_id.is_none()
+            && self.provider.is_none()
+            && self.since.is_none()
+            && self.event_type.is_none()
+            && self.agent_scope.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FileTouchScope {
     pub history_record_ids: BTreeSet<Uuid>,
@@ -1142,6 +1205,7 @@ pub struct Store {
     object_dir: PathBuf,
     conn: Connection,
     busy_timeout: Duration,
+    event_search_page_executions: std::cell::Cell<u64>,
 }
 
 impl Store {
@@ -1166,6 +1230,7 @@ impl Store {
             object_dir,
             conn,
             busy_timeout: BUSY_TIMEOUT,
+            event_search_page_executions: std::cell::Cell::new(0),
         })
     }
 
@@ -1195,6 +1260,7 @@ impl Store {
             object_dir,
             conn,
             busy_timeout,
+            event_search_page_executions: std::cell::Cell::new(0),
         };
         store.migrate()?;
         if migrated_legacy_layout {
@@ -3733,6 +3799,16 @@ impl Store {
         self.search_event_hits_page(query, limit, 0)
     }
 
+    /// Internal, non-contractual test instrumentation: number of ranked
+    /// event-search page statements successfully prepared by this store
+    /// handle (both unfiltered and filtered SQL shapes). Tests and benchmarks
+    /// assert on this counter instead of timing; production callers must not
+    /// depend on it as a public behavioral or telemetry contract.
+    #[doc(hidden)]
+    pub fn event_search_page_executions(&self) -> u64 {
+        self.event_search_page_executions.get()
+    }
+
     pub fn search_event_hits_page(
         &self,
         query: &str,
@@ -3746,43 +3822,65 @@ impl Store {
             return Ok(Vec::new());
         };
         let mut stmt = self.conn.prepare(SEARCH_EVENT_HITS_PAGE_SQL)?;
+        self.event_search_page_executions
+            .set(self.event_search_page_executions.get().saturating_add(1));
         let rows = stmt.query_map(
             params![match_query, limit.max(1) as i64, offset as i64],
-            |row| {
-                let payload_json = row.get::<_, String>(18)?;
-                let source_metadata_json = row.get::<_, Option<String>>(19)?;
-                let source_identity =
-                    event_search_source_identity(source_metadata_json.as_deref())?;
-                Ok(EventSearchHit {
-                    event_id: parse_uuid(row.get::<_, String>(0)?)?,
-                    history_record_id: parse_optional_uuid(row.get(1)?)?,
-                    session_id: parse_optional_uuid(row.get(2)?)?,
-                    run_id: parse_optional_uuid(row.get(3)?)?,
-                    seq: row.get::<_, i64>(4)? as u64,
-                    event_type: parse_text_enum::<EventType>(row.get::<_, String>(5)?)?,
-                    role: parse_optional_text_enum::<EventRole>(row.get(6)?)?,
-                    occurred_at: ms_to_time(row.get(7)?)?,
-                    preview: row.get(8)?,
-                    score: row.get(9)?,
-                    provider: parse_optional_text_enum::<CaptureProvider>(row.get(10)?)?,
-                    session_external_session_id: row.get(11)?,
-                    history_source: source_identity.history_source,
-                    history_source_plugin: source_identity.history_source_plugin,
-                    provider_key: source_identity.provider_key,
-                    source_id: source_identity.source_id,
-                    source_format: source_identity.source_format,
-                    session_parent_session_id: parse_optional_uuid(row.get(12)?)?,
-                    session_root_session_id: parse_optional_uuid(row.get(13)?)?,
-                    agent_type: parse_optional_text_enum::<AgentType>(row.get(14)?)?,
-                    session_is_primary: row.get::<_, Option<i64>>(15)?.map(|value| value != 0),
-                    cwd: row.get(16)?,
-                    raw_source_path: row.get(17)?,
-                    cursor: event_search_cursor(&payload_json, source_metadata_json.as_deref())?,
-                    record_title: row.get(20)?,
-                    record_kind: row.get(21)?,
-                    record_workspace: row.get(22)?,
-                })
-            },
+            event_search_hit_from_row,
+        )?;
+        collect_rows(rows)
+    }
+
+    /// Ranked event-search page with the exact-semantics filters of
+    /// `EventSearchSqlFilters` applied inside the candidate CTE, before
+    /// LIMIT/OFFSET. Ordering, hydration, and pagination semantics are
+    /// identical to `search_event_hits_page` restricted to matching rows:
+    /// every page is an exact slice of the unfiltered hit stream filtered by
+    /// the equivalent Rust predicates. Empty filters delegate to the
+    /// unfiltered query so plain searches keep the narrow phase-one shape.
+    pub fn search_event_hits_page_filtered(
+        &self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+        filters: &EventSearchSqlFilters,
+    ) -> Result<Vec<EventSearchHit>> {
+        if filters.is_empty() {
+            return self.search_event_hits_page(query, limit, offset);
+        }
+        if !table_exists(&self.conn, "event_search")? {
+            return Ok(Vec::new());
+        }
+        let Some(match_query) = fts_match_query(query) else {
+            return Ok(Vec::new());
+        };
+        // The provider fallback chain is the only predicate that needs the
+        // three capture_sources joins; skip them when provider is unfiltered.
+        let sql = if filters.provider.is_some() {
+            SEARCH_EVENT_HITS_PAGE_PROVIDER_FILTERED_SQL
+        } else {
+            SEARCH_EVENT_HITS_PAGE_SCOPED_FILTERED_SQL
+        };
+        let scope_mode = match filters.agent_scope {
+            None => 0_i64,
+            Some(EventSearchAgentScope::PrimaryOrSessionless) => 1,
+            Some(EventSearchAgentScope::PrimaryOnly) => 2,
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        self.event_search_page_executions
+            .set(self.event_search_page_executions.get().saturating_add(1));
+        let rows = stmt.query_map(
+            params![
+                match_query,
+                limit.max(1) as i64,
+                offset as i64,
+                filters.session_id.map(|id| id.to_string()),
+                filters.provider.map(CaptureProvider::as_str),
+                filters.since.map(event_search_since_threshold_ms),
+                filters.event_type.map(EventType::as_str),
+                scope_mode,
+            ],
+            event_search_hit_from_row,
         )?;
         collect_rows(rows)
     }
@@ -3905,16 +4003,21 @@ impl Store {
 // query. The subquery's LIMIT prevents SQLite from flattening it into the
 // outer join, which keeps wide hydration bounded to the selected page; the
 // plan shape is asserted in `search_order_tests`.
-const SEARCH_EVENT_HITS_PAGE_SQL: &str = r#"
-    WITH ranked_page AS (
-        SELECT event_search.rowid AS search_rowid,
-               bm25(event_search) AS score
-        FROM event_search
-        JOIN events e ON e.id = event_search.event_id
-        WHERE event_search MATCH ?1
-        ORDER BY bm25(event_search), e.occurred_at_ms DESC, e.seq DESC, event_search.event_id
-        LIMIT ?2 OFFSET ?3
-    )
+//
+// All page-query shapes share the same phase-two hydration text through this
+// macro, so filtered pages hydrate byte-identically to unfiltered ones. The
+// filtered candidate CTEs below add exact-semantics predicates (see
+// `EventSearchSqlFilters`) before LIMIT/OFFSET; their extra joins are indexed
+// primary-key lookups per FTS candidate and every predicate is written
+// against the same COALESCE fallback chain that phase two hydrates into the
+// corresponding `EventSearchHit` field.
+macro_rules! event_hits_page_sql {
+    ($($ranked_page_cte:literal),+ $(,)?) => {
+        concat!(
+            "\n    WITH ranked_page AS (\n",
+            $($ranked_page_cte),+,
+            "\n    )",
+            r#"
     SELECT event_search.event_id,
            COALESCE(e.history_record_id, event_search.history_record_id, s.history_record_id, rs.history_record_id),
            COALESCE(e.session_id, event_search.session_id, s.id, rs.id),
@@ -3949,7 +4052,131 @@ const SEARCH_EVENT_HITS_PAGE_SQL: &str = r#"
     LEFT JOIN capture_sources run_source ON run_source.id = r.source_id
     LEFT JOIN history_records wr ON wr.id = COALESCE(e.history_record_id, event_search.history_record_id, s.history_record_id, rs.history_record_id, r.history_record_id)
     ORDER BY ranked_page.score, e.occurred_at_ms DESC, e.seq DESC, event_search.event_id
-    "#;
+    "#
+        )
+    };
+}
+
+// Compose both filtered candidate CTEs from one readable predicate suffix.
+// The caller supplies only the provider-specific joins and predicate; session,
+// since, event_type, agent scope, ordering, and pagination therefore cannot
+// drift between the scoped and provider shapes.
+macro_rules! filtered_event_hits_page_sql {
+    () => {
+        filtered_event_hits_page_sql!(@compose r#""#, r#""#)
+    };
+    (provider) => {
+        filtered_event_hits_page_sql!(
+            @compose
+            r#"        LEFT JOIN capture_sources event_source ON event_source.id = e.capture_source_id
+        LEFT JOIN capture_sources session_source ON session_source.id = COALESCE(s.capture_source_id, rs.capture_source_id)
+        LEFT JOIN capture_sources run_source ON run_source.id = r.source_id
+"#,
+            r#"          AND (?5 IS NULL OR COALESCE(s.provider, rs.provider, event_source.provider, session_source.provider, run_source.provider) = ?5)
+"#
+        )
+    };
+    (@compose $provider_joins:literal, $provider_predicate:literal) => {
+        event_hits_page_sql!(
+            r#"        SELECT event_search.rowid AS search_rowid,
+               bm25(event_search) AS score
+        FROM event_search
+        JOIN events e ON e.id = event_search.event_id
+        LEFT JOIN runs r ON r.id = e.run_id
+        LEFT JOIN sessions s ON s.id = COALESCE(e.session_id, event_search.session_id)
+        LEFT JOIN sessions rs ON rs.id = r.session_id
+"#,
+            $provider_joins,
+            r#"        WHERE event_search MATCH ?1
+          AND (?4 IS NULL OR COALESCE(e.session_id, event_search.session_id, s.id, rs.id) = ?4)
+"#,
+            $provider_predicate,
+            r#"          AND (?6 IS NULL OR e.occurred_at_ms >= ?6)
+          AND (?7 IS NULL OR e.event_type = ?7)
+          AND (?8 = 0
+               OR COALESCE(s.is_primary, rs.is_primary) <> 0
+               OR COALESCE(s.agent_type, rs.agent_type) = 'primary'
+               OR (?8 = 1
+                   AND COALESCE(s.is_primary, rs.is_primary) IS NULL
+                   AND COALESCE(s.agent_type, rs.agent_type) IS NULL))
+        ORDER BY bm25(event_search), e.occurred_at_ms DESC, e.seq DESC, event_search.event_id
+        LIMIT ?2 OFFSET ?3"#,
+        )
+    };
+}
+
+const SEARCH_EVENT_HITS_PAGE_SQL: &str = event_hits_page_sql!(
+    r#"        SELECT event_search.rowid AS search_rowid,
+               bm25(event_search) AS score
+        FROM event_search
+        JOIN events e ON e.id = event_search.event_id
+        WHERE event_search MATCH ?1
+        ORDER BY bm25(event_search), e.occurred_at_ms DESC, e.seq DESC, event_search.event_id
+        LIMIT ?2 OFFSET ?3"#
+);
+
+// Filtered candidate selection without the provider predicate: only the
+// narrow events row plus the session identity chain (runs -> sessions) is
+// needed to evaluate session/since/event_type/agent-scope, so the three
+// capture_sources joins are skipped. ?5 (provider) is intentionally unused in
+// this shape; `search_event_hits_page_filtered` only chooses it when the
+// provider filter is absent.
+const SEARCH_EVENT_HITS_PAGE_SCOPED_FILTERED_SQL: &str = filtered_event_hits_page_sql!();
+
+// Filtered candidate selection including the provider predicate, which needs
+// the full five-way provider fallback chain and therefore the three
+// capture_sources joins (same join conditions as phase two).
+const SEARCH_EVENT_HITS_PAGE_PROVIDER_FILTERED_SQL: &str = filtered_event_hits_page_sql!(provider);
+
+/// Smallest stored `occurred_at_ms` value satisfying `occurred_at >= since`.
+/// Stored event timestamps are whole milliseconds, so a `since` with
+/// sub-millisecond precision must ceil to the next representable millisecond;
+/// a `since` that is exactly on a millisecond boundary keeps events at that
+/// exact millisecond (>= is inclusive).
+fn event_search_since_threshold_ms(since: DateTime<Utc>) -> i64 {
+    let floor_ms = since.timestamp_millis();
+    if DateTime::<Utc>::from_timestamp_millis(floor_ms) == Some(since) {
+        floor_ms
+    } else {
+        floor_ms.saturating_add(1)
+    }
+}
+
+fn event_search_hit_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventSearchHit> {
+    let payload_json = row.get::<_, String>(18)?;
+    let source_metadata_json = row.get::<_, Option<String>>(19)?;
+    let source_identity = event_search_source_identity(source_metadata_json.as_deref())?;
+    Ok(EventSearchHit {
+        event_id: parse_uuid(row.get::<_, String>(0)?)?,
+        history_record_id: parse_optional_uuid(row.get(1)?)?,
+        session_id: parse_optional_uuid(row.get(2)?)?,
+        run_id: parse_optional_uuid(row.get(3)?)?,
+        seq: row.get::<_, i64>(4)? as u64,
+        event_type: parse_text_enum::<EventType>(row.get::<_, String>(5)?)?,
+        role: parse_optional_text_enum::<EventRole>(row.get(6)?)?,
+        occurred_at: ms_to_time(row.get(7)?)?,
+        preview: row.get(8)?,
+        score: row.get(9)?,
+        provider: parse_optional_text_enum::<CaptureProvider>(row.get(10)?)?,
+        session_external_session_id: row.get(11)?,
+        history_source: source_identity.history_source,
+        history_source_plugin: source_identity.history_source_plugin,
+        provider_key: source_identity.provider_key,
+        source_id: source_identity.source_id,
+        source_format: source_identity.source_format,
+        session_parent_session_id: parse_optional_uuid(row.get(12)?)?,
+        session_root_session_id: parse_optional_uuid(row.get(13)?)?,
+        agent_type: parse_optional_text_enum::<AgentType>(row.get(14)?)?,
+        session_is_primary: row.get::<_, Option<i64>>(15)?.map(|value| value != 0),
+        cwd: row.get(16)?,
+        raw_source_path: row.get(17)?,
+        cursor: event_search_cursor(&payload_json, source_metadata_json.as_deref())?,
+        record_title: row.get(20)?,
+        record_kind: row.get(21)?,
+        record_workspace: row.get(22)?,
+    })
+}
+
 fn configure_connection(conn: &Connection, busy_timeout: Duration) -> Result<()> {
     conn.busy_timeout(busy_timeout)?;
     conn.execute_batch(
@@ -8400,6 +8627,682 @@ mod search_order_tests {
                 .any(|(op, table)| op == "SEARCH" && table == "e"),
             "plan:\n{plan_text}"
         );
+    }
+
+    #[test]
+    fn since_threshold_ceils_sub_millisecond_since_to_next_millisecond() {
+        let exact = DateTime::<Utc>::from_timestamp_millis(1_750_000_000_123).unwrap();
+        assert_eq!(event_search_since_threshold_ms(exact), 1_750_000_000_123);
+
+        // Any sub-millisecond remainder must round up: an event stored at the
+        // floored millisecond is strictly before `since` and must be excluded.
+        for nanos in [1, 500_000, 999_999] {
+            let fractional = exact + chrono::Duration::nanoseconds(nanos);
+            assert_eq!(
+                event_search_since_threshold_ms(fractional),
+                1_750_000_000_124,
+                "nanos={nanos}"
+            );
+        }
+
+        let pre_epoch = DateTime::<Utc>::from_timestamp_millis(-1_001).unwrap();
+        assert_eq!(event_search_since_threshold_ms(pre_epoch), -1_001);
+        assert_eq!(
+            event_search_since_threshold_ms(pre_epoch + chrono::Duration::microseconds(1)),
+            -1_000
+        );
+    }
+
+    #[test]
+    fn filtered_event_hits_page_sql_shapes_share_exact_hydration_phase() {
+        fn phases(sql: &str) -> (&str, &str) {
+            sql.split_once("\n    )")
+                .expect("ranked_page CTE terminator")
+        }
+        let (_, unfiltered_hydration) = phases(SEARCH_EVENT_HITS_PAGE_SQL);
+        for filtered in [
+            SEARCH_EVENT_HITS_PAGE_SCOPED_FILTERED_SQL,
+            SEARCH_EVENT_HITS_PAGE_PROVIDER_FILTERED_SQL,
+        ] {
+            let (cte, hydration) = phases(filtered);
+            assert_eq!(hydration, unfiltered_hydration);
+            // Both filtered CTEs must keep the exact unfiltered sort keys and
+            // page clamp so filtered pages are slices of the same ordering.
+            assert!(cte.contains(
+                "ORDER BY bm25(event_search), e.occurred_at_ms DESC, e.seq DESC, event_search.event_id"
+            ));
+            assert!(cte.contains("LIMIT ?2 OFFSET ?3"));
+        }
+    }
+
+    /// Corpus exercising every fallback chain the pushed-down predicates
+    /// touch: direct sessions (primary/subagent/unknown), a run-only session
+    /// chain, provider via event-level capture source only, a fully
+    /// sessionless row, and an event whose session identity exists only in
+    /// the event_search projection. Timestamps straddle a millisecond
+    /// boundary for the fractional `since` cases.
+    struct PushdownCorpus {
+        store: Store,
+        _temp: tempfile::TempDir,
+        base: DateTime<Utc>,
+        s_primary: Uuid,
+        s_subagent: Uuid,
+        s_run: Uuid,
+        projection_session: Uuid,
+    }
+
+    fn pushdown_corpus() -> PushdownCorpus {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let base = fixed_time();
+
+        let record_id = Uuid::parse_str("018f45d0-0000-7000-8000-0000000f0001").unwrap();
+        let mut record = HistoryRecord::new(
+            "Pushdown record",
+            "pushdown record body",
+            vec!["pushdown-test".into()],
+            "task",
+            Some("/workspace/pushdown".into()),
+        );
+        record.id = record_id;
+        record.created_at = base;
+        record.updated_at = base;
+        store.insert_record(&record).unwrap();
+
+        let insert_session =
+            |id: &str, provider: &str, agent_type: &str, is_primary: i64| -> Uuid {
+                let session_id = Uuid::parse_str(id).unwrap();
+                store
+                    .conn
+                    .execute(
+                        r#"
+                        INSERT INTO sessions
+                        (id, history_record_id, provider, external_session_id, agent_type,
+                         is_primary, status, fidelity, started_at_ms, created_at_ms, updated_at_ms)
+                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'imported', 'full', 1, 1, 1)
+                        "#,
+                        params![
+                            session_id.to_string(),
+                            record_id.to_string(),
+                            provider,
+                            format!("external-{id}"),
+                            agent_type,
+                            is_primary
+                        ],
+                    )
+                    .unwrap();
+                session_id
+            };
+        let s_primary = insert_session(
+            "018f45d0-0000-7000-8000-0000000f0011",
+            "codex",
+            "primary",
+            1,
+        );
+        let s_subagent = insert_session(
+            "018f45d0-0000-7000-8000-0000000f0012",
+            "claude",
+            "subagent",
+            0,
+        );
+        let s_unknown = insert_session(
+            "018f45d0-0000-7000-8000-0000000f0013",
+            "opencode",
+            "unknown",
+            0,
+        );
+        let s_run = insert_session(
+            "018f45d0-0000-7000-8000-0000000f0014",
+            "claude",
+            "subagent",
+            0,
+        );
+
+        let event_source_id = Uuid::parse_str("018f45d0-0000-7000-8000-0000000f0021").unwrap();
+        store
+            .conn
+            .execute(
+                r#"
+                INSERT INTO capture_sources
+                (id, kind, provider, machine_id, cwd, raw_source_path, started_at_ms, fidelity,
+                 metadata_json)
+                VALUES (?1, 'provider_import', 'gemini', 'test-machine', '/workspace/pushdown',
+                        '/workspace/pushdown/gemini.jsonl', 1, 'full', '{}')
+                "#,
+                params![event_source_id.to_string()],
+            )
+            .unwrap();
+        let run_source_id = Uuid::parse_str("018f45d0-0000-7000-8000-0000000f0022").unwrap();
+        store
+            .conn
+            .execute(
+                r#"
+                INSERT INTO capture_sources
+                (id, kind, provider, machine_id, cwd, raw_source_path, started_at_ms, fidelity,
+                 metadata_json)
+                VALUES (?1, 'provider_import', 'cursor', 'run-machine', '/workspace/run',
+                        '/workspace/run/transcript.jsonl', 1, 'full', '{}')
+                "#,
+                params![run_source_id.to_string()],
+            )
+            .unwrap();
+        let run_id = Uuid::parse_str("018f45d0-0000-7000-8000-0000000f0031").unwrap();
+        store
+            .conn
+            .execute(
+                r#"
+                INSERT INTO runs
+                (id, history_record_id, session_id, run_type, status, started_at_ms,
+                 created_at_ms, updated_at_ms, source_id)
+                VALUES (?1, ?2, ?3, 'agent_turn', 'succeeded', 1, 1, 1, ?4)
+                "#,
+                params![
+                    run_id.to_string(),
+                    record_id.to_string(),
+                    s_run.to_string(),
+                    run_source_id.to_string()
+                ],
+            )
+            .unwrap();
+
+        let event = |id: &str,
+                     seq: u64,
+                     session: Option<Uuid>,
+                     run: Option<Uuid>,
+                     source: Option<Uuid>,
+                     event_type: EventType,
+                     at: DateTime<Utc>,
+                     text: &str| Event {
+            id: Uuid::parse_str(id).unwrap(),
+            seq,
+            history_record_id: Some(record_id),
+            session_id: session,
+            run_id: run,
+            event_type,
+            role: Some(EventRole::Assistant),
+            occurred_at: at,
+            capture_source_id: source,
+            payload: serde_json::json!({ "text": text }),
+            payload_blob_id: None,
+            dedupe_key: None,
+            redaction_state: RedactionState::SafePreview,
+            sync: sync_metadata(),
+        };
+        let plus_ms = |ms: i64| base + chrono::Duration::milliseconds(ms);
+        let events = [
+            event(
+                "018f45d0-0000-7000-8000-0000000f0041",
+                1,
+                Some(s_primary),
+                None,
+                None,
+                EventType::Message,
+                plus_ms(0),
+                "pushfilter pushfilter",
+            ),
+            event(
+                "018f45d0-0000-7000-8000-0000000f0042",
+                2,
+                Some(s_subagent),
+                None,
+                None,
+                EventType::Message,
+                plus_ms(1),
+                "pushfilter subagent",
+            ),
+            event(
+                "018f45d0-0000-7000-8000-0000000f0043",
+                3,
+                Some(s_unknown),
+                None,
+                None,
+                EventType::ToolCall,
+                plus_ms(0),
+                "pushfilter unknown-agent",
+            ),
+            // Session identity only through the run chain (rs fallback).
+            event(
+                "018f45d0-0000-7000-8000-0000000f0044",
+                4,
+                None,
+                Some(run_id),
+                None,
+                EventType::Message,
+                plus_ms(2),
+                "pushfilter run-chained",
+            ),
+            // Provider only through the event-level capture source.
+            event(
+                "018f45d0-0000-7000-8000-0000000f0045",
+                5,
+                None,
+                None,
+                Some(event_source_id),
+                EventType::ToolCall,
+                plus_ms(0),
+                "pushfilter source-only",
+            ),
+            // Fully sessionless: no session, run, or source identity.
+            event(
+                "018f45d0-0000-7000-8000-0000000f0046",
+                6,
+                None,
+                None,
+                None,
+                EventType::Message,
+                plus_ms(1),
+                "pushfilter sessionless",
+            ),
+            // Session identity only in the event_search projection row.
+            event(
+                "018f45d0-0000-7000-8000-0000000f0047",
+                7,
+                None,
+                None,
+                None,
+                EventType::Message,
+                plus_ms(0),
+                "pushfilter projection-fallback",
+            ),
+        ];
+        for event in &events {
+            store.upsert_event(event).unwrap();
+        }
+        let projection_session = s_primary;
+        store
+            .conn
+            .execute(
+                "UPDATE event_search SET session_id = ?1 WHERE event_id = ?2",
+                params![
+                    projection_session.to_string(),
+                    "018f45d0-0000-7000-8000-0000000f0047"
+                ],
+            )
+            .unwrap();
+
+        PushdownCorpus {
+            store,
+            _temp: temp,
+            base,
+            s_primary,
+            s_subagent,
+            s_run,
+            projection_session,
+        }
+    }
+
+    /// Test-side oracle that mirrors the pushed-down subset of
+    /// `ctx-history-search::event_hit_matches_filters` (session, provider,
+    /// since, event_type) and `event_hit_matches_agent_scope` (primary /
+    /// primary-or-sessionless) over hydrated hits.
+    fn oracle_matches(hit: &EventSearchHit, filters: &EventSearchSqlFilters) -> bool {
+        let primary =
+            hit.session_is_primary == Some(true) || hit.agent_type == Some(AgentType::Primary);
+        let sessionless = hit.session_is_primary.is_none() && hit.agent_type.is_none();
+        filters
+            .session_id
+            .is_none_or(|id| hit.session_id == Some(id))
+            && filters
+                .provider
+                .is_none_or(|provider| hit.provider == Some(provider))
+            && filters.since.is_none_or(|since| hit.occurred_at >= since)
+            && filters
+                .event_type
+                .is_none_or(|event_type| hit.event_type == event_type)
+            && match filters.agent_scope {
+                None => true,
+                Some(EventSearchAgentScope::PrimaryOrSessionless) => primary || sessionless,
+                Some(EventSearchAgentScope::PrimaryOnly) => primary,
+            }
+    }
+
+    /// Differential oracle: for every filter combination, the filtered SQL
+    /// page equals the unfiltered ranked stream filtered in Rust by the
+    /// equivalent hit-level predicates and sliced by limit/offset — the exact
+    /// contract `fast_event_search_packet` relies on when it pushes filters
+    /// down while keeping `event_hit_matches_filters` as final authority.
+    #[test]
+    fn filtered_event_hits_page_equals_rust_filtered_unfiltered_stream() {
+        let corpus = pushdown_corpus();
+        let store = &corpus.store;
+        let query = "pushfilter";
+
+        let full = store.search_event_hits_page(query, 100, 0).unwrap();
+        assert_eq!(full.len(), 7, "corpus must index all events");
+
+        let exact_since = corpus.base;
+        let fractional_since = corpus.base + chrono::Duration::microseconds(500);
+        let next_ms_since = corpus.base + chrono::Duration::milliseconds(1);
+        let sessions = [
+            None,
+            Some(corpus.s_primary),
+            Some(corpus.s_subagent),
+            Some(corpus.s_run),
+        ];
+        let providers = [
+            None,
+            Some(CaptureProvider::Codex),
+            Some(CaptureProvider::Claude),
+            Some(CaptureProvider::Gemini),
+        ];
+        let sinces = [
+            None,
+            Some(exact_since),
+            Some(fractional_since),
+            Some(next_ms_since),
+        ];
+        let event_types = [None, Some(EventType::ToolCall)];
+        let scopes = [
+            None,
+            Some(EventSearchAgentScope::PrimaryOrSessionless),
+            Some(EventSearchAgentScope::PrimaryOnly),
+        ];
+
+        let mut combos = Vec::new();
+        for session_id in sessions {
+            for provider in providers {
+                for since in sinces {
+                    for event_type in event_types {
+                        for agent_scope in scopes {
+                            combos.push(EventSearchSqlFilters {
+                                session_id,
+                                provider,
+                                since,
+                                event_type,
+                                agent_scope,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut nonempty_filtered_combos = 0;
+        for filters in &combos {
+            let expected: Vec<EventSearchHit> = full
+                .iter()
+                .filter(|hit| oracle_matches(hit, filters))
+                .cloned()
+                .collect();
+            if !filters.is_empty() && !expected.is_empty() {
+                nonempty_filtered_combos += 1;
+            }
+            let actual = store
+                .search_event_hits_page_filtered(query, 100, 0, filters)
+                .unwrap();
+            assert_eq!(actual, expected, "filters={filters:?}");
+        }
+        assert!(nonempty_filtered_combos > 40, "corpus must not be vacuous");
+
+        // Fractional-since ceiling has observable effect: events exactly at
+        // the base millisecond pass `since = base` but fail `since = base +
+        // 500µs`, while events at the next millisecond pass both.
+        let at_exact = store
+            .search_event_hits_page_filtered(
+                query,
+                100,
+                0,
+                &EventSearchSqlFilters {
+                    since: Some(exact_since),
+                    ..EventSearchSqlFilters::default()
+                },
+            )
+            .unwrap();
+        let at_fractional = store
+            .search_event_hits_page_filtered(
+                query,
+                100,
+                0,
+                &EventSearchSqlFilters {
+                    since: Some(fractional_since),
+                    ..EventSearchSqlFilters::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(at_exact.len(), 7);
+        assert_eq!(at_fractional.len(), 3);
+        assert!(at_fractional
+            .iter()
+            .all(|hit| hit.occurred_at >= fractional_since));
+
+        // The projection-only session identity is honored by session pushdown.
+        let projection = store
+            .search_event_hits_page_filtered(
+                query,
+                100,
+                0,
+                &EventSearchSqlFilters {
+                    session_id: Some(corpus.projection_session),
+                    ..EventSearchSqlFilters::default()
+                },
+            )
+            .unwrap();
+        assert!(projection.iter().any(|hit| {
+            hit.event_id == Uuid::parse_str("018f45d0-0000-7000-8000-0000000f0047").unwrap()
+        }));
+
+        // Limit/offset paging over filtered results is an exact slice of the
+        // filtered ordering, replicating the unfiltered API's `limit.max(1)`
+        // clamp and out-of-range behavior.
+        let paged_filters = [
+            EventSearchSqlFilters::default(),
+            EventSearchSqlFilters {
+                agent_scope: Some(EventSearchAgentScope::PrimaryOrSessionless),
+                ..EventSearchSqlFilters::default()
+            },
+            EventSearchSqlFilters {
+                provider: Some(CaptureProvider::Claude),
+                agent_scope: Some(EventSearchAgentScope::PrimaryOnly),
+                ..EventSearchSqlFilters::default()
+            },
+            EventSearchSqlFilters {
+                session_id: Some(corpus.s_subagent),
+                since: Some(fractional_since),
+                ..EventSearchSqlFilters::default()
+            },
+            EventSearchSqlFilters {
+                event_type: Some(EventType::Message),
+                since: Some(exact_since),
+                agent_scope: Some(EventSearchAgentScope::PrimaryOrSessionless),
+                ..EventSearchSqlFilters::default()
+            },
+        ];
+        for filters in &paged_filters {
+            let expected_all: Vec<EventSearchHit> = full
+                .iter()
+                .filter(|hit| oracle_matches(hit, filters))
+                .cloned()
+                .collect();
+            for limit in [0_usize, 1, 2, 3, expected_all.len(), expected_all.len() + 2] {
+                for offset in [0_usize, 1, 2, expected_all.len(), expected_all.len() + 2] {
+                    let expected: Vec<EventSearchHit> = expected_all
+                        .iter()
+                        .skip(offset)
+                        .take(limit.max(1))
+                        .cloned()
+                        .collect();
+                    let actual = store
+                        .search_event_hits_page_filtered(query, limit, offset, filters)
+                        .unwrap();
+                    assert_eq!(
+                        actual, expected,
+                        "filters={filters:?} limit={limit} offset={offset}"
+                    );
+                }
+            }
+        }
+
+        // Empty filters delegate to the unfiltered two-phase query.
+        assert_eq!(
+            store
+                .search_event_hits_page_filtered(query, 3, 1, &EventSearchSqlFilters::default())
+                .unwrap(),
+            store.search_event_hits_page(query, 3, 1).unwrap()
+        );
+    }
+
+    /// The filtered shapes must preserve the two-phase plan: candidate
+    /// selection (FTS index + narrow keys + the predicate joins) happens
+    /// inside the ranked_page subquery with LIMIT/OFFSET, every predicate
+    /// join is an indexed SEARCH (never a table SCAN), and history_records
+    /// hydration stays outside, bounded to the selected page.
+    #[test]
+    fn filtered_event_hits_page_query_plan_keeps_two_phase_shape() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+
+        for (sql, inner_expected) in [
+            (
+                SEARCH_EVENT_HITS_PAGE_SCOPED_FILTERED_SQL,
+                vec!["event_search", "e", "r", "s", "rs"],
+            ),
+            (
+                SEARCH_EVENT_HITS_PAGE_PROVIDER_FILTERED_SQL,
+                vec![
+                    "event_search",
+                    "e",
+                    "r",
+                    "s",
+                    "rs",
+                    "event_source",
+                    "session_source",
+                    "run_source",
+                ],
+            ),
+        ] {
+            let mut stmt = store
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let rows = stmt
+                .query_map(
+                    params![
+                        "pushfilter",
+                        3_i64,
+                        0_i64,
+                        Some("018f45d0-0000-7000-8000-0000000f0011"),
+                        Some("codex"),
+                        Some(1_i64),
+                        Some("message"),
+                        1_i64
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
+                )
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            let plan_text = rows
+                .iter()
+                .map(|(id, parent, detail)| format!("{id} {parent} {detail}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let subquery_roots = rows
+                .iter()
+                .filter(|(_, _, detail)| {
+                    detail.starts_with("CO-ROUTINE") || detail.starts_with("MATERIALIZE")
+                })
+                .map(|(id, _, _)| *id)
+                .collect::<Vec<_>>();
+            assert_eq!(subquery_roots.len(), 1, "plan:\n{plan_text}");
+            let mut inside = std::collections::HashSet::from([subquery_roots[0]]);
+            loop {
+                let before = inside.len();
+                for (id, parent, _) in &rows {
+                    if inside.contains(parent) {
+                        inside.insert(*id);
+                    }
+                }
+                if inside.len() == before {
+                    break;
+                }
+            }
+
+            fn table_access(detail: &str) -> Option<(&str, &str)> {
+                let mut parts = detail.split_whitespace();
+                let op = parts.next()?;
+                if op != "SCAN" && op != "SEARCH" {
+                    return None;
+                }
+                Some((op, parts.next()?))
+            }
+
+            let mut inner = Vec::new();
+            let mut outer = Vec::new();
+            for (id, _, detail) in &rows {
+                let Some((op, table)) = table_access(detail) else {
+                    continue;
+                };
+                if inside.contains(id) {
+                    inner.push((op.to_owned(), table.to_owned()));
+                } else {
+                    outer.push((op.to_owned(), table.to_owned()));
+                }
+            }
+
+            // Candidate selection touches exactly the FTS index, the narrow
+            // events keys, and the predicate joins — nothing else (in
+            // particular, no history_records) before LIMIT/OFFSET.
+            assert_eq!(
+                inner
+                    .iter()
+                    .map(|(_, table)| table.clone())
+                    .collect::<std::collections::HashSet<_>>(),
+                inner_expected
+                    .iter()
+                    .map(|table| (*table).to_owned())
+                    .collect::<std::collections::HashSet<_>>(),
+                "plan:\n{plan_text}"
+            );
+            // Every predicate join inside the CTE is an indexed SEARCH; the
+            // only SCAN is the FTS MATCH driver itself.
+            for (op, table) in &inner {
+                if table != "event_search" {
+                    assert_eq!(
+                        op, "SEARCH",
+                        "inner join on {table} must be indexed; plan:\n{plan_text}"
+                    );
+                }
+            }
+
+            // Hydration stays outside, driven by the limited page.
+            assert!(
+                outer.iter().any(|(_, table)| table == "ranked_page"),
+                "plan:\n{plan_text}"
+            );
+            for wide in [
+                "r",
+                "s",
+                "rs",
+                "event_source",
+                "session_source",
+                "run_source",
+                "wr",
+            ] {
+                assert!(
+                    outer
+                        .iter()
+                        .any(|(op, table)| op == "SEARCH" && table == wide),
+                    "missing indexed page-bounded lookup for {wide}; plan:\n{plan_text}"
+                );
+                assert!(
+                    !outer
+                        .iter()
+                        .any(|(op, table)| op == "SCAN" && table == wide),
+                    "wide table {wide} must not be scanned; plan:\n{plan_text}"
+                );
+            }
+            assert!(
+                !inner.iter().any(|(_, table)| table == "wr"),
+                "record hydration must stay page-bounded; plan:\n{plan_text}"
+            );
+        }
     }
 }
 

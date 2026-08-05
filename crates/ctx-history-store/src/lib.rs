@@ -4531,7 +4531,54 @@ fn object_relative_path(hash: &str) -> String {
     format!("{OBJECTS_DIR}/{shard}/{hash}")
 }
 
+/// Atomic full rebuild of every FTS search projection from the base tables.
+///
+/// The delete + repopulate sequence runs inside a SQLite SAVEPOINT rather
+/// than `BEGIN`: callers invoke this both from autocommit mode
+/// (`Store::refresh_search_index`, post-import archive rebuilds,
+/// `ensure_search_projection_initialized`) and from inside already-open
+/// migration transactions (`migrate_to_v11`/`migrate_to_v12`). A savepoint
+/// opens an implicit transaction when none is active and nests inside an
+/// existing one otherwise, so in every context the rebuild commits as one
+/// unit — no per-row autocommit overhead — and any failure rolls back to
+/// the previous complete projection instead of leaving it empty or partial.
 fn rebuild_search_projection(conn: &Connection) -> Result<()> {
+    conn.execute_batch("SAVEPOINT rebuild_search_projection;")?;
+    match rebuild_search_projection_body(conn) {
+        Ok(()) => match conn.execute_batch("RELEASE SAVEPOINT rebuild_search_projection;") {
+            Ok(()) => Ok(()),
+            Err(release_err) => {
+                // RELEASE is the commit point for autocommit callers. If it
+                // fails, make a best-effort attempt to restore/drop the
+                // savepoint before surfacing that exact release error.
+                let _ = conn.execute_batch(
+                    "ROLLBACK TO SAVEPOINT rebuild_search_projection; \
+                     RELEASE SAVEPOINT rebuild_search_projection;",
+                );
+                Err(StoreError::Sql(release_err))
+            }
+        },
+        Err(err) => {
+            // ROLLBACK TO rewinds the rebuild but keeps the savepoint on the
+            // stack; the RELEASE then drops it (ending the implicit
+            // transaction for autocommit callers, and leaving an enclosing
+            // migration/import transaction open and usable). The rollback is
+            // best-effort: the original rebuild error is always the one
+            // surfaced, and if the rollback itself failed the connection is
+            // broken in a way the caller's own error path will hit anyway.
+            let _ = conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT rebuild_search_projection; \
+                 RELEASE SAVEPOINT rebuild_search_projection;",
+            );
+            Err(err)
+        }
+    }
+}
+
+/// Projection rebuild statements, identical contents and order to the
+/// pre-savepoint implementation. Only [`rebuild_search_projection`] (and the
+/// retained rebuild benchmark) may call this directly.
+fn rebuild_search_projection_body(conn: &Connection) -> Result<()> {
     if !table_exists(conn, "ctx_history_search")? {
         return Ok(());
     }
@@ -10018,6 +10065,427 @@ mod search_maintenance_benches {
             let merge_repeated = started.elapsed();
             println!(
                 "corpus {size}: {increments} increments -> full optimize {optimize_repeated:?} vs bounded merge {merge_repeated:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod projection_rebuild_atomicity_tests {
+    use super::*;
+
+    fn tempdir() -> tempfile::TempDir {
+        let root = std::env::current_dir().unwrap().join("target/test-data");
+        fs::create_dir_all(&root).unwrap();
+        tempfile::Builder::new()
+            .prefix("ctx-history-store-rebuild-atomicity-")
+            .tempdir_in(root)
+            .unwrap()
+    }
+
+    fn fixed_time() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-06-23T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn sync_metadata() -> SyncMetadata {
+        SyncMetadata {
+            visibility: Visibility::LocalOnly,
+            fidelity: Fidelity::Imported,
+            sync_state: SyncState::LocalOnly,
+            sync_version: 0,
+            deleted_at: None,
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    fn probe_event(seq: u64) -> Event {
+        Event {
+            id: new_id(),
+            seq,
+            history_record_id: None,
+            session_id: None,
+            run_id: None,
+            event_type: EventType::Message,
+            role: Some(EventRole::User),
+            occurred_at: fixed_time(),
+            capture_source_id: None,
+            payload: serde_json::json!({ "text": format!("rebuild probe body {seq:05}") }),
+            payload_blob_id: None,
+            dedupe_key: None,
+            redaction_state: RedactionState::SafePreview,
+            sync: sync_metadata(),
+        }
+    }
+
+    fn probe_record(title: &str) -> HistoryRecord {
+        let mut record = HistoryRecord::new(
+            title,
+            "rebuild probe record body",
+            vec!["rebuild".into()],
+            "task",
+            None,
+        );
+        record.created_at = fixed_time();
+        record.updated_at = fixed_time();
+        record
+    }
+
+    type EventProjectionRow = (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+        String,
+    );
+    type RecordProjectionRow = (String, String, String, String, String, String, String);
+    type ArtifactProjectionRow = (String, Option<String>, String);
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct ProjectionSnapshot {
+        events: Vec<EventProjectionRow>,
+        records: Vec<RecordProjectionRow>,
+        artifacts: Vec<ArtifactProjectionRow>,
+    }
+
+    /// Full, ordered contents of both populated projections; equality means
+    /// the exact previous projection survived, not merely the same counts.
+    fn projection_snapshot(store: &Store) -> ProjectionSnapshot {
+        let mut events = store.conn.prepare(
+            "SELECT event_id, history_record_id, session_id, role, safe_preview_text, rank_bucket
+             FROM event_search ORDER BY event_id",
+        ).unwrap();
+        let events = events
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        let mut records = store
+            .conn
+            .prepare(
+                "SELECT record_id, title, summary, primary_user_text, decision_text, context_text, tag_text
+                 FROM ctx_history_search ORDER BY record_id",
+            )
+            .unwrap();
+        let records = records
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            })
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        let mut artifacts = store
+            .conn
+            .prepare(
+                "SELECT artifact_id, history_record_id, safe_preview_text
+                 FROM artifact_search ORDER BY artifact_id",
+            )
+            .unwrap();
+        let artifacts = artifacts
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        ProjectionSnapshot {
+            events,
+            records,
+            artifacts,
+        }
+    }
+
+    fn populated_store(temp: &tempfile::TempDir) -> Store {
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        for seq in 1..=5 {
+            store.upsert_event(&probe_event(seq)).unwrap();
+        }
+        store
+            .insert_record(&probe_record("Rebuild record one"))
+            .unwrap();
+        store
+            .insert_record(&probe_record("Rebuild record two"))
+            .unwrap();
+        store
+    }
+
+    fn corrupt_one_record_id(store: &Store) -> String {
+        let original: String = store
+            .conn
+            .query_row(
+                "SELECT id FROM history_records ORDER BY created_at DESC, id LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let changed = store
+            .conn
+            .execute(
+                "UPDATE history_records SET id = 'malformed-history-record-id' WHERE id = ?1",
+                params![original],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        original
+    }
+
+    fn match_ids(store: &Store, table: &str, id_column: &str, query: &str) -> Vec<String> {
+        let sql =
+            format!("SELECT {id_column} FROM {table} WHERE {table} MATCH ?1 ORDER BY {id_column}");
+        let mut stmt = store.conn.prepare(&sql).unwrap();
+        stmt.query_map(params![query], |row| row.get(0))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect()
+    }
+
+    fn assert_fts_integrity(store: &Store, table: &str) {
+        store
+            .conn
+            .execute(
+                &format!("INSERT INTO {table}({table}) VALUES ('integrity-check')"),
+                [],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn successful_rebuild_reaches_base_and_fts_parity() {
+        let temp = tempdir();
+        let store = populated_store(&temp);
+        // Wreck the projections, then rebuild from base tables.
+        store.conn.execute("DELETE FROM event_search", []).unwrap();
+        store
+            .conn
+            .execute("DELETE FROM ctx_history_search", [])
+            .unwrap();
+
+        store.refresh_search_index().unwrap();
+
+        let snapshot = projection_snapshot(&store);
+        assert_eq!(
+            snapshot.events.len(),
+            5,
+            "every event with preview text projected"
+        );
+        assert_eq!(snapshot.records.len(), 2, "every history record projected");
+        let base_events: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(snapshot.events.len() as i64, base_events);
+        let hits: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM event_search WHERE event_search MATCH 'rebuild'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 5);
+    }
+
+    #[test]
+    fn failed_rebuild_restores_previous_complete_projection() {
+        let temp = tempdir();
+        let store = populated_store(&temp);
+        store.refresh_search_index().unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO artifact_search
+                 (artifact_id, history_record_id, safe_preview_text)
+                 VALUES ('artifact-rollback-sentinel', NULL, 'artifact rollback sentinel')",
+                [],
+            )
+            .unwrap();
+        let before = projection_snapshot(&store);
+        assert_eq!(before.events.len(), 5);
+        assert_eq!(before.records.len(), 2);
+        assert_eq!(before.artifacts.len(), 1);
+        let event_matches = match_ids(&store, "event_search", "event_id", "rebuild");
+        let record_matches = match_ids(&store, "ctx_history_search", "record_id", "rebuild");
+        let artifact_matches = match_ids(&store, "artifact_search", "artifact_id", "rollback");
+
+        // The malformed record is not read until event_search has been fully
+        // repopulated and artifact_search (including its sentinel) deleted.
+        // Thus this fails late, after real replacement/deletion work, rather
+        // than immediately on the first event row.
+        let original_record_id = corrupt_one_record_id(&store);
+        let err = store.refresh_search_index().unwrap_err();
+        assert!(matches!(err, StoreError::Sql(_)), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("invalid character"),
+            "original malformed-UUID error was not preserved: {err}"
+        );
+
+        // The previous complete projection is back, not empty or partial,
+        // and the connection is back in autocommit (no dangling savepoint).
+        assert_eq!(projection_snapshot(&store), before);
+        assert_eq!(
+            match_ids(&store, "event_search", "event_id", "rebuild"),
+            event_matches
+        );
+        assert_eq!(
+            match_ids(&store, "ctx_history_search", "record_id", "rebuild"),
+            record_matches
+        );
+        assert_eq!(
+            match_ids(&store, "artifact_search", "artifact_id", "rollback"),
+            artifact_matches
+        );
+        for table in SEARCH_PROJECTION_FTS_TABLES {
+            assert_fts_integrity(&store, table);
+        }
+        assert!(store.conn.is_autocommit());
+
+        // Repairing the base row makes the same rebuild succeed again.
+        store
+            .conn
+            .execute(
+                "UPDATE history_records SET id = ?1 WHERE id = 'malformed-history-record-id'",
+                params![original_record_id],
+            )
+            .unwrap();
+        store.refresh_search_index().unwrap();
+        assert_eq!(projection_snapshot(&store).events.len(), 5);
+    }
+
+    #[test]
+    fn rebuild_nests_inside_an_open_transaction() {
+        let temp = tempdir();
+        let store = populated_store(&temp);
+        store.refresh_search_index().unwrap();
+        let baseline = projection_snapshot(&store);
+
+        // Success inside an outer transaction: the savepoint must nest (a
+        // BEGIN here would fail with "cannot start a transaction within a
+        // transaction") and its work must remain part of the outer
+        // transaction, so rolling the outer back also rewinds the rebuild.
+        store.conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        store.upsert_event(&probe_event(6)).unwrap();
+        rebuild_search_projection(&store.conn).unwrap();
+        assert!(!store.conn.is_autocommit());
+        assert_eq!(projection_snapshot(&store).events.len(), 6);
+        store.conn.execute_batch("ROLLBACK;").unwrap();
+        assert_eq!(projection_snapshot(&store), baseline);
+
+        // Failure inside an outer transaction: the savepoint rewinds only
+        // the rebuild, preserves the original error, and leaves the outer
+        // transaction open and usable — mirroring the migration callers.
+        store.conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        corrupt_one_record_id(&store);
+        let err = rebuild_search_projection(&store.conn).unwrap_err();
+        assert!(matches!(err, StoreError::Sql(_)), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("invalid character"),
+            "original malformed-UUID error was not preserved: {err}"
+        );
+        assert!(
+            !store.conn.is_autocommit(),
+            "outer transaction must survive a failed rebuild"
+        );
+        assert_eq!(projection_snapshot(&store), baseline);
+        // The outer transaction is still usable after the failure.
+        store
+            .conn
+            .execute("UPDATE events SET metadata_json = '{}'", [])
+            .unwrap();
+        store.conn.execute_batch("ROLLBACK;").unwrap();
+        assert!(store.conn.is_autocommit());
+        assert_eq!(projection_snapshot(&store), baseline);
+    }
+}
+
+/// Retained benchmark evidence for the atomic projection rebuild. Run
+/// explicitly with:
+///
+/// ```text
+/// cargo test --release -p ctx-history-store -- --ignored --nocapture --test-threads=1 bench_rebuild
+/// ```
+#[cfg(test)]
+mod projection_rebuild_benches {
+    use super::*;
+
+    fn tempdir() -> tempfile::TempDir {
+        let root = std::env::current_dir().unwrap().join("target/test-data");
+        fs::create_dir_all(&root).unwrap();
+        tempfile::Builder::new()
+            .prefix("ctx-history-store-rebuild-bench-")
+            .tempdir_in(root)
+            .unwrap()
+    }
+
+    #[test]
+    #[ignore = "benchmark: cargo test --release -p ctx-history-store -- --ignored --nocapture --test-threads=1 bench_rebuild"]
+    fn bench_rebuild_search_projection_savepoint_vs_autocommit() {
+        for &size in &[10_000u64, 50_000] {
+            let temp = tempdir();
+            let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+
+            // Source generation, separated from the rebuild timings: raw
+            // base-table rows only; the rebuild itself repopulates the
+            // projections from scratch either way.
+            let started = Instant::now();
+            store.conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+            {
+                let mut insert = store
+                    .conn
+                    .prepare(
+                        "INSERT INTO events (id, seq, event_type, role, occurred_at_ms, payload_json)
+                         VALUES (?1, ?2, 'message', 'user', ?3, ?4)",
+                    )
+                    .unwrap();
+                for seq in 1..=size {
+                    insert
+                        .execute(params![
+                            new_id().to_string(),
+                            seq as i64,
+                            1_750_000_000_000_i64 + seq as i64,
+                            format!(
+                                "{{\"text\": \"bench rebuild event {seq:07}: deterministic \
+                                 transcript payload for projection rebuild timing {seq:07}\"}}"
+                            ),
+                        ])
+                        .unwrap();
+                }
+            }
+            store.conn.execute_batch("COMMIT;").unwrap();
+            let generation = started.elapsed();
+            println!(
+                "corpus {size}: base-row generation {generation:?} (excluded from rebuild timings)"
+            );
+
+            // Old behavior: bare statement sequence in autocommit mode, one
+            // implicit transaction (and WAL commit) per projected row.
+            let started = Instant::now();
+            rebuild_search_projection_body(&store.conn).unwrap();
+            let autocommit = started.elapsed();
+
+            // New behavior: the same statements inside one savepoint.
+            let started = Instant::now();
+            rebuild_search_projection(&store.conn).unwrap();
+            let savepoint = started.elapsed();
+
+            println!(
+                "corpus {size}: rebuild autocommit (per-row) {autocommit:?} vs savepoint (atomic) {savepoint:?}"
             );
         }
     }

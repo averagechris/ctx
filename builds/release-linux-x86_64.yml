@@ -1,6 +1,6 @@
 image: nixos/unstable
 arch: x86_64
-oauth: git.sr.ht/OBJECTS:RW git.sr.ht/REPOSITORIES:RO git.sr.ht/PROFILE:RO builds.sr.ht/JOBS:RW builds.sr.ht/SECRETS:RO meta.sr.ht/PROFILE:RO
+oauth: git.sr.ht/OBJECTS:RW git.sr.ht/REPOSITORIES:RO git.sr.ht/PROFILE:RO builds.sr.ht/JOBS:RW builds.sr.ht/SECRETS:RO meta.sr.ht/PROFILE:RO pages.sr.ht/PAGES:RW
 environment:
   GIT_CONFIG_COUNT: "1"
   GIT_CONFIG_KEY_0: http.userAgent
@@ -36,7 +36,6 @@ tasks:
       set +x
       export SRHT_TOKEN="${SRHT_TOKEN:-${OAUTH2_TOKEN:-$(awk '/access-token/ { gsub(/"/, "", $2); print $2; exit }' ~/.config/hut/config 2>/dev/null || true)}}"
       set -x
-      srht() { nix run --inputs-from . fleet#srht -- "$@"; }
       version="$(awk '/^\[package\]/{s=1} s && /^version = /{gsub(/"/,"",$3); print $3; exit}' crates/ctx-cli/Cargo.toml)"
       tag="v${version#v}"
       commit="$(git rev-parse HEAD)"
@@ -44,8 +43,7 @@ tasks:
       set -- result-release-artifact/*.tar.gz
       [ -e "$1" ] || { printf '%s\n' 'no release artifacts found' >&2; exit 1; }
       for artifact do
-        srht git artifact upload -r ctx --rev "$tag" "$artifact"
-        srht git artifact upload -r ctx --rev "$tag" "$artifact.sha256"
+        TAG="$tag" scripts/upload-release-artifacts.sh "$artifact" "$artifact.sha256"
       done
 
       manifest="$(mktemp)"
@@ -72,7 +70,7 @@ tasks:
             cd averagechris.srht.site
             nix run .#refresh-pages
       EOF
-      srht builds submit "$manifest" --secrets --note "site refresh: ctx $tag"
+      nix run --inputs-from . fleet#srht -- builds submit "$manifest" --secrets --note "site refresh: ctx $tag"
 artifacts:
   - artifacts/ctx-v1.0.2-x86_64-linux.tar.gz
   - artifacts/ctx-v1.0.2-x86_64-linux.tar.gz.sha256

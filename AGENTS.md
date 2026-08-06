@@ -86,7 +86,7 @@ This is a hard fork of [ctxrs/ctx](https://github.com/ctxrs/ctx) maintained at
   `build-pages` + `publish-pages`. It lives in `builds/` (not `.builds/`) so
   it does not auto-run on every push; submit it explicitly with
   `nix run .#release -- --submit-linux-build` or
-  `hut builds submit builds/release-linux-x86_64.yml`.
+  `srht builds submit --secrets builds/release-linux-x86_64.yml`.
 - The darwin artifact is built/published locally by the orchestrator, or by
   hand: `nix build .#release-artifact`, copy the outputs into
   `dist/downloads/`, then `nix run .#build-pages -- --include-existing-downloads`

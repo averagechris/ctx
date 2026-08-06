@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Fixed
+
+- Delegated the Pages OAuth grant through Linux release builds so their nested
+  downloads-site refresh can be submitted successfully, and made artifact
+  uploads safe to retry after a partial release failure.
+
 ### Changed
 
 - First fork schema divergence (v1000): existing-row search index updates are

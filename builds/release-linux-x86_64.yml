@@ -72,5 +72,5 @@ tasks:
       EOF
       nix run --inputs-from . fleet#srht -- builds submit "$manifest" --secrets --note "site refresh: ctx $tag"
 artifacts:
-  - artifacts/ctx-v1.0.2-x86_64-linux.tar.gz
-  - artifacts/ctx-v1.0.2-x86_64-linux.tar.gz.sha256
+  - artifacts/ctx-v1.0.3-x86_64-linux.tar.gz
+  - artifacts/ctx-v1.0.3-x86_64-linux.tar.gz.sha256

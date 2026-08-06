@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+
+## v1.0.3 - 2026-08-06
+
 ### Added
 
 - Bounded pagination across `ctx search`, `ctx show session`, and the MCP
@@ -84,7 +87,6 @@
   behavior or weakening raw-SQL protections (#187).
 - Compact search and session projections now build only the fields they return,
   avoiding discarded data and store lookups without changing output (#186).
-
 ## v1.0.2 - 2026-08-05
 
 ### Changed

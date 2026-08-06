@@ -2020,6 +2020,115 @@ fn sql_is_read_only_and_does_not_initialize_store() {
     assert!(stderr.contains("Multiple statements provided"));
 }
 
+fn write_bare_store_with_user_version(temp: &TempDir, version: i64) -> PathBuf {
+    let db_path = temp.path().join("work.sqlite");
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch("CREATE TABLE foreign_marker (id INTEGER PRIMARY KEY, note TEXT);")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO foreign_marker (note) VALUES ('foreign row')",
+        [],
+    )
+    .unwrap();
+    conn.execute_batch(&format!("PRAGMA user_version = {version};"))
+        .unwrap();
+    db_path
+}
+
+#[test]
+fn read_only_commands_direct_old_schemas_to_a_writable_migration() {
+    let temp = tempdir();
+    write_bare_store_with_user_version(&temp, 15);
+
+    let stderr = failure_stderr(ctx(&temp).args(["sql", "SELECT 1"]));
+    assert!(
+        stderr.contains("schema version 15 is older than this ctx binary"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("run a writable command such as `ctx status` once to migrate"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn read_only_commands_reject_foreign_schemas_without_impossible_migration_advice() {
+    // 16 sits in the unreviewed upstream gap; 1001 is newer than this
+    // binary. Neither can be migrated by it, so the guidance must say
+    // upgrade/restore rather than suggesting a migration command.
+    for version in [16i64, 1001] {
+        let temp = tempdir();
+        let db_path = write_bare_store_with_user_version(&temp, version);
+        let before = fs::read(&db_path).unwrap();
+
+        let stderr = failure_stderr(ctx(&temp).args(["sql", "SELECT 1"]));
+        assert!(
+            stderr.contains(&format!(
+                "schema version {version} is newer than or incompatible with this ctx binary"
+            )),
+            "{stderr}"
+        );
+        assert!(stderr.contains("upgrade ctx"), "{stderr}");
+        assert!(
+            !stderr.contains("once to migrate"),
+            "foreign version {version} must not be advertised as migratable: {stderr}"
+        );
+
+        // A writable command refuses the foreign database too, and the
+        // rejection happens before any persistent PRAGMA: the file bytes
+        // (header, schema, journal mode) stay exactly as a foreign binary
+        // left them.
+        ctx(&temp).args(["status"]).assert().failure();
+        assert_eq!(
+            fs::read(&db_path).unwrap(),
+            before,
+            "rejected version {version} store was mutated"
+        );
+    }
+}
+
+#[test]
+fn mcp_status_reports_version_guidance_for_foreign_schema() {
+    let temp = tempdir();
+    write_bare_store_with_user_version(&temp, 1001);
+    let responses = mcp_roundtrip(
+        &temp,
+        &[
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": { "name": "ctx-test", "version": "0" }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": { "name": "status", "arguments": {} }
+            }),
+        ],
+    );
+
+    assert_eq!(responses.len(), 2);
+    let result = &responses[1]["result"];
+    assert_eq!(result["isError"], true);
+    let error = result["structuredContent"]["error"].as_str().unwrap();
+    assert!(
+        error.contains("schema version 1001 is newer than or incompatible with this ctx binary"),
+        "{error}"
+    );
+    assert!(error.contains("upgrade ctx"), "{error}");
+    assert!(!error.contains("once to migrate"), "{error}");
+}
+
 #[test]
 fn docs_commands_expose_embedded_docs_and_man_pages() {
     let temp = tempdir();

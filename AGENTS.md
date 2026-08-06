@@ -35,11 +35,29 @@ This is a hard fork of [ctxrs/ctx](https://github.com/ctxrs/ctx) maintained at
   session. Keep the raw-SQL surface strictly read-only (the 5-layer
   enforcement in `ctx-history-store` must not be weakened) and keep data-root
   permissions at `0o700`/`0o600`.
-- **FTS projections are maintained manually** (no SQLite triggers). Any new
-  write path in `ctx-history-store` must update the search projections or
-  search silently misses data.
-- **Schema versioning:** upstream chain is v1–v15. If this fork ever diverges
-  the schema, start at version 1000. New provider strings require a
+- **FTS projections and their rowid maps are maintained manually** (no SQLite
+  triggers). Any new write path in `ctx-history-store` must update the search
+  projections or search silently misses data, and must maintain the
+  `record_search_rowids`/`event_search_rowids` maps in the same write
+  transaction. The maps are performance caches keyed by explicit
+  SQLite-assigned FTS rowids — never inferred from base-table rowids, never a
+  search-correctness input. Unmapped or stale entries heal lazily via the
+  legacy full-scan delete; refresh/rebuild clears and repopulates maps in
+  lockstep with the projections.
+- **Schema versioning:** upstream chain is v1–v15; this fork diverged at
+  v1000 (durable FTS rowid map tables, no rebuild or backfill at migration).
+  **v1000 is taken by the landed rowid-map migration and is authoritative;**
+  two v1000 schemas cannot coexist. Binaries whose migration chain ends at
+  v15 refuse to newly open a maps-v1000 store both read-only and read-write.
+  The unpublished, pre-rebase local #195 binary is different: it also stamps
+  v1000, so it is not technically rejected and would silently assume its
+  different schema. It must never be built or run against a store migrated by
+  this change, and #195 must be rebased onto this authoritative v1000 as v1001
+  before its next build, run, or ship. Future fork migrations continue from
+  1001. The v15 open-time gate is load-bearing for the map invariants; do not
+  weaken it (it cannot evict pre-upgrade processes that already hold a
+  connection; restart long-lived ctx processes such as `ctx mcp` after
+  upgrading). New provider strings require a
   CHECK-constraint rebuild migration — prefer the external history-source
   plugin format (`ctx-history-jsonl-v1`) over in-tree adapters.
 - **Tests must not touch the network or the real home directory.** Integration

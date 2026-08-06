@@ -8,7 +8,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Args, Subcommand};
 use ctx_history_core::{database_path, EventType};
 use ctx_history_store::{
-    RawSqlOptions, Store, RAW_SQL_DEFAULT_MAX_COLUMNS, RAW_SQL_DEFAULT_MAX_ROWS,
+    RawSqlOptions, Store, StoreError, RAW_SQL_DEFAULT_MAX_COLUMNS, RAW_SQL_DEFAULT_MAX_ROWS,
     RAW_SQL_DEFAULT_MAX_SQL_BYTES, RAW_SQL_DEFAULT_MAX_VALUE_BYTES, RAW_SQL_DEFAULT_TIMEOUT,
     RAW_SQL_MAX_COLUMNS_CAP, RAW_SQL_MAX_ROWS_CAP, RAW_SQL_MAX_SQL_BYTES_CAP, RAW_SQL_MAX_TIMEOUT,
     RAW_SQL_MAX_VALUE_BYTES_CAP,
@@ -274,8 +274,7 @@ fn tool_status(data_root: &Path) -> Result<Value> {
         failed_catalog_sessions,
         stale_catalog_sessions,
     ) = if initialized {
-        let store = Store::open_read_only(&db_path)
-            .with_context(|| format!("open read-only ctx store {}", db_path.display()))?;
+        let store = open_store_read_only_with_version_guidance(&db_path)?;
         let catalog_counts = store.catalog_session_counts()?;
         (
             indexed_history_item_count(&store)?,
@@ -461,8 +460,23 @@ fn open_existing_store(data_root: &Path) -> Result<Store> {
             db_path.display()
         ));
     }
-    Store::open_read_only(&db_path)
-        .with_context(|| format!("open read-only ctx store {}", db_path.display()))
+    open_store_read_only_with_version_guidance(&db_path)
+}
+
+/// Read-only store open with the same version-aware guidance as the CLI:
+/// older (≤ v15) stores need one writable ctx command to migrate, while
+/// gap/newer versions need a newer ctx or a matching database, not an
+/// impossible migration.
+fn open_store_read_only_with_version_guidance(db_path: &Path) -> Result<Store> {
+    match Store::open_read_only(db_path) {
+        Ok(store) => Ok(store),
+        Err(StoreError::UnsupportedSchemaVersion(version)) => {
+            Err(crate::unsupported_schema_version_error(version, "ctx mcp"))
+        }
+        Err(err) => {
+            Err(err).with_context(|| format!("open read-only ctx store {}", db_path.display()))
+        }
+    }
 }
 
 fn tool_result(structured: Value) -> Value {

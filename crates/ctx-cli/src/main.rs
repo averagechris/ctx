@@ -3577,12 +3577,30 @@ fn open_existing_store_read_only(db_path: &Path, command: &str) -> Result<Store>
     }
     match Store::open_read_only(db_path) {
         Ok(store) => Ok(store),
-        Err(StoreError::UnsupportedSchemaVersion(version)) => Err(anyhow!(
-            "ctx store schema version {version} is not supported by this ctx binary; run `ctx status` once to migrate before using `{command}`"
-        )),
+        Err(StoreError::UnsupportedSchemaVersion(version)) => {
+            Err(unsupported_schema_version_error(version, command))
+        }
         Err(err) => {
             Err(err).with_context(|| format!("open read-only ctx store {}", db_path.display()))
         }
+    }
+}
+
+/// Version-aware guidance for [`StoreError::UnsupportedSchemaVersion`].
+/// Only versions on the ported upstream chain (≤ v15) can be migrated by
+/// this binary, via any writable command; everything else (the unreviewed
+/// 16–999 gap or versions newer than this binary) needs a newer ctx or a
+/// matching database, and telling the user to "migrate" would be advising
+/// the impossible.
+pub(crate) fn unsupported_schema_version_error(version: i64, command: &str) -> anyhow::Error {
+    if ctx_history_store::schema_version_is_migratable(version) {
+        anyhow!(
+            "ctx store schema version {version} is older than this ctx binary; run a writable command such as `ctx status` once to migrate before using `{command}`"
+        )
+    } else {
+        anyhow!(
+            "ctx store schema version {version} is newer than or incompatible with this ctx binary and cannot be migrated by it; upgrade ctx, or restore a database backup that matches this version, before using `{command}`"
+        )
     }
 }
 

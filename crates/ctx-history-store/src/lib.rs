@@ -95,7 +95,40 @@ pub enum StoreError {
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
-const SCHEMA_VERSION: i64 = 15;
+/// Current schema version. The ported upstream migration chain is v1–v15;
+/// this fork's first schema divergence jumps to 1000 (docs/fork-plan.md,
+/// decision 9) so fork migrations can never collide with upstream's chain.
+/// v1000 is reserved by the landed rowid-map migration; the next fork
+/// migration is 1001.
+///
+/// Any binary whose chain ends at v15 refuses to *open* a v1000 store, both
+/// read-only (exact-version check in [`Store::open_read_only`]) and
+/// read-write (the greater-than guard in [`Store::migrate`]). That
+/// rejection is a load-bearing part of the FTS rowid-map invariants (see
+/// [`SearchRowidMapSpec`]): no older binary can newly open the store and
+/// change the search projections without maintaining the maps. The gate is
+/// enforced at open time only — a pre-upgrade process that already holds an
+/// open connection can keep writing until it restarts, which is why release
+/// guidance says to restart long-lived ctx processes after upgrading and
+/// why map entries are verified before every point delete.
+const SCHEMA_VERSION: i64 = 1000;
+/// Last schema version of the ported upstream chain. A `user_version`
+/// strictly between this and [`SCHEMA_VERSION`] could only come from a newer
+/// upstream schema this fork has not reviewed; it is rejected instead of
+/// migrated blind.
+const UPSTREAM_SCHEMA_VERSION_MAX: i64 = 15;
+
+/// True when a writable open of this binary can migrate the given on-disk
+/// schema version to the current one: everything at or below the ported
+/// upstream chain (≤ v15) migrates. Versions in the (15, 1000) gap and
+/// versions above [`SCHEMA_VERSION`] belong to other (newer or unreviewed)
+/// binaries and are rejected rather than migrated; callers should steer
+/// users toward upgrading ctx or restoring a matching database instead of
+/// suggesting an impossible migration.
+pub fn schema_version_is_migratable(user_version: i64) -> bool {
+    user_version <= UPSTREAM_SCHEMA_VERSION_MAX
+}
+
 const BUSY_TIMEOUT: Duration = Duration::from_millis(30_000);
 const OBJECTS_DIR: &str = "objects";
 const SPOOL_DIR: &str = "spool";
@@ -1097,6 +1130,28 @@ CREATE VIRTUAL TABLE IF NOT EXISTS artifact_search USING fts5(
 );
 "#;
 
+/// Durable FTS rowid maps, fork schema v1000 (the fork's first divergence
+/// from the upstream chain). Each row caches the SQLite-assigned FTS rowid
+/// of the single projection row for one entity id, so existing-id
+/// projection maintenance can replace the O(index size) full-scan DELETE on
+/// an UNINDEXED FTS5 id column with a rowid point delete. The maps are
+/// performance caches, never query inputs; the maintenance contract lives
+/// on [`SearchRowidMapSpec`]. `artifact_search` is intentionally unmapped:
+/// it is currently never populated. Executed by `migrate_to_v1000` and
+/// re-executed on every `Store::migrate` so a dropped map table reappears
+/// (empty, which is always safe: every row heals lazily on its next write).
+const SEARCH_ROWID_MAP_TABLES_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS record_search_rowids (
+    record_id TEXT PRIMARY KEY,
+    search_rowid INTEGER NOT NULL UNIQUE
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS event_search_rowids (
+    event_id TEXT PRIMARY KEY,
+    search_rowid INTEGER NOT NULL UNIQUE
+) WITHOUT ROWID;
+"#;
+
 const STABLE_SQL_VIEWS_SQL: &str = r#"
 DROP VIEW IF EXISTS ctx_sessions;
 CREATE VIEW ctx_sessions AS
@@ -1271,7 +1326,6 @@ impl Store {
         }
         let conn = Connection::open(&path)?;
         restrict_private_file(&path)?;
-        configure_connection(&conn, busy_timeout)?;
         let store = Self {
             path,
             object_dir,
@@ -1279,6 +1333,9 @@ impl Store {
             busy_timeout,
             event_search_page_executions: std::cell::Cell::new(0),
         };
+        // migrate() validates the on-disk schema version before applying
+        // any persistent connection configuration (journal mode), so a
+        // rejected foreign database is returned untouched.
         store.migrate()?;
         if migrated_legacy_layout {
             store.normalize_legacy_blob_paths()?;
@@ -1490,13 +1547,24 @@ impl Store {
     }
 
     pub fn migrate(&self) -> Result<()> {
-        configure_connection(&self.conn, self.busy_timeout)?;
+        // Validate the on-disk schema version before any persistent PRAGMA:
+        // rejecting a foreign database (an unreviewed upstream version in
+        // the (15, 1000) gap, or anything newer than this binary) must
+        // leave its file — header, schema, and journal mode included —
+        // exactly as the binary that owns it left them. The busy timeout is
+        // per-connection and non-persistent, so it is safe to set first and
+        // keeps the version read robust under a concurrent writer.
+        self.conn.busy_timeout(self.busy_timeout)?;
         let user_version: i64 = self
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if user_version > SCHEMA_VERSION {
             return Err(StoreError::UnsupportedSchemaVersion(user_version));
         }
+        if user_version > UPSTREAM_SCHEMA_VERSION_MAX && user_version < SCHEMA_VERSION {
+            return Err(StoreError::UnsupportedSchemaVersion(user_version));
+        }
+        configure_connection(&self.conn, self.busy_timeout)?;
         if user_version < 1 {
             migrate_to_v1(&self.conn)?;
         }
@@ -1542,7 +1610,14 @@ impl Store {
         if user_version < 15 {
             migrate_to_v15(&self.conn)?;
         }
+        if user_version < 1000 {
+            migrate_to_v1000(&self.conn)?;
+        }
         create_fts_tables_if_supported(&self.conn)?;
+        // Recreate dropped rowid map tables empty on open; an empty map is
+        // always safe (writes degrade to the legacy full-scan path and each
+        // row heals lazily on its next write).
+        self.conn.execute_batch(SEARCH_ROWID_MAP_TABLES_SQL)?;
         Ok(())
     }
 
@@ -4680,7 +4755,17 @@ fn rebuild_search_projection_body(conn: &Connection) -> Result<()> {
         return Ok(());
     }
 
+    // Projections and rowid maps are cleared and repopulated in lockstep so
+    // the rebuilt maps describe exactly the rebuilt FTS rows. The map
+    // tables may be absent while rebuilds run inside pre-v1000 migration
+    // transactions (v11/v12); the probes keep those paths map-free.
     conn.execute("DELETE FROM ctx_history_search", [])?;
+    if RECORD_SEARCH_ROWID_MAP.is_present(conn)? {
+        conn.execute("DELETE FROM record_search_rowids", [])?;
+    }
+    if EVENT_SEARCH_ROWID_MAP.is_present(conn)? {
+        conn.execute("DELETE FROM event_search_rowids", [])?;
+    }
     let has_event_search = table_exists(conn, "event_search")?;
     if has_event_search {
         conn.execute("DELETE FROM event_search", [])?;
@@ -4712,25 +4797,205 @@ fn rebuild_search_projection_body(conn: &Connection) -> Result<()> {
             "",
             local_preview(&record.tags.join(" "), 1024),
         ])?;
+        let search_rowid = conn.last_insert_rowid();
+        RECORD_SEARCH_ROWID_MAP.store_entry(conn, &record.id.to_string(), search_rowid)?;
     }
 
     Ok(())
 }
 
+/// Maintenance contract for one durable FTS rowid map (fork schema v1000).
+///
+/// Exact invariants, in force for every write path that touches a search
+/// projection:
+///
+/// - **Caches only.** Query and search code never reads the maps; no search
+///   result ever depends on their contents. Dropping or corrupting a map
+///   changes write-path cost, never output.
+/// - **Same-transaction maintenance.** A map entry is written inside the
+///   same write transaction as the FTS row whose freshly SQLite-assigned
+///   rowid (captured from `last_insert_rowid()` immediately after the FTS
+///   INSERT) it stores, and only after all previous projection rows for
+///   that id were removed — by a verified point delete or by the legacy
+///   full-scan delete-all. Within supported writer history — every writer
+///   since v1000 maintains the maps, and older binaries refuse to newly
+///   open the schema — a verified map entry therefore implies exactly one
+///   projection row for its id. This scoping matters: a pre-upgrade
+///   process that opened the store before the migration ran can keep
+///   writing until it restarts, and external SQL writers are never
+///   blocked. Such unsupported writes cannot make a point delete remove
+///   another id's row (verification matches the id first), but they can
+///   leave duplicate or orphaned projection rows that the maps do not
+///   know about; a given id's duplicates collapse on its next healed
+///   write, and orphans disappear only on a full projection rebuild (the
+///   search-index rebuild that `ctx import` performs when required, or
+///   the index reset documented in docs/storage.md). Search reads the FTS
+///   tables directly and never trusts the maps, so such rows can at worst
+///   surface as extra hits, never as wrong deletions.
+/// - **Verify before point delete.** A mapped rowid is trusted only after
+///   re-reading the FTS id column at that rowid and matching it against the
+///   entity id. Missing, stale, or mismatched entries fall back to the
+///   legacy full-scan delete (which also collapses legacy duplicate rows)
+///   and self-heal when the row is reinserted.
+/// - **Never inferred.** Mapped rowids are stored explicitly; they are
+///   never derived from base-table rowids or insertion counting. FTS5
+///   content rowids survive VACUUM, so external VACUUM cannot invalidate
+///   entries.
+/// - **Blank previews.** An event whose preview is blank has neither an FTS
+///   row nor a map entry.
+/// - **Degrade, never fail.** A missing map table turns writes into the
+///   legacy full-scan path without error; `Store::migrate` recreates
+///   missing map tables empty on open, and `rebuild_search_projection`
+///   clears and repopulates maps in lockstep with the projections.
+struct SearchRowidMapSpec {
+    map_table: &'static str,
+    lookup_sql: &'static str,
+    store_sql: &'static str,
+    remove_sql: &'static str,
+    verify_sql: &'static str,
+    point_delete_sql: &'static str,
+    full_scan_delete_sql: &'static str,
+}
+
+const RECORD_SEARCH_ROWID_MAP: SearchRowidMapSpec = SearchRowidMapSpec {
+    map_table: "record_search_rowids",
+    lookup_sql: "SELECT search_rowid FROM record_search_rowids WHERE record_id = ?1",
+    // OR REPLACE also evicts a stale entry from another id that still
+    // claims this UNIQUE search_rowid: the rowid was just assigned by the
+    // FTS insert, so any other claim is necessarily stale and the evicted
+    // id simply heals on its own next write.
+    store_sql:
+        "INSERT OR REPLACE INTO record_search_rowids (record_id, search_rowid) VALUES (?1, ?2)",
+    remove_sql: "DELETE FROM record_search_rowids WHERE record_id = ?1",
+    verify_sql: "SELECT record_id FROM ctx_history_search WHERE rowid = ?1",
+    point_delete_sql: "DELETE FROM ctx_history_search WHERE rowid = ?1",
+    full_scan_delete_sql: "DELETE FROM ctx_history_search WHERE record_id = ?1",
+};
+
+const EVENT_SEARCH_ROWID_MAP: SearchRowidMapSpec = SearchRowidMapSpec {
+    map_table: "event_search_rowids",
+    lookup_sql: "SELECT search_rowid FROM event_search_rowids WHERE event_id = ?1",
+    store_sql:
+        "INSERT OR REPLACE INTO event_search_rowids (event_id, search_rowid) VALUES (?1, ?2)",
+    remove_sql: "DELETE FROM event_search_rowids WHERE event_id = ?1",
+    verify_sql: "SELECT event_id FROM event_search WHERE rowid = ?1",
+    point_delete_sql: "DELETE FROM event_search WHERE rowid = ?1",
+    full_scan_delete_sql: "DELETE FROM event_search WHERE event_id = ?1",
+};
+
+impl SearchRowidMapSpec {
+    /// Existence probe for the map table, used by the rebuild path (once
+    /// per rebuild). Per-row write paths avoid this probe: they attempt the
+    /// map statement directly and treat a missing table as a degrade signal
+    /// via [`Self::is_missing_map_table_error`].
+    fn is_present(&self, conn: &Connection) -> Result<bool> {
+        Ok(conn
+            .prepare_cached("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1")?
+            .query_row(params![self.map_table], |_| Ok(()))
+            .optional()?
+            .is_some())
+    }
+
+    /// True when `err` is SQLite's "no such table" for this map table,
+    /// i.e. the map has been dropped externally. Write paths degrade to the
+    /// legacy full-scan behavior instead of failing (mirroring the
+    /// `is_missing_fts_module` tolerance for the FTS tables themselves);
+    /// `Store::migrate` recreates the table empty on the next open.
+    fn is_missing_map_table_error(&self, err: &rusqlite::Error) -> bool {
+        matches!(
+            err,
+            rusqlite::Error::SqliteFailure(error, Some(message))
+                if error.extended_code == rusqlite::ffi::SQLITE_ERROR
+                    && *message == format!("no such table: {}", self.map_table)
+        )
+    }
+
+    /// Records `search_rowid` as the projection rowid for `id`. Callers
+    /// must pass the value of `conn.last_insert_rowid()` captured
+    /// immediately after the FTS INSERT, inside the same transaction. A
+    /// missing map table is a silent no-op.
+    fn store_entry(&self, conn: &Connection, id: &str, search_rowid: i64) -> Result<()> {
+        let result = conn
+            .prepare_cached(self.store_sql)
+            .and_then(|mut stmt| stmt.execute(params![id, search_rowid]));
+        match result {
+            Ok(_) => Ok(()),
+            Err(err) if self.is_missing_map_table_error(&err) => Ok(()),
+            Err(err) => Err(StoreError::Sql(err)),
+        }
+    }
+
+    /// Removes the map entry for `id`. A missing map table is a silent
+    /// no-op.
+    fn remove_entry(&self, conn: &Connection, id: &str) -> Result<()> {
+        let result = conn
+            .prepare_cached(self.remove_sql)
+            .and_then(|mut stmt| stmt.execute(params![id]));
+        match result {
+            Ok(_) => Ok(()),
+            Err(err) if self.is_missing_map_table_error(&err) => Ok(()),
+            Err(err) => Err(StoreError::Sql(err)),
+        }
+    }
+
+    /// Mapped rowid for `id`, if any. A missing map table reads as "no
+    /// entry", which sends callers down the legacy full-scan path.
+    fn mapped_rowid(&self, conn: &Connection, id: &str) -> Result<Option<i64>> {
+        let result = conn
+            .prepare_cached(self.lookup_sql)
+            .and_then(|mut stmt| stmt.query_row(params![id], |row| row.get(0)).optional());
+        match result {
+            Ok(rowid) => Ok(rowid),
+            Err(err) if self.is_missing_map_table_error(&err) => Ok(None),
+            Err(err) => Err(StoreError::Sql(err)),
+        }
+    }
+
+    /// Point lookup of the FTS id column at `search_rowid`. A map entry is
+    /// used for deletion only when this returns true.
+    fn fts_row_holds_id(&self, conn: &Connection, search_rowid: i64, id: &str) -> Result<bool> {
+        let found: Option<Option<String>> = conn
+            .prepare_cached(self.verify_sql)?
+            .query_row(params![search_rowid], |row| row.get(0))
+            .optional()?;
+        Ok(matches!(found, Some(Some(existing)) if existing == id))
+    }
+
+    /// Removes every projection row for `id` plus its map entry. A verified
+    /// map hit is one rowid point delete (constant work regardless of index
+    /// size); anything else — no map table, no entry, stale or hijacked
+    /// entry — falls back to the legacy full-scan DELETE on the UNINDEXED
+    /// id column, which also removes legacy duplicate rows. The caller's
+    /// reinsert then re-maps the id (self-healing).
+    fn delete_projection_rows(&self, conn: &Connection, id: &str) -> Result<()> {
+        if let Some(search_rowid) = self.mapped_rowid(conn, id)? {
+            if self.fts_row_holds_id(conn, search_rowid, id)? {
+                conn.prepare_cached(self.point_delete_sql)?
+                    .execute(params![search_rowid])?;
+                self.remove_entry(conn, id)?;
+                return Ok(());
+            }
+        }
+        self.remove_entry(conn, id)?;
+        conn.prepare_cached(self.full_scan_delete_sql)?
+            .execute(params![id])?;
+        Ok(())
+    }
+}
+
 /// Delete-then-insert projection maintenance for a history record that may
-/// already be projected. `record_id` is an UNINDEXED FTS5 column, so the
-/// DELETE cannot use an index: SQLite scans the entire projection to find
-/// the old row, making this O(index size) per call. Write paths that can
-/// prove the base row is newly inserted must call
-/// [`insert_record_search_projection`] instead and skip that scan.
+/// already be projected. The delete goes through
+/// [`SearchRowidMapSpec::delete_projection_rows`]: a verified rowid-map hit
+/// is a point delete, and only unmapped or unverifiable ids pay the legacy
+/// O(index size) full scan (once — the reinsert re-maps them). Write paths
+/// that can prove the base row is newly inserted call
+/// [`insert_record_search_projection`] instead and skip the delete
+/// entirely.
 fn upsert_record_search_projection(conn: &Connection, record: &HistoryRecord) -> Result<()> {
     if !table_exists(conn, "ctx_history_search")? {
         return Ok(());
     }
-    conn.execute(
-        "DELETE FROM ctx_history_search WHERE record_id = ?1",
-        params![record.id.to_string()],
-    )?;
+    RECORD_SEARCH_ROWID_MAP.delete_projection_rows(conn, &record.id.to_string())?;
     insert_record_search_projection(conn, record)
 }
 
@@ -4739,7 +5004,9 @@ fn upsert_record_search_projection(conn: &Connection, record: &HistoryRecord) ->
 /// Novelty must be proven against the base table in the same transaction —
 /// a successful plain `INSERT` on the primary key, or an indexed
 /// pre-existence probe — never assumed from UUID uniqueness. Callers are
-/// responsible for wrapping base write + projection write atomically.
+/// responsible for wrapping base write + projection write atomically. The
+/// SQLite-assigned FTS rowid is captured immediately and stored in the
+/// rowid map so later updates become point operations.
 fn insert_record_search_projection(conn: &Connection, record: &HistoryRecord) -> Result<()> {
     if !table_exists(conn, "ctx_history_search")? {
         return Ok(());
@@ -4759,6 +5026,8 @@ fn insert_record_search_projection(conn: &Connection, record: &HistoryRecord) ->
         "",
         local_preview(&record.tags.join(" "), 1024),
     ])?;
+    let search_rowid = conn.last_insert_rowid();
+    RECORD_SEARCH_ROWID_MAP.store_entry(conn, &record.id.to_string(), search_rowid)?;
     Ok(())
 }
 
@@ -4888,6 +5157,8 @@ fn populate_event_search_projection(conn: &Connection) -> Result<()> {
             preview,
             event_type
         ])?;
+        let search_rowid = conn.last_insert_rowid();
+        EVENT_SEARCH_ROWID_MAP.store_entry(conn, &event_id, search_rowid)?;
     }
     Ok(())
 }
@@ -4898,10 +5169,12 @@ fn insert_event_search_projection_for_event(conn: &Connection, event: &Event) ->
 
 /// Delete-then-insert projection maintenance for an event that may already
 /// be projected (including removing the row entirely when the new preview
-/// is blank). `event_id` is an UNINDEXED FTS5 column, so the DELETE scans
-/// the whole projection — O(index size) per call. Write paths that can
-/// prove the event id is new must call
-/// [`insert_event_search_projection_for_event_id`] instead.
+/// is blank — a blank preview leaves neither an FTS row nor a map entry).
+/// The delete goes through [`SearchRowidMapSpec::delete_projection_rows`]:
+/// a verified rowid-map hit is a point delete, and only unmapped or
+/// unverifiable ids pay the legacy O(index size) full scan (once — the
+/// reinsert re-maps them). Write paths that can prove the event id is new
+/// call [`insert_event_search_projection_for_event_id`] instead.
 fn upsert_event_search_projection_for_event(
     conn: &Connection,
     event_id: Uuid,
@@ -4910,10 +5183,7 @@ fn upsert_event_search_projection_for_event(
     if !table_exists(conn, "event_search")? {
         return Ok(());
     }
-    conn.execute(
-        "DELETE FROM event_search WHERE event_id = ?1",
-        params![event_id.to_string()],
-    )?;
+    EVENT_SEARCH_ROWID_MAP.delete_projection_rows(conn, &event_id.to_string())?;
     insert_event_search_projection_for_event_id(conn, event_id, event)
 }
 
@@ -4944,6 +5214,8 @@ fn insert_event_search_projection_for_event_id(
         preview,
         event.event_type.as_str(),
     ])?;
+    let search_rowid = conn.last_insert_rowid();
+    EVENT_SEARCH_ROWID_MAP.store_entry(conn, &event_id.to_string(), search_rowid)?;
     Ok(())
 }
 
@@ -5492,6 +5764,43 @@ fn migrate_to_v15(conn: &Connection) -> Result<()> {
             }
             if foreign_keys_enabled != 0 {
                 conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+            }
+            Err(err)
+        }
+    }
+}
+
+/// First fork schema divergence: v15 → v1000 (upstream chain ends at v15;
+/// fork versions start at 1000 per docs/fork-plan.md decision 9).
+///
+/// Creates the persistent FTS rowid map tables and nothing else. There is
+/// deliberately no FTS rebuild and no map backfill: existing search
+/// projections stay byte-for-byte intact (rowids included) and the maps
+/// start empty. Every map entry is created lazily by the first
+/// post-migration write that touches its row — the legacy full-scan delete
+/// runs once per updated row, then the stored rowid makes later updates
+/// point operations. Rolling back to an older binary is not supported once
+/// a store reaches v1000 (older binaries refuse to open the version); the
+/// data itself is unchanged by this migration, so unsupported external
+/// recovery is possible by dropping the two map tables and resetting
+/// `PRAGMA user_version` to 15 in one transaction (exact steps in
+/// docs/storage.md), or by rebuilding the index from provider history.
+fn migrate_to_v1000(conn: &Connection) -> Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let migration = (|| -> Result<()> {
+        conn.execute_batch(SEARCH_ROWID_MAP_TABLES_SQL)?;
+        conn.execute_batch("PRAGMA user_version = 1000;")?;
+        Ok(())
+    })();
+
+    match migration {
+        Ok(()) => {
+            conn.execute_batch("COMMIT;")?;
+            Ok(())
+        }
+        Err(err) => {
+            if let Err(rollback_err) = conn.execute_batch("ROLLBACK;") {
+                return Err(StoreError::Sql(rollback_err));
             }
             Err(err)
         }
@@ -10783,13 +11092,15 @@ mod projection_write_path_tests {
     }
 
     /// Deterministic bounded-work evidence for #186: writing provably new
-    /// records must not pay the O(index size) full-scan FTS DELETE, so the
-    /// VDBE opcode count of every fresh-row write path stays flat between a
-    /// small and a 20x larger index. Updates of existing rows intentionally
-    /// keep the scan (asserted relationally below, not as an exact bound).
+    /// records must not pay the O(index size) full-scan FTS DELETE, and —
+    /// with the v1000 rowid maps — neither must updates of already-mapped
+    /// ids, so the VDBE opcode count of those paths stays flat between a
+    /// small and a 20x larger index. Only the one-time healing update of an
+    /// unmapped (legacy) id still scans, and its immediate successor is
+    /// bounded again.
     #[test]
     fn fresh_record_write_work_stays_bounded_as_index_grows() {
-        fn ops_at(size: u64) -> (usize, usize, usize, usize) {
+        fn ops_at(size: u64) -> (usize, usize, usize, usize, usize, usize) {
             let temp = tempdir();
             let store = populated_record_store(&temp, size);
 
@@ -10809,15 +11120,46 @@ mod projection_write_path_tests {
             let batch_ops = vdbe_ops(&store, || {
                 store.upsert_records(&batch).unwrap();
             });
-            let existing = record_with(batch[0].id, "updated existing body");
-            let update_ops = vdbe_ops(&store, || {
-                store.upsert_record(&existing).unwrap();
+            // Map hit: seeding populated the rowid map, so the existing-id
+            // update point-deletes its projection row.
+            let map_hit_ops = vdbe_ops(&store, || {
+                store
+                    .upsert_record(&record_with(batch[0].id, "map-hit update body"))
+                    .unwrap();
             });
-            (insert_ops, upsert_ops, batch_ops, update_ops)
+            // Legacy shape: a v15→v1000 migrated store has projections but
+            // an empty map, so the first update per id heals via the
+            // full-scan delete...
+            store
+                .conn
+                .execute("DELETE FROM record_search_rowids", [])
+                .unwrap();
+            let heal_ops = vdbe_ops(&store, || {
+                store
+                    .upsert_record(&record_with(batch[0].id, "healing update body"))
+                    .unwrap();
+            });
+            // ...and the heal stored the fresh rowid, so the next update of
+            // the same id is bounded again.
+            let remapped_ops = vdbe_ops(&store, || {
+                store
+                    .upsert_record(&record_with(batch[0].id, "remapped update body"))
+                    .unwrap();
+            });
+            (
+                insert_ops,
+                upsert_ops,
+                batch_ops,
+                map_hit_ops,
+                heal_ops,
+                remapped_ops,
+            )
         }
 
-        let (small_insert, small_upsert, small_batch, _) = ops_at(30);
-        let (large_insert, large_upsert, large_batch, large_update) = ops_at(600);
+        let (small_insert, small_upsert, small_batch, small_map_hit, small_heal, small_remapped) =
+            ops_at(30);
+        let (large_insert, large_upsert, large_batch, large_map_hit, large_heal, large_remapped) =
+            ops_at(600);
 
         let slack = 32;
         assert!(
@@ -10832,20 +11174,35 @@ mod projection_write_path_tests {
             large_batch <= small_batch + slack,
             "upsert_records (all new ids) work scaled with index size: {small_batch} ops at 30 records vs {large_batch} ops at 600"
         );
-        // The existing-row arm still walks the projection (documented #186
-        // caveat): it must dominate the bounded fresh-row path at scale.
         assert!(
-            large_update > large_upsert + 600,
-            "existing-id upsert unexpectedly stopped scanning the projection: {large_update} ops vs fresh {large_upsert}"
+            large_map_hit <= small_map_hit + slack,
+            "map-hit existing-id upsert work scaled with index size: {small_map_hit} ops at 30 records vs {large_map_hit} ops at 600"
+        );
+        assert!(
+            large_remapped <= small_remapped + slack,
+            "post-heal existing-id upsert work scaled with index size: {small_remapped} ops at 30 records vs {large_remapped} ops at 600"
+        );
+        // The unmapped (legacy) arm still walks the projection exactly once
+        // per id: it must scale with the index and dominate the mapped arm
+        // at size, while the small-index heal stays in the same regime as
+        // the mapped path.
+        assert!(
+            large_heal > small_heal + 600,
+            "healing update unexpectedly stopped scanning the projection: {small_heal} ops at 30 records vs {large_heal} ops at 600"
+        );
+        assert!(
+            large_heal > large_map_hit + 600,
+            "healing update should dominate the mapped update at scale: heal {large_heal} ops vs mapped {large_map_hit}"
         );
     }
 
     /// Event-side twin of the record bound: fresh event ids through both
     /// upsert_event and insert_event_if_absent stay flat as event_search
-    /// grows; only existing ids pay the delete scan.
+    /// grows, mapped existing-id updates stay flat too, and only the
+    /// one-time heal of an unmapped (legacy) id pays the delete scan.
     #[test]
     fn fresh_event_write_work_stays_bounded_as_index_grows() {
-        fn ops_at(size: u64) -> (usize, usize, usize) {
+        fn ops_at(size: u64) -> (usize, usize, usize, usize, usize) {
             let temp = tempdir();
             let store = populated_event_store(&temp, size);
 
@@ -10864,16 +11221,30 @@ mod projection_write_path_tests {
                     ))
                     .unwrap());
             });
-            let update_ops = vdbe_ops(&store, || {
+            let map_hit_ops = vdbe_ops(&store, || {
                 store
-                    .upsert_event(&text_event(upsert_id, size + 1, "updated existing event"))
+                    .upsert_event(&text_event(upsert_id, size + 1, "map-hit updated event"))
                     .unwrap();
             });
-            (upsert_ops, insert_ops, update_ops)
+            store
+                .conn
+                .execute("DELETE FROM event_search_rowids", [])
+                .unwrap();
+            let heal_ops = vdbe_ops(&store, || {
+                store
+                    .upsert_event(&text_event(upsert_id, size + 1, "healing updated event"))
+                    .unwrap();
+            });
+            let remapped_ops = vdbe_ops(&store, || {
+                store
+                    .upsert_event(&text_event(upsert_id, size + 1, "remapped updated event"))
+                    .unwrap();
+            });
+            (upsert_ops, insert_ops, map_hit_ops, heal_ops, remapped_ops)
         }
 
-        let (small_upsert, small_insert, _) = ops_at(30);
-        let (large_upsert, large_insert, large_update) = ops_at(600);
+        let (small_upsert, small_insert, small_map_hit, small_heal, small_remapped) = ops_at(30);
+        let (large_upsert, large_insert, large_map_hit, large_heal, large_remapped) = ops_at(600);
 
         let slack = 32;
         assert!(
@@ -10885,8 +11256,20 @@ mod projection_write_path_tests {
             "insert_event_if_absent work scaled with index size: {small_insert} ops at 30 events vs {large_insert} ops at 600"
         );
         assert!(
-            large_update > large_upsert + 600,
-            "existing-id upsert_event unexpectedly stopped scanning the projection: {large_update} ops vs fresh {large_upsert}"
+            large_map_hit <= small_map_hit + slack,
+            "map-hit existing-id upsert_event work scaled with index size: {small_map_hit} ops at 30 events vs {large_map_hit} ops at 600"
+        );
+        assert!(
+            large_remapped <= small_remapped + slack,
+            "post-heal existing-id upsert_event work scaled with index size: {small_remapped} ops at 30 events vs {large_remapped} ops at 600"
+        );
+        assert!(
+            large_heal > small_heal + 600,
+            "healing upsert_event unexpectedly stopped scanning the projection: {small_heal} ops at 30 events vs {large_heal} ops at 600"
+        );
+        assert!(
+            large_heal > large_map_hit + 600,
+            "healing upsert_event should dominate the mapped update at scale: heal {large_heal} ops vs mapped {large_map_hit}"
         );
     }
 
@@ -11262,6 +11645,1008 @@ mod projection_write_path_tests {
     }
 }
 
+#[cfg(test)]
+mod search_rowid_map_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use super::*;
+
+    fn tempdir() -> tempfile::TempDir {
+        let root = std::env::current_dir().unwrap().join("target/test-data");
+        fs::create_dir_all(&root).unwrap();
+        tempfile::Builder::new()
+            .prefix("ctx-history-store-rowid-map-")
+            .tempdir_in(root)
+            .unwrap()
+    }
+
+    fn fixed_time() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-06-23T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn sync_metadata() -> SyncMetadata {
+        SyncMetadata {
+            visibility: Visibility::LocalOnly,
+            fidelity: Fidelity::Imported,
+            sync_state: SyncState::LocalOnly,
+            sync_version: 0,
+            deleted_at: None,
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    fn record_with(id: Uuid, body: &str) -> HistoryRecord {
+        let mut record = HistoryRecord::new(
+            "Rowid map record title",
+            body,
+            vec!["rowidmap".into()],
+            "task",
+            None,
+        );
+        record.id = id;
+        record.created_at = fixed_time();
+        record.updated_at = fixed_time();
+        record
+    }
+
+    fn event_with(id: Uuid, seq: u64, payload: serde_json::Value) -> Event {
+        Event {
+            id,
+            seq,
+            history_record_id: None,
+            session_id: None,
+            run_id: None,
+            event_type: EventType::Message,
+            role: Some(EventRole::User),
+            occurred_at: fixed_time(),
+            capture_source_id: None,
+            payload,
+            payload_blob_id: None,
+            dedupe_key: None,
+            redaction_state: RedactionState::SafePreview,
+            sync: sync_metadata(),
+        }
+    }
+
+    fn text_event(id: Uuid, seq: u64, text: &str) -> Event {
+        event_with(id, seq, serde_json::json!({ "text": text }))
+    }
+
+    fn blank_event(id: Uuid, seq: u64) -> Event {
+        event_with(id, seq, serde_json::json!(""))
+    }
+
+    fn count(store: &Store, sql: &str) -> i64 {
+        store.conn.query_row(sql, [], |row| row.get(0)).unwrap()
+    }
+
+    fn user_version(store: &Store) -> i64 {
+        store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn map_rows(store: &Store, map_table: &str) -> Vec<(String, i64)> {
+        let sql = format!("SELECT * FROM {map_table} ORDER BY search_rowid");
+        let mut stmt = store.conn.prepare(&sql).unwrap();
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap();
+        rows.map(|row| row.unwrap()).collect()
+    }
+
+    fn fts_rows(store: &Store, fts_table: &str, id_column: &str) -> Vec<(String, i64)> {
+        let sql = format!("SELECT {id_column}, rowid FROM {fts_table} ORDER BY rowid");
+        let mut stmt = store.conn.prepare(&sql).unwrap();
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap();
+        rows.map(|row| row.unwrap()).collect()
+    }
+
+    /// Exact map <-> FTS identity in both directions: every projection row
+    /// has a map entry with the same id and rowid, and every map entry
+    /// points at a projection row holding its id.
+    fn assert_map_fts_identity(store: &Store) {
+        for (fts_table, id_column, map_table) in [
+            ("ctx_history_search", "record_id", "record_search_rowids"),
+            ("event_search", "event_id", "event_search_rowids"),
+        ] {
+            let unmapped: i64 = store
+                .conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM {fts_table} f
+                         LEFT JOIN {map_table} m
+                           ON m.{id_column} = f.{id_column} AND m.search_rowid = f.rowid
+                         WHERE m.{id_column} IS NULL"
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(unmapped, 0, "{fts_table} rows without exact map entries");
+            let dangling: i64 = store
+                .conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM {map_table} m
+                         LEFT JOIN {fts_table} f ON f.rowid = m.search_rowid
+                         WHERE f.{id_column} IS NULL OR f.{id_column} != m.{id_column}"
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                dangling, 0,
+                "{map_table} entries not backed by {fts_table} rows"
+            );
+        }
+    }
+
+    /// Counts VDBE operations for `work` (same technique as
+    /// projection_write_path_tests::vdbe_ops).
+    fn vdbe_ops(store: &Store, work: impl FnOnce()) -> usize {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let handler_counter = Arc::clone(&counter);
+        store.conn.progress_handler(
+            1,
+            Some(move || {
+                handler_counter.fetch_add(1, Ordering::Relaxed);
+                false
+            }),
+        );
+        work();
+        store.conn.progress_handler(0, None::<fn() -> bool>);
+        counter.load(Ordering::Relaxed)
+    }
+
+    /// Builds a database exactly as an upstream-chain v15 binary leaves it:
+    /// base rows present, FTS projections populated at explicit rowids
+    /// (listing an id twice models legacy duplicate projection rows), no map
+    /// tables, `user_version` 15.
+    fn build_v15_database(
+        path: &Path,
+        record_rows: &[(Uuid, i64, &str)],
+        event_rows: &[(Uuid, i64, u64, &str)],
+    ) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(CREATE_TABLES_SQL).unwrap();
+        conn.execute_batch(FTS_TABLES_SQL).unwrap();
+        conn.execute_batch(INDEXES_SQL).unwrap();
+        for (id, fts_rowid, projected_text) in record_rows {
+            conn.execute(
+                "INSERT OR IGNORE INTO history_records
+                 (id, title, last_activity_at_ms, body, created_at, updated_at)
+                 VALUES (?1, 'Legacy record title', 0, ?2, '2026-06-23T12:00:00+00:00', '2026-06-23T12:00:00+00:00')",
+                params![id.to_string(), format!("legacy base body for {projected_text}")],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO ctx_history_search
+                 (rowid, record_id, title, summary, primary_user_text, decision_text, context_text, tag_text)
+                 VALUES (?1, ?2, 'Legacy record title', ?3, ?3, '', '', '')",
+                params![fts_rowid, id.to_string(), projected_text],
+            )
+            .unwrap();
+        }
+        for (id, fts_rowid, seq, projected_text) in event_rows {
+            conn.execute(
+                "INSERT OR IGNORE INTO events (id, seq, event_type, role, occurred_at_ms, payload_json)
+                 VALUES (?1, ?2, 'message', 'user', 0, ?3)",
+                params![
+                    id.to_string(),
+                    *seq as i64,
+                    serde_json::json!({ "text": projected_text }).to_string()
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO event_search
+                 (rowid, event_id, history_record_id, session_id, role, safe_preview_text, rank_bucket)
+                 VALUES (?1, ?2, NULL, NULL, 'user', ?3, 'message')",
+                params![fts_rowid, id.to_string(), projected_text],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("PRAGMA user_version = 15;").unwrap();
+    }
+
+    #[test]
+    fn schema_v15_to_v1000_preserves_projections_and_creates_empty_maps() {
+        let temp = tempdir();
+        let path = temp.path().join("work.sqlite");
+        let record_a = new_id();
+        let record_b = new_id();
+        let event_e = new_id();
+        build_v15_database(
+            &path,
+            &[
+                (record_a, 10, "legacy alpha projection"),
+                (record_b, 20, "legacy bravo projection"),
+            ],
+            &[(event_e, 30, 1, "legacy charlie event")],
+        );
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(user_version(&store), 1000);
+        assert_eq!(user_version(&store), SCHEMA_VERSION);
+
+        // The maps exist and start empty: no backfill.
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM record_search_rowids"),
+            0
+        );
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM event_search_rowids"), 0);
+
+        // No forced rebuild: the legacy projection rows survive at their
+        // original explicit rowids with their original text (a rebuild
+        // would renumber them 1..N and re-derive text from base rows).
+        assert_eq!(
+            fts_rows(&store, "ctx_history_search", "record_id"),
+            vec![(record_a.to_string(), 10), (record_b.to_string(), 20)]
+        );
+        assert_eq!(
+            fts_rows(&store, "event_search", "event_id"),
+            vec![(event_e.to_string(), 30)]
+        );
+        let projected: String = store
+            .conn
+            .query_row(
+                "SELECT summary FROM ctx_history_search WHERE rowid = 10",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(projected, "legacy alpha projection");
+
+        // Search serves the intact legacy projections.
+        assert_eq!(store.search_records("alpha", 10).unwrap()[0].id, record_a);
+        assert_eq!(
+            store.search_event_hits("charlie", 10).unwrap()[0].event_id,
+            event_e
+        );
+    }
+
+    #[test]
+    fn fresh_database_reaches_v1000_through_the_upstream_chain() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        assert_eq!(user_version(&store), SCHEMA_VERSION);
+        assert_eq!(user_version(&store), 1000);
+        // The upstream chain ran first: its v13+ stable views exist.
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'view' AND name = 'ctx_sessions'"
+            ),
+            1
+        );
+        for map_table in ["record_search_rowids", "event_search_rowids"] {
+            assert!(table_exists(&store.conn, map_table).unwrap());
+        }
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM record_search_rowids"),
+            0
+        );
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM event_search_rowids"), 0);
+    }
+
+    #[test]
+    fn non_current_schema_versions_are_rejected_explicitly() {
+        let temp = tempdir();
+
+        // Read-only open requires the exact current version: a v15 store
+        // must be migrated by a writable open first.
+        let v15_path = temp.path().join("v15.sqlite");
+        build_v15_database(&v15_path, &[(new_id(), 1, "legacy row")], &[]);
+        assert!(matches!(
+            Store::open_read_only(&v15_path),
+            Err(StoreError::UnsupportedSchemaVersion(15))
+        ));
+
+        // A current store opens read-only.
+        let current_path = temp.path().join("current.sqlite");
+        drop(Store::open(&current_path).unwrap());
+        drop(Store::open_read_only(&current_path).unwrap());
+
+        // Versions newer than this binary are refused in both modes: this
+        // is exactly how a v1000 store looks to an older (<= v15) binary.
+        let future_path = temp.path().join("future.sqlite");
+        drop(Store::open(&future_path).unwrap());
+        Connection::open(&future_path)
+            .unwrap()
+            .execute_batch("PRAGMA user_version = 1001;")
+            .unwrap();
+        assert!(matches!(
+            Store::open(&future_path),
+            Err(StoreError::UnsupportedSchemaVersion(1001))
+        ));
+        assert!(matches!(
+            Store::open_read_only(&future_path),
+            Err(StoreError::UnsupportedSchemaVersion(1001))
+        ));
+
+        // Versions in the (15, 1000) gap could only come from an unreviewed
+        // newer upstream chain; they are rejected instead of migrated blind.
+        let gap_path = temp.path().join("gap.sqlite");
+        build_v15_database(&gap_path, &[], &[]);
+        Connection::open(&gap_path)
+            .unwrap()
+            .execute_batch("PRAGMA user_version = 16;")
+            .unwrap();
+        assert!(matches!(
+            Store::open(&gap_path),
+            Err(StoreError::UnsupportedSchemaVersion(16))
+        ));
+        assert!(matches!(
+            Store::open_read_only(&gap_path),
+            Err(StoreError::UnsupportedSchemaVersion(16))
+        ));
+    }
+
+    #[test]
+    fn rejected_foreign_schemas_leave_the_database_file_untouched() {
+        let temp = tempdir();
+        // One gap version (unreviewed upstream chain) and one future
+        // version, both in SQLite's default rollback-journal mode: any
+        // persistent PRAGMA (journal_mode = WAL) applied before the version
+        // gate would show up as mutated bytes, a changed journal mode, or
+        // WAL sidecar files.
+        for version in [16i64, 999, 1001] {
+            let path = temp.path().join(format!("foreign-{version}.sqlite"));
+            {
+                let conn = Connection::open(&path).unwrap();
+                conn.execute_batch(
+                    "CREATE TABLE foreign_marker (id INTEGER PRIMARY KEY, note TEXT);",
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO foreign_marker (note) VALUES ('foreign row')",
+                    [],
+                )
+                .unwrap();
+                conn.execute_batch(&format!("PRAGMA user_version = {version};"))
+                    .unwrap();
+            }
+            let before = fs::read(&path).unwrap();
+
+            assert!(matches!(
+                Store::open(&path),
+                Err(StoreError::UnsupportedSchemaVersion(rejected)) if rejected == version
+            ));
+            assert!(matches!(
+                Store::open_read_only(&path),
+                Err(StoreError::UnsupportedSchemaVersion(rejected)) if rejected == version
+            ));
+
+            let after = fs::read(&path).unwrap();
+            assert_eq!(
+                before, after,
+                "rejected open mutated the database file for version {version}"
+            );
+            let mut wal_path = path.clone().into_os_string();
+            wal_path.push("-wal");
+            assert!(
+                !PathBuf::from(wal_path).exists(),
+                "rejected open created a WAL sidecar for version {version}"
+            );
+
+            let conn = Connection::open(&path).unwrap();
+            let journal_mode: String = conn
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                journal_mode, "delete",
+                "rejected open persisted a journal-mode change for version {version}"
+            );
+            let user_version: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(user_version, version);
+            let schema_objects: i64 = conn
+                .query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                schema_objects, 1,
+                "rejected open changed the schema for version {version}"
+            );
+        }
+    }
+
+    /// Mirrors the unsupported external downgrade recipe documented in
+    /// docs/storage.md: dropping both map tables and resetting
+    /// `user_version` to 15 in one transaction yields a store the upstream
+    /// v15 chain owns again (this binary's own read-only gate confirms it
+    /// reads as exactly v15), with all base and FTS data intact, and a
+    /// later writable open by this binary re-migrates it cleanly.
+    #[test]
+    fn documented_downgrade_steps_restore_a_v15_shaped_store() {
+        let temp = tempdir();
+        let path = temp.path().join("work.sqlite");
+        let record_id = new_id();
+        let event_id = new_id();
+        {
+            let store = Store::open(&path).unwrap();
+            store
+                .insert_record(&record_with(record_id, "downgrade survivor body"))
+                .unwrap();
+            store
+                .upsert_event(&text_event(event_id, 1, "downgrade survivor event"))
+                .unwrap();
+        }
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                BEGIN IMMEDIATE;
+                DROP TABLE record_search_rowids;
+                DROP TABLE event_search_rowids;
+                PRAGMA user_version = 15;
+                COMMIT;
+                "#,
+            )
+            .unwrap();
+            let user_version: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(user_version, 15);
+            assert!(!table_exists(&conn, "record_search_rowids").unwrap());
+            assert!(!table_exists(&conn, "event_search_rowids").unwrap());
+        }
+
+        // This binary's exact-version read-only gate sees a plain v15 store.
+        assert!(matches!(
+            Store::open_read_only(&path),
+            Err(StoreError::UnsupportedSchemaVersion(15))
+        ));
+
+        // Re-upgrading runs only the v1000 step again: data intact, maps
+        // recreated empty, lazy healing resumes.
+        let store = Store::open(&path).unwrap();
+        assert_eq!(user_version(&store), 1000);
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM record_search_rowids"),
+            0
+        );
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM event_search_rowids"), 0);
+        assert_eq!(
+            store.search_records("survivor", 10).unwrap()[0].id,
+            record_id
+        );
+        assert_eq!(
+            store.search_event_hits("survivor", 10).unwrap()[0].event_id,
+            event_id
+        );
+        store
+            .upsert_record(&record_with(record_id, "post downgrade healed body"))
+            .unwrap();
+        store
+            .upsert_event(&text_event(event_id, 1, "post downgrade healed event"))
+            .unwrap();
+        assert_map_fts_identity(&store);
+    }
+
+    #[test]
+    fn every_write_path_maps_projection_rows_exactly() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+
+        store
+            .insert_record(&record_with(new_id(), "insert_record body"))
+            .unwrap();
+        store
+            .upsert_record(&record_with(new_id(), "upsert_record body"))
+            .unwrap();
+        let repeated = new_id();
+        store
+            .upsert_records(&[
+                record_with(new_id(), "batch body one"),
+                record_with(repeated, "batch repeat first"),
+                record_with(repeated, "batch repeat second"),
+            ])
+            .unwrap();
+
+        let event_id = new_id();
+        store
+            .upsert_event(&text_event(event_id, 1, "upsert_event body"))
+            .unwrap();
+        store
+            .upsert_event(&text_event(event_id, 1, "upsert_event updated body"))
+            .unwrap();
+        assert!(store
+            .insert_event_if_absent(&text_event(new_id(), 2, "insert_if_absent body"))
+            .unwrap());
+        let blank_id = new_id();
+        store.upsert_event(&blank_event(blank_id, 3)).unwrap();
+
+        // One projection row and one map entry per projected id; the blank
+        // event has neither.
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM ctx_history_search"), 4);
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM record_search_rowids"),
+            4
+        );
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM event_search"), 2);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM event_search_rowids"), 2);
+        assert!(!map_rows(&store, "event_search_rowids")
+            .iter()
+            .any(|(id, _)| id == &blank_id.to_string()));
+        assert_map_fts_identity(&store);
+
+        // The repeated batch id kept its second body.
+        assert_eq!(store.search_records("second", 10).unwrap()[0].id, repeated);
+        assert!(store.search_records("first", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn legacy_rows_heal_lazily_on_first_update() {
+        let temp = tempdir();
+        let path = temp.path().join("work.sqlite");
+        let record_a = new_id();
+        let record_b = new_id();
+        let event_e = new_id();
+        // record_a and event_e both carry legacy duplicate projection rows.
+        build_v15_database(
+            &path,
+            &[
+                (record_a, 10, "legacy alpha projection"),
+                (record_a, 11, "legacy alpha duplicate"),
+                (record_b, 20, "legacy bravo projection"),
+            ],
+            &[
+                (event_e, 30, 1, "legacy charlie event"),
+                (event_e, 31, 1, "legacy charlie duplicate"),
+            ],
+        );
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM ctx_history_search"), 3);
+
+        // First update of an unmapped id: the legacy full-scan delete
+        // removes ALL its rows (both duplicates), the reinsert re-maps it.
+        store
+            .upsert_record(&record_with(record_a, "healed alpha body"))
+            .unwrap();
+        let record_projection = fts_rows(&store, "ctx_history_search", "record_id");
+        assert_eq!(record_projection.len(), 2);
+        assert_eq!(record_projection[0], (record_b.to_string(), 20));
+        assert_eq!(record_projection[1].0, record_a.to_string());
+        assert_eq!(
+            map_rows(&store, "record_search_rowids"),
+            vec![(record_a.to_string(), record_projection[1].1)]
+        );
+
+        store
+            .upsert_event(&text_event(event_e, 1, "healed charlie event"))
+            .unwrap();
+        let event_projection = fts_rows(&store, "event_search", "event_id");
+        assert_eq!(event_projection.len(), 1);
+        assert_eq!(event_projection[0].0, event_e.to_string());
+        assert_eq!(
+            map_rows(&store, "event_search_rowids"),
+            vec![(event_e.to_string(), event_projection[0].1)]
+        );
+
+        // Untouched legacy rows stay unmapped and searchable; healed rows
+        // now satisfy exact identity for their ids.
+        assert_eq!(store.search_records("bravo", 10).unwrap()[0].id, record_b);
+        assert_eq!(store.search_records("healed", 10).unwrap()[0].id, record_a);
+        assert!(store.search_records("duplicate", 10).unwrap().is_empty());
+
+        // Second update of the healed id keeps exactly one row and an exact
+        // map (the bounded-work contract is pinned in
+        // projection_write_path_tests).
+        store
+            .upsert_record(&record_with(record_a, "healed alpha body again"))
+            .unwrap();
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM ctx_history_search WHERE record_id IN (SELECT record_id FROM record_search_rowids)"
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn stale_map_entries_fall_back_without_touching_other_rows() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let record_a = new_id();
+        let record_b = new_id();
+        store
+            .insert_record(&record_with(record_a, "alpha original body"))
+            .unwrap();
+        store
+            .insert_record(&record_with(record_b, "bravo original body"))
+            .unwrap();
+        let rowid_b: i64 = store
+            .conn
+            .query_row(
+                "SELECT search_rowid FROM record_search_rowids WHERE record_id = ?1",
+                params![record_b.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        // Corrupt the map: point record_a's entry at record_b's row.
+        store
+            .conn
+            .execute(
+                "DELETE FROM record_search_rowids WHERE record_id = ?1",
+                params![record_b.to_string()],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE record_search_rowids SET search_rowid = ?1 WHERE record_id = ?2",
+                params![rowid_b, record_a.to_string()],
+            )
+            .unwrap();
+
+        // The verified point lookup sees record_b's id at the mapped rowid,
+        // rejects the entry, and falls back to the full-scan delete for
+        // record_a only. record_b's projection row must survive untouched.
+        store
+            .upsert_record(&record_with(record_a, "alpha revised body"))
+            .unwrap();
+        let survivor: String = store
+            .conn
+            .query_row(
+                "SELECT record_id FROM ctx_history_search WHERE rowid = ?1",
+                params![rowid_b],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(survivor, record_b.to_string());
+        assert_eq!(store.search_records("bravo", 10).unwrap()[0].id, record_b);
+        assert_eq!(store.search_records("revised", 10).unwrap()[0].id, record_a);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM ctx_history_search"), 2);
+
+        // record_a self-healed to a fresh verified entry; record_b heals on
+        // its own next write.
+        let healed = map_rows(&store, "record_search_rowids");
+        assert_eq!(healed.len(), 1);
+        assert_eq!(healed[0].0, record_a.to_string());
+        assert_ne!(healed[0].1, rowid_b);
+
+        // A mapped rowid that no longer exists is equally safe.
+        store
+            .conn
+            .execute(
+                "UPDATE record_search_rowids SET search_rowid = 999999 WHERE record_id = ?1",
+                params![record_a.to_string()],
+            )
+            .unwrap();
+        store
+            .upsert_record(&record_with(record_a, "alpha third body"))
+            .unwrap();
+        assert_eq!(store.search_records("third", 10).unwrap()[0].id, record_a);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM ctx_history_search"), 2);
+        store
+            .upsert_record(&record_with(record_b, "bravo revised body"))
+            .unwrap();
+        assert_map_fts_identity(&store);
+    }
+
+    #[test]
+    fn blank_preview_transitions_keep_maps_in_lockstep() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let event_id = new_id();
+
+        // Fresh blank: neither FTS row nor map entry.
+        store.upsert_event(&blank_event(event_id, 1)).unwrap();
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM event_search"), 0);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM event_search_rowids"), 0);
+
+        // blank -> nonblank: both appear together.
+        store
+            .upsert_event(&text_event(event_id, 1, "now searchable delta"))
+            .unwrap();
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM event_search"), 1);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM event_search_rowids"), 1);
+        assert_map_fts_identity(&store);
+
+        // nonblank -> blank: both disappear together.
+        store.upsert_event(&blank_event(event_id, 1)).unwrap();
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM event_search"), 0);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM event_search_rowids"), 0);
+
+        // blank -> nonblank again: exactly one of each returns.
+        store
+            .upsert_event(&text_event(event_id, 1, "searchable echo again"))
+            .unwrap();
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM event_search"), 1);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM event_search_rowids"), 1);
+        assert_map_fts_identity(&store);
+    }
+
+    #[test]
+    fn rebuild_clears_and_repopulates_maps_in_lockstep() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        for index in 0..3 {
+            store
+                .insert_record(&record_with(new_id(), &format!("rebuild body {index}")))
+                .unwrap();
+        }
+        store
+            .upsert_event(&text_event(new_id(), 1, "rebuild event one"))
+            .unwrap();
+        store
+            .upsert_event(&text_event(new_id(), 2, "rebuild event two"))
+            .unwrap();
+        store.upsert_event(&blank_event(new_id(), 3)).unwrap();
+
+        // Scramble the maps arbitrarily; the rebuild must not trust them.
+        store
+            .conn
+            .execute(
+                "UPDATE record_search_rowids SET search_rowid = search_rowid + 700",
+                [],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute("DELETE FROM event_search_rowids", [])
+            .unwrap();
+
+        store.refresh_search_index().unwrap();
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM ctx_history_search"), 3);
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM record_search_rowids"),
+            3
+        );
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM event_search"), 2);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM event_search_rowids"), 2);
+        assert_map_fts_identity(&store);
+    }
+
+    #[test]
+    fn injected_map_failure_rolls_back_base_fts_and_maps() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let record_id = new_id();
+        store
+            .insert_record(&record_with(record_id, "original protected body"))
+            .unwrap();
+        let original_map = map_rows(&store, "record_search_rowids");
+        let original_fts = fts_rows(&store, "ctx_history_search", "record_id");
+
+        // Test-only fault injection: production code never installs
+        // triggers (projections and maps are maintained manually); this
+        // trigger only forces the map INSERT inside the write transaction
+        // to fail after base + FTS writes succeeded.
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER injected_map_failure
+                 BEFORE INSERT ON record_search_rowids
+                 BEGIN SELECT RAISE(ABORT, 'injected map failure'); END;",
+            )
+            .unwrap();
+
+        let err = store
+            .upsert_record(&record_with(record_id, "poisoned update body"))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("injected map failure"),
+            "original injected error was not preserved: {err}"
+        );
+        assert!(store.conn.is_autocommit());
+        assert_eq!(
+            store.get_record(record_id).unwrap().body,
+            "original protected body"
+        );
+        assert_eq!(map_rows(&store, "record_search_rowids"), original_map);
+        assert_eq!(
+            fts_rows(&store, "ctx_history_search", "record_id"),
+            original_fts
+        );
+        assert_map_fts_identity(&store);
+        assert_eq!(
+            store.search_records("protected", 10).unwrap()[0].id,
+            record_id
+        );
+
+        // A fresh insert rolls back base + FTS + map together too.
+        let fresh = record_with(new_id(), "poisoned fresh body");
+        assert!(store.insert_record(&fresh).is_err());
+        assert!(matches!(
+            store.get_record(fresh.id).unwrap_err(),
+            StoreError::NotFound(_)
+        ));
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM ctx_history_search"), 1);
+
+        store
+            .conn
+            .execute_batch("DROP TRIGGER injected_map_failure;")
+            .unwrap();
+        store
+            .upsert_record(&record_with(record_id, "recovered update body"))
+            .unwrap();
+        assert_map_fts_identity(&store);
+        assert_eq!(
+            store.search_records("recovered", 10).unwrap()[0].id,
+            record_id
+        );
+    }
+
+    #[test]
+    fn search_output_is_independent_of_maps() {
+        let temp = tempdir();
+        let path = temp.path().join("work.sqlite");
+        let store = Store::open(&path).unwrap();
+        let record_a = new_id();
+        let record_b = new_id();
+        store
+            .insert_record(&record_with(record_a, "alpha needle body"))
+            .unwrap();
+        store
+            .insert_record(&record_with(record_b, "bravo needle body"))
+            .unwrap();
+        store
+            .upsert_event(&text_event(new_id(), 1, "event needle one"))
+            .unwrap();
+        store
+            .upsert_event(&text_event(new_id(), 2, "event needle two"))
+            .unwrap();
+
+        let baseline_records: Vec<Uuid> = store
+            .search_records("needle", 10)
+            .unwrap()
+            .iter()
+            .map(|record| record.id)
+            .collect();
+        let baseline_events: Vec<Uuid> = store
+            .search_event_hits("needle", 10)
+            .unwrap()
+            .iter()
+            .map(|hit| hit.event_id)
+            .collect();
+        assert_eq!(baseline_records.len(), 2);
+        assert_eq!(baseline_events.len(), 2);
+
+        // Corrupt every map entry: search output must not change, because
+        // search never reads the maps.
+        store
+            .conn
+            .execute(
+                "UPDATE record_search_rowids SET search_rowid = search_rowid + 900",
+                [],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE event_search_rowids SET search_rowid = search_rowid + 900",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .search_records("needle", 10)
+                .unwrap()
+                .iter()
+                .map(|record| record.id)
+                .collect::<Vec<_>>(),
+            baseline_records
+        );
+        assert_eq!(
+            store
+                .search_event_hits("needle", 10)
+                .unwrap()
+                .iter()
+                .map(|hit| hit.event_id)
+                .collect::<Vec<_>>(),
+            baseline_events
+        );
+
+        // Drop the map tables entirely: search is still identical, and
+        // writes degrade to the legacy full-scan path instead of failing.
+        store
+            .conn
+            .execute_batch("DROP TABLE record_search_rowids; DROP TABLE event_search_rowids;")
+            .unwrap();
+        assert_eq!(
+            store
+                .search_records("needle", 10)
+                .unwrap()
+                .iter()
+                .map(|record| record.id)
+                .collect::<Vec<_>>(),
+            baseline_records
+        );
+        store
+            .upsert_record(&record_with(record_a, "alpha needle revised"))
+            .unwrap();
+        assert_eq!(store.search_records("revised", 10).unwrap()[0].id, record_a);
+        drop(store);
+
+        // Reopen recreates the dropped map tables empty; the next write per
+        // id heals it back into the map.
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM record_search_rowids"),
+            0
+        );
+        store
+            .upsert_record(&record_with(record_a, "alpha needle healed"))
+            .unwrap();
+        let healed = map_rows(&store, "record_search_rowids");
+        assert_eq!(healed.len(), 1);
+        assert_eq!(healed[0].0, record_a.to_string());
+        assert_eq!(store.search_records("healed", 10).unwrap()[0].id, record_a);
+        assert_eq!(store.search_records("bravo", 10).unwrap()[0].id, record_b);
+    }
+
+    #[test]
+    fn external_vacuum_preserves_explicit_mapped_rowids() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let records = (0..50)
+            .map(|index| record_with(new_id(), &format!("vacuum corpus body {index:03}")))
+            .collect::<Vec<_>>();
+        store.upsert_records(&records).unwrap();
+        store
+            .upsert_event(&text_event(new_id(), 1, "vacuum corpus event"))
+            .unwrap();
+        let before = map_rows(&store, "record_search_rowids");
+
+        store.conn.execute_batch("VACUUM;").unwrap();
+
+        // The maps store explicit FTS rowids and FTS5 content rowids
+        // survive VACUUM, so identity holds without any healing...
+        assert_eq!(map_rows(&store, "record_search_rowids"), before);
+        assert_map_fts_identity(&store);
+
+        // ...and the post-VACUUM update still takes the constant mapped
+        // path rather than falling back to the full scan: its VDBE work
+        // matches a known map hit, and both stay far below the heal cost.
+        let target = records[7].id;
+        let mapped_ops = vdbe_ops(&store, || {
+            store
+                .upsert_record(&record_with(target, "post vacuum mapped update"))
+                .unwrap();
+        });
+        let repeat_ops = vdbe_ops(&store, || {
+            store
+                .upsert_record(&record_with(target, "post vacuum mapped repeat"))
+                .unwrap();
+        });
+        store
+            .conn
+            .execute(
+                "DELETE FROM record_search_rowids WHERE record_id = ?1",
+                params![target.to_string()],
+            )
+            .unwrap();
+        let heal_ops = vdbe_ops(&store, || {
+            store
+                .upsert_record(&record_with(target, "post vacuum healed update"))
+                .unwrap();
+        });
+        assert!(
+            mapped_ops <= repeat_ops + 32,
+            "post-VACUUM update fell off the mapped path: {mapped_ops} ops vs mapped repeat {repeat_ops}"
+        );
+        assert!(
+            heal_ops > mapped_ops + 100,
+            "heal arm should dominate the mapped arm: heal {heal_ops} vs mapped {mapped_ops}"
+        );
+        assert_map_fts_identity(&store);
+    }
+}
+
 /// Retained benchmark evidence for the fresh-row FTS write paths. Run
 /// explicitly with:
 ///
@@ -11362,6 +12747,126 @@ mod projection_write_path_benches {
             let update_arm = started.elapsed();
             println!(
                 "corpus {size}: {UPDATE_ROWS} existing-row updates (unchanged full-scan path) {update_arm:?}"
+            );
+        }
+    }
+}
+
+/// Retained benchmark evidence for the durable FTS rowid maps. Run
+/// explicitly with:
+///
+/// ```text
+/// cargo test --release -p ctx-history-store -- --ignored --nocapture --test-threads=1 bench_rowid_map
+/// ```
+#[cfg(test)]
+mod search_rowid_map_benches {
+    use super::*;
+
+    fn tempdir() -> tempfile::TempDir {
+        let root = std::env::current_dir().unwrap().join("target/test-data");
+        fs::create_dir_all(&root).unwrap();
+        tempfile::Builder::new()
+            .prefix("ctx-history-store-rowid-map-bench-")
+            .tempdir_in(root)
+            .unwrap()
+    }
+
+    fn bench_record(index: u64, body_tag: &str) -> HistoryRecord {
+        let mut record = HistoryRecord::new(
+            format!("Bench record {index:07}"),
+            format!(
+                "bench {body_tag} record {index:07}: deterministic transcript payload for \
+                 rowid map replay timing {index:07}"
+            ),
+            vec!["bench".into()],
+            "task",
+            None,
+        );
+        record.created_at = DateTime::parse_from_rfc3339("2026-06-23T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        record.updated_at = record.created_at;
+        record
+    }
+
+    /// 250 existing-record replays against 30k/100k-row projections.
+    /// The first pass runs against an empty map (exactly the state of a
+    /// store migrated from v15): every row pays the one-time legacy
+    /// full-scan heal. The second pass replays the same rows through their
+    /// now-verified map entries. The fresh arm appends 250 new records
+    /// through the insert-only path (which now also writes map entries) to
+    /// show it does not regress.
+    #[test]
+    #[ignore = "benchmark: cargo test --release -p ctx-history-store -- --ignored --nocapture --test-threads=1 bench_rowid_map"]
+    fn bench_rowid_map_replay_vs_legacy_scan() {
+        const REPLAY_ROWS: usize = 250;
+        const FRESH_ROWS: u64 = 250;
+        for &size in &[30_000u64, 100_000] {
+            let temp = tempdir();
+            let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+
+            let started = Instant::now();
+            let seed = (0..size)
+                .map(|index| bench_record(index, "seed"))
+                .collect::<Vec<_>>();
+            store.upsert_records(&seed).unwrap();
+            println!(
+                "corpus {size}: seed ingestion {:?} (excluded from arm timings)",
+                started.elapsed()
+            );
+
+            // v15-migration shape: projections intact, maps empty.
+            store
+                .conn
+                .execute("DELETE FROM record_search_rowids", [])
+                .unwrap();
+
+            let step = size as usize / REPLAY_ROWS;
+            let replay_ids = seed
+                .iter()
+                .step_by(step)
+                .take(REPLAY_ROWS)
+                .map(|record| record.id)
+                .collect::<Vec<_>>();
+
+            let heal_pass = replay_ids
+                .iter()
+                .enumerate()
+                .map(|(index, id)| {
+                    let mut record = bench_record(index as u64, "heal-pass");
+                    record.id = *id;
+                    record
+                })
+                .collect::<Vec<_>>();
+            let started = Instant::now();
+            store.upsert_records(&heal_pass).unwrap();
+            let first_replay = started.elapsed();
+
+            let mapped_pass = replay_ids
+                .iter()
+                .enumerate()
+                .map(|(index, id)| {
+                    let mut record = bench_record(index as u64, "mapped-pass");
+                    record.id = *id;
+                    record
+                })
+                .collect::<Vec<_>>();
+            let started = Instant::now();
+            store.upsert_records(&mapped_pass).unwrap();
+            let second_replay = started.elapsed();
+
+            println!(
+                "corpus {size}: {REPLAY_ROWS} existing-record replay -> first (legacy heal) {first_replay:?} vs second (mapped) {second_replay:?}"
+            );
+
+            let fresh = (0..FRESH_ROWS)
+                .map(|index| bench_record(size + index, "fresh"))
+                .collect::<Vec<_>>();
+            let started = Instant::now();
+            store.upsert_records(&fresh).unwrap();
+            let fresh_elapsed = started.elapsed();
+            println!(
+                "corpus {size}: {FRESH_ROWS} fresh rows (insert-only + map) {fresh_elapsed:?}"
             );
         }
     }

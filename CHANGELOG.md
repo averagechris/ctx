@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Changed
+
+- First fork schema divergence (v1000): existing-row search index updates are
+  now keyed by durable FTS rowid maps instead of full-index scans. The
+  migration only adds two empty map tables — no reindex, no backfill; legacy
+  rows heal lazily on their first update. Once migrated, the store is no
+  longer openable by older ctx binaries; restart long-lived ctx processes
+  (for example `ctx mcp`) after upgrading, since the version check happens at
+  open time and cannot stop an already-running pre-upgrade process. An
+  unsupported external downgrade procedure is documented in `ctx docs show
+  storage`.
 
 ## v1.0.2 - 2026-08-05
 

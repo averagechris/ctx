@@ -126,6 +126,42 @@ replaces those old rows with current local/private transcript text. If source
 files were deleted or moved, ctx can still return indexed text from SQLite but
 cannot reconstruct text that was already stored as a placeholder.
 
+This fork's first schema change (version 1000) is different: it only adds
+internal search-rowid map tables and rebuilds or reimports nothing. Existing
+search data is untouched and the maps fill in lazily as rows are next written.
+The migration runs on the first *writable* open — `ctx status`, `ctx setup`,
+or `ctx import` — and read-only commands such as `ctx sql` and `ctx mcp`
+refuse to run until that has happened. Once migrated, the store can no longer
+be opened by older ctx binaries (they report an unsupported schema version).
+The open-time version check cannot stop an instance of ctx that was already
+running before the upgrade, so restart long-lived ctx instances — an MCP
+server (`ctx mcp`), scripted import loops — after upgrading the binary. The
+maps are internal performance caches: search never reads them, writes fall
+back to the previous slower path if they are missing, and a rebuild recreates
+them.
+
+Downgrading a v1000 store back to an older (v15-chain) ctx binary is
+unsupported and at your own risk. Because the v1000 migration changes no
+indexed data, it can be reversed externally. Back up the database first,
+make sure no running instance of ctx has the store open, then run both
+drops and the version reset as one transaction:
+
+```bash
+cp ~/.ctx/work.sqlite ~/.ctx/work.sqlite.bak
+sqlite3 ~/.ctx/work.sqlite <<'SQL'
+BEGIN IMMEDIATE;
+DROP TABLE IF EXISTS record_search_rowids;
+DROP TABLE IF EXISTS event_search_rowids;
+PRAGMA user_version = 15;
+COMMIT;
+SQL
+```
+
+Dropping the map tables is required, not optional: leaving them behind with
+a v15 version invites stale map contents if the store is later re-upgraded.
+Re-upgrading afterwards is safe — the newer binary just runs the v1000
+migration again with empty maps.
+
 Remove a source from future imports:
 
 ```bash

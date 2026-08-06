@@ -45,15 +45,31 @@
   gains a structured `query_plan`, and no-result searches print a labeled
   `suggestion (not run)` one-step broadening command (JSON
   `broadened_search`) instead of ctx ever retrying broader semantics itself.
+- `ctx search` now reports index freshness in human and JSON output, including
+  whether refresh ran, its outcome and duration, index age, and import totals
+  (#196). `--refresh off` remains strictly read-only.
+- `ctx status` now reports the local storage footprint and available space,
+  with stable low-space warnings; `ctx doctor --storage` adds read-only SQLite,
+  FTS, and reclaimable-space diagnostics without checkpointing or maintenance
+  writes (#199).
 
 ### Fixed
 
 - Delegated the Pages OAuth grant through Linux release builds so their nested
   downloads-site refresh can be submitted successfully, and made artifact
   uploads safe to retry after a partial release failure.
+- Accepted unambiguous ctx ID prefixes consistently across CLI and MCP lookups,
+  including case-insensitive compact and canonical UUID prefixes of at least
+  eight hex digits (#198).
+- Diagnosed non-empty import sources that unexpectedly produce no sessions,
+  events, or edges with path-free `zero_yield_anomaly` health reports and
+  warnings; `ctx import --strict` now exits nonzero after printing the complete
+  report (#197).
 
 ### Changed
 
+- Fresh record and event ingestion now skips unnecessary full FTS scans while
+  keeping base rows and search projections atomic (#186).
 - First fork schema divergence (v1000): existing-row search index updates are
   now keyed by durable FTS rowid maps instead of full-index scans. The
   migration only adds two empty map tables — no reindex, no backfill; legacy
@@ -62,7 +78,12 @@
   (for example `ctx mcp`) after upgrading, since the version check happens at
   open time and cannot stop an already-running pre-upgrade process. An
   unsupported external downgrade procedure is documented in `ctx docs show
-  storage`.
+  storage` (#186).
+- Consolidated indexed projections, status, source listing, locate, and raw SQL
+  behind a shared read-only query service without changing their CLI/MCP
+  behavior or weakening raw-SQL protections (#187).
+- Compact search and session projections now build only the fields they return,
+  avoiding discarded data and store lookups without changing output (#186).
 
 ## v1.0.2 - 2026-08-05
 

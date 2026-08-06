@@ -507,9 +507,9 @@
 
         publish-pages = pkgs.writeShellApplication {
           name = "publish-pages";
-          runtimeInputs = with pkgs; [
-            git
-            hut
+          runtimeInputs = [
+            pkgs.git
+            fleet.packages.${system}.srht
           ];
           text = ''
             repo_root="$(git rev-parse --show-toplevel)"
@@ -536,7 +536,7 @@
               exit 1
             fi
 
-            exec hut pages publish "$pages_tarball" --domain "$domain" --subdirectory "$subdirectory"
+            exec srht pages publish --domain "$domain" --subdirectory "$subdirectory" "$pages_tarball"
           '';
         };
 

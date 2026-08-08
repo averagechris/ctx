@@ -1211,10 +1211,11 @@ pub enum EventSearchAgentScope {
 ///   Rust predicate names (`tool_call`, `tool_output`, `command_started`,
 ///   `command_output`, `command_finished`).
 ///
-/// Filters that require request-scoped context (repo substring matching, file
-/// touch scopes, excluded provider sessions, history-source identity) or
-/// payload-derived data (`exclude_tool_names`, which parses tool/command
-/// executables out of `payload_json`) stay in Rust; callers keep
+/// File-touch scope is request-scoped but is pushed as bound identity arrays
+/// and also retained in Rust as an oracle. Other request-scoped filters (repo
+/// substring matching, excluded provider sessions, history-source identity)
+/// and payload-derived data (`exclude_tool_names`, which parses tool/command
+/// executables out of `payload_json`) stay only in Rust; callers keep
 /// `event_hit_matches_filters` as the final authority over every returned
 /// row.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1234,6 +1235,10 @@ pub struct EventSearchSqlFilters {
     /// Exclude tool/command noise event types (`tool_call`, `tool_output`,
     /// `command_started`, `command_output`, `command_finished`).
     pub exclude_tool_noise: bool,
+    /// Request-scoped file-touch identity sets. The candidate predicate tests
+    /// the same hydrated event/run/session/history-record identity chains as
+    /// the Rust residual oracle. Values are passed as bound JSON arrays.
+    pub file_scope: Option<FileTouchScope>,
 }
 
 impl EventSearchSqlFilters {
@@ -1246,6 +1251,7 @@ impl EventSearchSqlFilters {
             && self.roles.is_empty()
             && self.exclude_roles.is_empty()
             && !self.exclude_tool_noise
+            && self.file_scope.is_none()
     }
 }
 
@@ -2058,6 +2064,7 @@ pub struct Store {
     conn: Connection,
     busy_timeout: Duration,
     event_search_page_executions: std::cell::Cell<u64>,
+    event_search_rows_hydrated: std::cell::Cell<u64>,
     record_list_page_executions: std::cell::Cell<u64>,
 }
 
@@ -2095,6 +2102,7 @@ impl Store {
             conn,
             busy_timeout: BUSY_TIMEOUT,
             event_search_page_executions: std::cell::Cell::new(0),
+            event_search_rows_hydrated: std::cell::Cell::new(0),
             record_list_page_executions: std::cell::Cell::new(0),
         })
     }
@@ -2188,6 +2196,7 @@ impl Store {
             conn,
             busy_timeout,
             event_search_page_executions: std::cell::Cell::new(0),
+            event_search_rows_hydrated: std::cell::Cell::new(0),
             record_list_page_executions: std::cell::Cell::new(0),
         };
         // Schema validation is deliberately the first operation for an
@@ -5255,6 +5264,11 @@ impl Store {
         self.event_search_page_executions.get()
     }
 
+    #[doc(hidden)]
+    pub fn event_search_rows_hydrated(&self) -> u64 {
+        self.event_search_rows_hydrated.get()
+    }
+
     pub fn search_event_hits_plan_page(
         &self,
         plan: &SearchQueryPlan,
@@ -5293,7 +5307,13 @@ impl Store {
             params![match_query, limit.max(1) as i64, offset as i64],
             event_search_hit_from_row,
         )?;
-        collect_rows(rows)
+        let rows = collect_rows(rows)?;
+        self.event_search_rows_hydrated.set(
+            self.event_search_rows_hydrated
+                .get()
+                .saturating_add(rows.len() as u64),
+        );
+        Ok(rows)
     }
 
     /// Ranked event-search page with the exact-semantics filters of
@@ -5363,10 +5383,17 @@ impl Store {
                 event_role_mask(&filters.roles),
                 event_role_mask(&filters.exclude_roles),
                 i64::from(filters.exclude_tool_noise),
+                filters.file_scope.as_ref().map(file_scope_json),
             ],
             event_search_hit_from_row,
         )?;
-        collect_rows(rows)
+        let rows = collect_rows(rows)?;
+        self.event_search_rows_hydrated.set(
+            self.event_search_rows_hydrated
+                .get()
+                .saturating_add(rows.len() as u64),
+        );
+        Ok(rows)
     }
 
     pub fn export_archive(&self) -> Result<SessionHistoryArchive> {
@@ -5474,6 +5501,16 @@ impl Store {
         )?;
         Ok(())
     }
+}
+
+fn file_scope_json(scope: &FileTouchScope) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "history_record_ids": scope.history_record_ids.iter().map(Uuid::to_string).collect::<Vec<_>>(),
+        "session_ids": scope.session_ids.iter().map(Uuid::to_string).collect::<Vec<_>>(),
+        "run_ids": scope.run_ids.iter().map(Uuid::to_string).collect::<Vec<_>>(),
+        "event_ids": scope.event_ids.iter().map(Uuid::to_string).collect::<Vec<_>>(),
+    }))
+    .expect("UUID file scope is JSON serializable")
 }
 
 // Two-phase ranked event search. Phase one ranks FTS candidates on a narrow
@@ -5592,6 +5629,14 @@ macro_rules! filtered_event_hits_page_sql {
           AND (?11 = 0 OR e.event_type NOT IN
                ('tool_call', 'tool_output', 'command_started', 'command_output',
                 'command_finished'))
+          AND (?12 IS NULL OR
+               e.id IN (SELECT value FROM json_each(?12, '$.event_ids')) OR
+               e.run_id IN (SELECT value FROM json_each(?12, '$.run_ids')) OR
+               COALESCE(e.session_id, event_search.session_id, s.id, rs.id)
+                   IN (SELECT value FROM json_each(?12, '$.session_ids')) OR
+               COALESCE(e.history_record_id, event_search.history_record_id,
+                        s.history_record_id, rs.history_record_id)
+                   IN (SELECT value FROM json_each(?12, '$.history_record_ids')))
         ORDER BY bm25(event_search), e.occurred_at_ms DESC, e.seq DESC, event_search.event_id
         LIMIT ?2 OFFSET ?3"#,
         )
@@ -11540,6 +11585,7 @@ mod search_order_tests {
                                             roles: roles.clone(),
                                             exclude_roles: exclude_roles.clone(),
                                             exclude_tool_noise,
+                                            file_scope: None,
                                         });
                                     }
                                 }
@@ -11828,7 +11874,7 @@ mod search_order_tests {
         for (sql, inner_expected) in [
             (
                 SEARCH_EVENT_HITS_PAGE_SCOPED_FILTERED_SQL,
-                vec!["event_search", "e", "r", "s", "rs"],
+                vec!["event_search", "e", "r", "s", "rs", "json_each"],
             ),
             (
                 SEARCH_EVENT_HITS_PAGE_PROVIDER_FILTERED_SQL,
@@ -11841,6 +11887,7 @@ mod search_order_tests {
                     "event_source",
                     "session_source",
                     "run_source",
+                    "json_each",
                 ],
             ),
         ] {
@@ -11861,7 +11908,8 @@ mod search_order_tests {
                         1_i64,
                         3_i64,
                         8_i64,
-                        1_i64
+                        1_i64,
+                        None::<String>
                     ],
                     |row| {
                         Ok((
@@ -11937,10 +11985,11 @@ mod search_order_tests {
                     .collect::<std::collections::HashSet<_>>(),
                 "plan:\n{plan_text}"
             );
-            // Every predicate join inside the CTE is an indexed SEARCH; the
-            // only SCAN is the FTS MATCH driver itself.
+            // Every base-table predicate join inside the CTE is an indexed
+            // SEARCH. SCAN is limited to the FTS driver and bounded json_each
+            // virtual tables carrying the bound file-scope IDs.
             for (op, table) in &inner {
-                if table != "event_search" {
+                if table != "event_search" && table != "json_each" {
                     assert_eq!(
                         op, "SEARCH",
                         "inner join on {table} must be indexed; plan:\n{plan_text}"

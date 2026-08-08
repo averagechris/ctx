@@ -17,6 +17,21 @@ use serde::Serialize;
 use thiserror::Error;
 use uuid::Uuid;
 
+#[cfg(test)]
+thread_local! {
+    static DISABLE_FILE_SCOPE_PUSHDOWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static RESIDUAL_COUNTS: std::cell::Cell<[u64; 3]> = const { std::cell::Cell::new([0; 3]) };
+}
+
+#[cfg(test)]
+fn increment_residual_count(index: usize) {
+    RESIDUAL_COUNTS.with(|counts| {
+        let mut next = counts.get();
+        next[index] += 1;
+        counts.set(next);
+    });
+}
+
 pub const SEARCH_PACKET_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_RESULT_LIMIT: usize = 10;
 pub const MAX_RESULT_LIMIT: usize = 200;
@@ -691,7 +706,7 @@ fn fast_event_search_packet(
     // authority over every hit either way, and `plan.matches_text` re-verifies
     // every hit against ctx literal-token semantics (FTS unicode61 folds
     // diacritics; ctx does not).
-    let sql_filters = sql_pushdown_filters(&options.filters);
+    let sql_filters = sql_pushdown_filters(&options.filters, file_scope);
     let residual_filtered = has_residual_event_filters(&options.filters, file_scope);
     // Bounded rerank pool: the final sort order is not the SQL bm25 order in
     // any match mode — `any`-mode ranking rewards matched-token counts, and
@@ -728,6 +743,8 @@ fn fast_event_search_packet(
         let page_len = hits.len();
 
         for hit in hits {
+            #[cfg(test)]
+            increment_residual_count(0);
             // Hits come from an FTS MATCH over exactly `hit.preview`; the
             // ASCII-exact case needs no Rust re-verification (see
             // `fts_match_is_exact_for`), and the reference differential in
@@ -736,8 +753,12 @@ fn fast_event_search_packet(
                 continue;
             }
             if !event_hit_matches_filters(&hit, &options.filters, file_scope) {
+                #[cfg(test)]
+                increment_residual_count(1);
                 continue;
             }
+            #[cfg(test)]
+            increment_residual_count(2);
             if clustered {
                 let cluster_id = hit.session_id.unwrap_or(hit.event_id);
                 if let Some(index) = clustered_index.get(&cluster_id).copied() {
@@ -872,7 +893,17 @@ fn empty_search_packet(
 /// `event_hit_matches_agent_scope`, so pushing it can never change which hits
 /// survive Rust filtering — it only stops non-matching rows from being
 /// hydrated and scanned.
-fn sql_pushdown_filters(filters: &SearchFilters) -> EventSearchSqlFilters {
+fn sql_pushdown_filters(
+    filters: &SearchFilters,
+    file_scope: Option<&FileTouchScope>,
+) -> EventSearchSqlFilters {
+    let file_scope = file_scope.cloned();
+    #[cfg(test)]
+    let file_scope = if DISABLE_FILE_SCOPE_PUSHDOWN.get() {
+        None
+    } else {
+        file_scope
+    };
     let agent_scope = if filters.session.is_some() {
         // An explicit session filter makes the Rust agent-scope check vacuous:
         // `event_hit_matches_agent_scope` accepts any hit of that session
@@ -904,12 +935,14 @@ fn sql_pushdown_filters(filters: &SearchFilters) -> EventSearchSqlFilters {
         roles: filters.roles.clone(),
         exclude_roles: filters.exclude_roles.clone(),
         exclude_tool_noise: filters.exclude_tool_noise,
+        file_scope,
     }
 }
 
 /// Filters that cannot be pushed into the ranked SQL page and still require
-/// Rust-side scanning over candidate pages: repo substring matching over
-/// cwd/raw-source/workspace, file-touch scopes, excluded provider sessions,
+/// Rust-side checking over candidate pages: repo substring matching over
+/// cwd/raw-source/workspace, file-touch scopes (retained as the oracle after
+/// SQL pushdown), excluded provider sessions,
 /// history-source identity, and `exclude_tool_names` (payload-derived
 /// executable names). The scan budget continues to bound these.
 /// The history-source branch is defensive today: the fast event path returns
@@ -8011,6 +8044,110 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "ticket #265 file-scope pushdown benchmark evidence"]
+    fn synthetic_search_file_scope_pushdown_evidence() {
+        let archive = synthetic_perf_archive(200_000, 50);
+        let (_temp, mut store) = test_store();
+        store.import_archive(&archive, false).unwrap();
+        let options = PacketOptions {
+            limit: 24,
+            snippet_chars: 320,
+            filters: SearchFilters {
+                file: Some("profile_00/perf_profile.rs".into()),
+                ..SearchFilters::default()
+            },
+            result_mode: SearchResultMode::Events,
+            match_mode: SearchMatchMode::All,
+        };
+        let plain = PacketOptions {
+            filters: SearchFilters::default(),
+            ..options.clone()
+        };
+
+        fn measured(
+            store: &Store,
+            options: &PacketOptions,
+            disabled: bool,
+        ) -> (f64, Vec<String>, [u64; 3]) {
+            DISABLE_FILE_SCOPE_PUSHDOWN.set(disabled);
+            let before = RESIDUAL_COUNTS.get();
+            let started = std::time::Instant::now();
+            let packet = search_packet(store, "perfneedle", options).unwrap();
+            (
+                elapsed_ms(started.elapsed()),
+                result_ids(&packet),
+                std::array::from_fn(|index| RESIDUAL_COUNTS.get()[index] - before[index]),
+            )
+        }
+
+        // Five warmups per shape, then five paired samples, matching #262.
+        for index in 0..5 {
+            for disabled in if index % 2 == 0 {
+                [true, false]
+            } else {
+                [false, true]
+            } {
+                measured(&store, &options, disabled);
+                measured(&store, &plain, disabled);
+            }
+        }
+        let mut residual_ms = Vec::new();
+        let mut pushed_ms = Vec::new();
+        let mut plain_before_ms = Vec::new();
+        let mut plain_after_ms = Vec::new();
+        let mut residual_counts = [0_u64; 3];
+        let mut pushed_counts = [0_u64; 3];
+        for index in 0..5 {
+            let (residual, pushed) = if index % 2 == 0 {
+                (
+                    measured(&store, &options, true),
+                    measured(&store, &options, false),
+                )
+            } else {
+                let pushed = measured(&store, &options, false);
+                let residual = measured(&store, &options, true);
+                (residual, pushed)
+            };
+            let (before_ms, before_ids, examined_before) = residual;
+            let (after_ms, after_ids, examined_after) = pushed;
+            assert_eq!(before_ids, after_ids);
+            assert_eq!(before_ids.len(), 24);
+            residual_ms.push(before_ms);
+            pushed_ms.push(after_ms);
+            for index in 0..3 {
+                residual_counts[index] += examined_before[index];
+                pushed_counts[index] += examined_after[index];
+            }
+
+            let plain_pair = if index % 2 == 0 {
+                (
+                    measured(&store, &plain, true).0,
+                    measured(&store, &plain, false).0,
+                )
+            } else {
+                let after = measured(&store, &plain, false).0;
+                let before = measured(&store, &plain, true).0;
+                (before, after)
+            };
+            plain_before_ms.push(plain_pair.0);
+            plain_after_ms.push(plain_pair.1);
+        }
+        DISABLE_FILE_SCOPE_PUSHDOWN.set(false);
+        println!(
+            "file-scope pushdown evidence: {}",
+            serde_json::json!({
+                "fixture_events": 200_000,
+                "warmups_per_shape": 5,
+                "samples": 5,
+                "residual_only": { "timings": timing_stats(&residual_ms).to_json(), "examined": residual_counts[0], "rejected": residual_counts[1], "accepted": residual_counts[2] },
+                "sql_plus_residual": { "timings": timing_stats(&pushed_ms).to_json(), "examined": pushed_counts[0], "rejected": pushed_counts[1], "accepted": pushed_counts[2] },
+                "unfiltered_before": timing_stats(&plain_before_ms).to_json(),
+                "unfiltered_after": timing_stats(&plain_after_ms).to_json(),
+            })
+        );
+    }
+
     fn sqlite_search_baseline_evidence(
         event_count: usize,
         events_per_record: usize,
@@ -9192,6 +9329,161 @@ mod tests {
             ctx_command_event: ctx_command.id,
             base,
             decoys,
+        }
+    }
+
+    #[test]
+    fn file_scope_sql_pushdown_matches_residual_only_packets() {
+        #[derive(Clone, Copy, Debug)]
+        enum Ownership {
+            Event,
+            Run,
+            SessionFallback,
+            HistoryRecordFallback,
+        }
+
+        fn packet(store: &Store, options: &PacketOptions, residual_only: bool) -> SearchPacket {
+            DISABLE_FILE_SCOPE_PUSHDOWN.set(residual_only);
+            let packet = search_packet(store, "perfneedle", options).unwrap();
+            DISABLE_FILE_SCOPE_PUSHDOWN.set(false);
+            packet
+        }
+
+        for ownership in [
+            Ownership::Event,
+            Ownership::Run,
+            Ownership::SessionFallback,
+            Ownership::HistoryRecordFallback,
+        ] {
+            let mut archive = synthetic_perf_archive(1_200, 50);
+            archive.files_touched.clear();
+            let target_id = archive.events[0].id;
+            let anchor_id = archive.events[1].id;
+            let auxiliary_id = archive.events[2].id;
+            let target_record = archive.records[0].id;
+            let target_run = archive.runs[0].id;
+            let target_session = archive.sessions[0].id;
+
+            // A second identity exercises bound arrays with more than one
+            // value without adding another FTS match to the expected packet.
+            archive.events[1].payload = serde_json::json!({ "text": "anchor without query" });
+            archive.events[1].history_record_id = None;
+            archive.events[1].run_id = None;
+            archive.events[1].session_id = match ownership {
+                Ownership::SessionFallback => Some(target_session),
+                _ => None,
+            };
+            archive.events[2].payload = serde_json::json!({ "text": "second anchor" });
+            archive.events[2].history_record_id = None;
+            archive.events[2].run_id = None;
+            archive.events[2].session_id = None;
+
+            archive.events[0].history_record_id = None;
+            archive.events[0].session_id = None;
+            archive.events[0].run_id = match ownership {
+                Ownership::Run | Ownership::SessionFallback | Ownership::HistoryRecordFallback => {
+                    Some(target_run)
+                }
+                Ownership::Event => None,
+            };
+            archive.runs[0].history_record_id = None;
+            archive.runs[0].session_id = match ownership {
+                Ownership::SessionFallback | Ownership::HistoryRecordFallback => {
+                    Some(target_session)
+                }
+                _ => None,
+            };
+            archive.sessions[0].history_record_id = match ownership {
+                Ownership::HistoryRecordFallback => Some(target_record),
+                _ => None,
+            };
+
+            let touched = |id: Uuid, event_id, run_id, history_record_id| FileTouched {
+                id,
+                history_record_id,
+                run_id,
+                event_id,
+                vcs_workspace_id: None,
+                path: "src/selected.rs".into(),
+                change_kind: Some(FileChangeKind::Modified),
+                old_path: None,
+                line_count_delta: None,
+                confidence: Confidence::Explicit,
+                timestamps: timestamps(),
+                source_id: None,
+                sync: sync_metadata(),
+            };
+            archive.files_touched.push(match ownership {
+                Ownership::Event => touched(perf_uuid(0x7100, 0), Some(target_id), None, None),
+                Ownership::Run => touched(perf_uuid(0x7100, 1), None, Some(target_run), None),
+                Ownership::SessionFallback => {
+                    touched(perf_uuid(0x7100, 2), Some(anchor_id), None, None)
+                }
+                Ownership::HistoryRecordFallback => {
+                    touched(perf_uuid(0x7100, 3), None, None, Some(target_record))
+                }
+            });
+            archive.files_touched.push(touched(
+                perf_uuid(0x7200, ownership as u64),
+                Some(auxiliary_id),
+                None,
+                None,
+            ));
+
+            let (_temp, mut store) = test_store();
+            store.import_archive(&archive, false).unwrap();
+            let options = PacketOptions {
+                limit: 60,
+                snippet_chars: 200,
+                filters: SearchFilters {
+                    file: Some("selected.rs".into()),
+                    ..SearchFilters::default()
+                },
+                result_mode: SearchResultMode::Events,
+                match_mode: SearchMatchMode::All,
+            };
+            let before_pages = store.event_search_page_executions();
+            let residual = packet(&store, &options, true);
+            let residual_pages = store.event_search_page_executions() - before_pages;
+            let pushed = packet(&store, &options, false);
+
+            assert!(
+                residual_pages > 1,
+                "{ownership:?} must cross the first 500 rows"
+            );
+            assert!(
+                pushed
+                    .results
+                    .iter()
+                    .any(|result| result.event_id == Some(target_id)),
+                "{ownership:?}"
+            );
+            assert_eq!(
+                packet_without_generated_at(&pushed),
+                packet_without_generated_at(&residual),
+                "{ownership:?}: complete packet, including order/ranks/pagination/truncation"
+            );
+        }
+
+        let archive = synthetic_perf_archive(1_024, 50);
+        let (_temp, mut store) = test_store();
+        store.import_archive(&archive, false).unwrap();
+        for file in [None, Some("   "), Some("does-not-exist.rs")] {
+            let options = PacketOptions {
+                limit: 10,
+                filters: SearchFilters {
+                    file: file.map(str::to_owned),
+                    ..SearchFilters::default()
+                },
+                result_mode: SearchResultMode::Events,
+                ..PacketOptions::default()
+            };
+            let pushed = packet(&store, &options, false);
+            let residual = packet(&store, &options, true);
+            assert_eq!(
+                packet_without_generated_at(&pushed),
+                packet_without_generated_at(&residual)
+            );
         }
     }
 

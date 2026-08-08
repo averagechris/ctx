@@ -20,6 +20,7 @@ ctx-history-core = { path = "../ctx-history-core" }
 ctx-history-store = { path = "../ctx-history-store" }
 
 [dev-dependencies]
+ctx-history-store = { path = "../ctx-history-store", features = ["test-utils"] }
 libc.workspace = true
 rusqlite.workspace = true
 tempfile.workspace = true

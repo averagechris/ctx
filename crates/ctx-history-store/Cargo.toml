@@ -9,6 +9,9 @@ homepage.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+test-utils = []
+
 [dependencies]
 chrono.workspace = true
 rusqlite.workspace = true

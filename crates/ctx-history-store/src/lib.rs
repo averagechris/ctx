@@ -1,6 +1,6 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ffi::CString,
     fs,
     os::raw::c_char,
@@ -25,13 +25,17 @@ use ctx_history_core::{
 pub const SOURCE_IMPORT_ZERO_YIELD_ANOMALY_CODE: &str = "zero_yield_anomaly";
 pub const CATALOG_IMPORT_OUTCOME_UNATTRIBUTED_CODE: &str = "import_outcome_unattributed";
 use rusqlite::{
-    ffi, limits::Limit, params, types::ValueRef, Connection, ErrorCode, OpenFlags,
-    OptionalExtension, Transaction,
+    ffi,
+    limits::Limit,
+    params, params_from_iter,
+    types::{Value as SqlValue, ValueRef},
+    Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
+const BATCH_RECORD_ID_CHUNK_SIZE: usize = 500;
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("sqlite error: {0}")]
@@ -2066,6 +2070,8 @@ pub struct Store {
     event_search_page_executions: std::cell::Cell<u64>,
     event_search_rows_hydrated: std::cell::Cell<u64>,
     record_list_page_executions: std::cell::Cell<u64>,
+    #[cfg(feature = "test-utils")]
+    relation_batch_executions: std::cell::Cell<u64>,
 }
 
 impl Store {
@@ -2104,6 +2110,8 @@ impl Store {
             event_search_page_executions: std::cell::Cell::new(0),
             event_search_rows_hydrated: std::cell::Cell::new(0),
             record_list_page_executions: std::cell::Cell::new(0),
+            #[cfg(feature = "test-utils")]
+            relation_batch_executions: std::cell::Cell::new(0),
         })
     }
 
@@ -2198,6 +2206,8 @@ impl Store {
             event_search_page_executions: std::cell::Cell::new(0),
             event_search_rows_hydrated: std::cell::Cell::new(0),
             record_list_page_executions: std::cell::Cell::new(0),
+            #[cfg(feature = "test-utils")]
+            relation_batch_executions: std::cell::Cell::new(0),
         };
         // Schema validation is deliberately the first operation for an
         // existing database. Unsupported versions must not trigger chmod,
@@ -2627,6 +2637,23 @@ impl Store {
             )
             .optional()?
             .ok_or(StoreError::NotFound(id))
+    }
+
+    pub fn capture_sources_for_ids(&self, ids: &[Uuid]) -> Result<BTreeMap<Uuid, CaptureSource>> {
+        let mut sources = BTreeMap::new();
+        for chunk in distinct_uuid_chunks(ids) {
+            #[cfg(feature = "test-utils")]
+            self.relation_batch_executions
+                .set(self.relation_batch_executions.get().saturating_add(1));
+            let sql = format!("SELECT id, kind, provider, machine_id, process_id, cwd, raw_source_path, external_session_id, started_at_ms, ended_at_ms, fidelity, visibility, sync_state, sync_version, metadata_json FROM capture_sources WHERE id IN ({}) ORDER BY id", sql_placeholders(chunk.len()));
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(uuid_values(&chunk), capture_source_from_row)?;
+            for row in rows {
+                let source = row?;
+                sources.insert(source.id, source);
+            }
+        }
+        Ok(sources)
     }
 
     pub fn list_capture_sources(&self) -> Result<Vec<CaptureSource>> {
@@ -3524,6 +3551,19 @@ impl Store {
         collect_rows(rows)
     }
 
+    pub fn sessions_for_records(&self, ids: &[Uuid]) -> Result<BTreeMap<Uuid, Vec<Session>>> {
+        self.relations_for_records(
+            ids,
+            session_select_sql(""),
+            "FROM sessions",
+            "sessions.history_record_id = requested.record_id",
+            "sessions.started_at_ms, sessions.id",
+            23,
+            session_from_row,
+            &[],
+        )
+    }
+
     pub fn assign_session_to_record(&self, session_id: Uuid, record_id: Uuid) -> Result<()> {
         self.conn.execute(
             "UPDATE sessions SET history_record_id = ?1 WHERE id = ?2",
@@ -3739,6 +3779,10 @@ impl Store {
         )?;
         let rows = stmt.query_map(params![record_id.to_string()], run_from_row)?;
         collect_rows(rows)
+    }
+
+    pub fn runs_for_records(&self, ids: &[Uuid]) -> Result<BTreeMap<Uuid, Vec<Run>>> {
+        self.relations_for_records(ids, run_select_sql(""), "FROM runs", "runs.history_record_id = requested.record_id OR runs.session_id IN (SELECT id FROM sessions WHERE history_record_id = requested.record_id)", "runs.started_at_ms, runs.id", 21, run_from_row, &[])
     }
 
     fn list_runs(&self) -> Result<Vec<Run>> {
@@ -4164,6 +4208,10 @@ impl Store {
         collect_rows(rows)
     }
 
+    pub fn events_for_records(&self, ids: &[Uuid]) -> Result<BTreeMap<Uuid, Vec<Event>>> {
+        self.relations_for_records(ids, event_select_sql(""), "FROM events", "events.history_record_id = requested.record_id OR events.session_id IN (SELECT id FROM sessions WHERE history_record_id = requested.record_id) OR events.run_id IN (SELECT id FROM runs WHERE history_record_id = requested.record_id OR session_id IN (SELECT id FROM sessions WHERE history_record_id = requested.record_id))", "events.seq, events.occurred_at_ms", 19, event_from_row, &[])
+    }
+
     fn list_events(&self) -> Result<Vec<Event>> {
         let mut stmt = self
             .conn
@@ -4585,6 +4633,15 @@ impl Store {
         collect_rows(rows)
     }
 
+    pub fn artifacts_for_records(&self, ids: &[Uuid]) -> Result<BTreeMap<Uuid, Vec<Artifact>>> {
+        self.relations_for_records(ids, artifact_select_sql(""), "FROM artifacts", r#"artifacts.id IN (
+            SELECT transcript_blob_id FROM sessions WHERE history_record_id = requested.record_id AND transcript_blob_id IS NOT NULL
+            UNION SELECT input_blob_id FROM runs WHERE (history_record_id = requested.record_id OR session_id IN (SELECT id FROM sessions WHERE history_record_id = requested.record_id)) AND input_blob_id IS NOT NULL
+            UNION SELECT output_blob_id FROM runs WHERE (history_record_id = requested.record_id OR session_id IN (SELECT id FROM sessions WHERE history_record_id = requested.record_id)) AND output_blob_id IS NOT NULL
+            UNION SELECT payload_blob_id FROM events WHERE (history_record_id = requested.record_id OR session_id IN (SELECT id FROM sessions WHERE history_record_id = requested.record_id)) AND payload_blob_id IS NOT NULL
+            UNION SELECT target_id FROM history_record_links WHERE history_record_id = requested.record_id AND target_type = 'artifact')"#, "artifacts.updated_at_ms DESC, artifacts.id", 17, artifact_from_row, &[])
+    }
+
     pub fn vcs_changes_for_record(&self, record_id: Uuid) -> Result<Vec<VcsChange>> {
         let mut stmt = self.conn.prepare(
             vcs_change_select_sql(
@@ -4603,6 +4660,10 @@ impl Store {
         collect_rows(rows)
     }
 
+    pub fn vcs_changes_for_records(&self, ids: &[Uuid]) -> Result<BTreeMap<Uuid, Vec<VcsChange>>> {
+        self.relations_for_records(ids, vcs_change_select_sql(""), "FROM vcs_changes", "vcs_changes.id IN (SELECT target_id FROM history_record_links WHERE history_record_id = requested.record_id AND target_type = 'vcs_change')", "vcs_changes.updated_at_ms DESC, vcs_changes.id", 18, vcs_change_from_row, &[])
+    }
+
     pub fn summaries_for_record(&self, record_id: Uuid) -> Result<Vec<Summary>> {
         let mut stmt = self.conn.prepare(
             summary_select_sql(
@@ -4616,6 +4677,10 @@ impl Store {
         )?;
         let rows = stmt.query_map(params![record_id.to_string()], summary_from_row)?;
         collect_rows(rows)
+    }
+
+    pub fn summaries_for_records(&self, ids: &[Uuid]) -> Result<BTreeMap<Uuid, Vec<Summary>>> {
+        self.relations_for_records(ids, summary_select_sql(""), "FROM summaries", "summaries.history_record_id = requested.record_id OR summaries.session_id IN (SELECT id FROM sessions WHERE history_record_id = requested.record_id)", "summaries.updated_at_ms DESC, summaries.id", 16, summary_from_row, &[])
     }
 
     pub fn files_touched_for_record(&self, record_id: Uuid) -> Result<Vec<FileTouched>> {
@@ -4640,6 +4705,82 @@ impl Store {
         )?;
         let rows = stmt.query_map(params![record_id.to_string()], file_touched_from_row)?;
         collect_rows(rows)
+    }
+
+    pub fn files_touched_for_records(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<BTreeMap<Uuid, Vec<FileTouched>>> {
+        self.files_touched_for_records_inner(ids, None)
+    }
+
+    pub fn files_touched_for_records_matching(
+        &self,
+        ids: &[Uuid],
+        file: &str,
+    ) -> Result<BTreeMap<Uuid, Vec<FileTouched>>> {
+        let Some((exact, suffix)) = file_touch_match_values(file) else {
+            return Ok(empty_relation_map(ids));
+        };
+        self.files_touched_for_records_inner(ids, Some((exact, suffix)))
+    }
+
+    fn files_touched_for_records_inner(
+        &self,
+        ids: &[Uuid],
+        file: Option<(String, String)>,
+    ) -> Result<BTreeMap<Uuid, Vec<FileTouched>>> {
+        let mut extra = Vec::new();
+        let file_predicate = if let Some((exact, suffix)) = file {
+            extra = vec![
+                SqlValue::Text(exact.clone()),
+                SqlValue::Text(exact),
+                SqlValue::Text(suffix.clone()),
+                SqlValue::Text(suffix),
+            ];
+            " AND (files_touched.path = ? OR files_touched.old_path = ? OR files_touched.path LIKE ? ESCAPE '\\' OR files_touched.old_path LIKE ? ESCAPE '\\')"
+        } else {
+            ""
+        };
+        self.relations_for_records(ids, file_touched_select_sql(""), "FROM files_touched", &format!("(files_touched.history_record_id = requested.record_id OR files_touched.run_id IN (SELECT id FROM runs WHERE history_record_id = requested.record_id OR session_id IN (SELECT id FROM sessions WHERE history_record_id = requested.record_id)) OR files_touched.event_id IN (SELECT id FROM events WHERE history_record_id = requested.record_id OR session_id IN (SELECT id FROM sessions WHERE history_record_id = requested.record_id))){file_predicate}"), "files_touched.updated_at_ms DESC, files_touched.id", 19, file_touched_from_row, &extra)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn relations_for_records<T>(
+        &self,
+        ids: &[Uuid],
+        select: String,
+        from: &str,
+        predicate: &str,
+        order: &str,
+        columns: usize,
+        parse: fn(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+        extra: &[SqlValue],
+    ) -> Result<BTreeMap<Uuid, Vec<T>>> {
+        let mut grouped = empty_relation_map(ids);
+        for chunk in distinct_uuid_chunks(ids) {
+            #[cfg(feature = "test-utils")]
+            self.relation_batch_executions
+                .set(self.relation_batch_executions.get().saturating_add(1));
+            let requested = vec!["(?)"; chunk.len()].join(",");
+            let projection = select.replacen(
+                from,
+                &format!(", requested.record_id {from} JOIN requested ON ({predicate})"),
+                1,
+            );
+            let sql = format!("WITH requested(record_id) AS (VALUES {requested}) {projection} ORDER BY requested.record_id, {order}");
+            let mut values = uuid_value_vec(&chunk);
+            values.extend_from_slice(extra);
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(values), |row| {
+                Ok((parse_uuid(row.get::<_, String>(columns)?)?, parse(row)?))
+            })?;
+            for row in rows {
+                let (id, entity) = row?;
+                grouped.entry(id).or_default().push(entity);
+            }
+        }
+        Ok(grouped)
     }
 
     pub fn files_touched_for_record_matching(
@@ -5267,6 +5408,15 @@ impl Store {
     #[doc(hidden)]
     pub fn event_search_rows_hydrated(&self) -> u64 {
         self.event_search_rows_hydrated.get()
+    }
+
+    /// Statement count for the bounded relation loaders. Intended for focused
+    /// regression tests and evidence collection; unlike connection tracing it
+    /// cannot observe unrelated statements on a shared store.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn relation_batch_executions(&self) -> u64 {
+        self.relation_batch_executions.get()
     }
 
     pub fn search_event_hits_plan_page(
@@ -9313,6 +9463,37 @@ fn catalog_indexed_count_sql() -> String {
       )
     "#
     .to_owned()
+}
+
+fn distinct_uuid_chunks(ids: &[Uuid]) -> Vec<Vec<Uuid>> {
+    let distinct = ids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    distinct
+        .chunks(BATCH_RECORD_ID_CHUNK_SIZE)
+        .map(<[Uuid]>::to_vec)
+        .collect()
+}
+
+fn uuid_value_vec(ids: &[Uuid]) -> Vec<SqlValue> {
+    ids.iter()
+        .map(|id| SqlValue::Text(id.to_string()))
+        .collect()
+}
+
+fn uuid_values(ids: &[Uuid]) -> impl rusqlite::Params + '_ {
+    params_from_iter(ids.iter().map(Uuid::to_string))
+}
+
+fn sql_placeholders(count: usize) -> String {
+    vec!["?"; count].join(",")
+}
+
+fn empty_relation_map<T>(ids: &[Uuid]) -> BTreeMap<Uuid, Vec<T>> {
+    ids.iter().copied().map(|id| (id, Vec::new())).collect()
 }
 
 fn session_select_sql(tail: &str) -> String {

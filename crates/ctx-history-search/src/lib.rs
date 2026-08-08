@@ -221,7 +221,7 @@ struct Candidate {
     primary_hit: Option<HitMetadata>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 struct RecordContext {
     sessions: Vec<Session>,
     runs: Vec<Run>,
@@ -1438,17 +1438,21 @@ fn ranked_candidates(
                 scan_budget_exhausted,
             });
         };
+        let mut records = Vec::new();
         for record_id in &scope.history_record_ids {
             if !seen.insert(*record_id) {
                 continue;
             }
-            let record = store.get_record(*record_id)?;
-            if let Some(candidate) =
-                candidate_for_record(store, record, plan, &terms, &options.filters, file_scope)?
-            {
-                candidates.push(candidate);
-            }
+            records.push(store.get_record(*record_id)?);
         }
+        candidates.extend(candidates_for_records(
+            store,
+            records,
+            plan,
+            &terms,
+            &options.filters,
+            file_scope,
+        )?);
         normalize_scores(&mut candidates);
         candidates.sort_by(compare_candidates);
         if candidates.len() > target_candidates {
@@ -1475,6 +1479,7 @@ fn ranked_candidates(
             };
             let page_len = records.len();
 
+            let mut page_records = Vec::new();
             for record in records {
                 if !seen.insert(record.id) {
                     continue;
@@ -1486,12 +1491,16 @@ fn ranked_candidates(
                         continue;
                     }
                 }
-                if let Some(candidate) =
-                    candidate_for_record(store, record, plan, &terms, &options.filters, file_scope)?
-                {
-                    candidates.push(candidate);
-                }
+                page_records.push(record);
             }
+            candidates.extend(candidates_for_records(
+                store,
+                page_records,
+                plan,
+                &terms,
+                &options.filters,
+                file_scope,
+            )?);
 
             if candidates.len() >= target_candidates || page_len < page_size {
                 break;
@@ -1516,6 +1525,7 @@ fn ranked_candidates(
             Some(plan) if !plan.is_empty() => store.search_records_plan(plan, fetch_limit)?,
             _ => Vec::new(),
         };
+        let mut page_records = Vec::new();
         for record in records {
             if !seen.insert(record.id) {
                 continue;
@@ -1523,12 +1533,16 @@ fn ranked_candidates(
             if file_scope.is_some_and(|scope| !scope.history_record_ids.contains(&record.id)) {
                 continue;
             }
-            if let Some(candidate) =
-                candidate_for_record(store, record, plan, &terms, &options.filters, file_scope)?
-            {
-                candidates.push(candidate);
-            }
+            page_records.push(record);
         }
+        candidates.extend(candidates_for_records(
+            store,
+            page_records,
+            plan,
+            &terms,
+            &options.filters,
+            file_scope,
+        )?);
     }
 
     normalize_scores(&mut candidates);
@@ -1551,103 +1565,160 @@ fn compare_candidates(left: &Candidate, right: &Candidate) -> Ordering {
         .then_with(|| left.record.id.cmp(&right.record.id))
 }
 
-fn candidate_for_record(
+fn candidates_for_records(
     store: &Store,
-    record: HistoryRecord,
+    records: Vec<HistoryRecord>,
     plan: Option<&SearchQueryPlan>,
     terms: &[String],
     filters: &SearchFilters,
     file_scope: Option<&FileTouchScope>,
-) -> Result<Option<Candidate>> {
-    let context = hydrate_record_context(store, record.id, filters.file.as_deref())?;
+) -> Result<Vec<Candidate>> {
+    let ids = records.iter().map(|record| record.id).collect::<Vec<_>>();
+    let mut contexts = hydrate_record_contexts(store, &ids, filters.file.as_deref())?;
+    let mut candidates = Vec::new();
+    for record in records {
+        let context = contexts.remove(&record.id).unwrap_or_default();
+        if let Some(candidate) =
+            candidate_for_record(record, context, plan, terms, filters, file_scope)
+        {
+            candidates.push(candidate);
+        }
+    }
+    Ok(candidates)
+}
+
+fn candidate_for_record(
+    record: HistoryRecord,
+    context: RecordContext,
+    plan: Option<&SearchQueryPlan>,
+    terms: &[String],
+    filters: &SearchFilters,
+    file_scope: Option<&FileTouchScope>,
+) -> Option<Candidate> {
     if !record_matches_filters(&record, &context, filters, file_scope) {
-        return Ok(None);
+        return None;
     }
     let analysis = analyze_record(&record, &context, plan, terms, filters);
     if terms.is_empty() || analysis.score > 0.0 {
-        Ok(Some(Candidate {
+        Some(Candidate {
             record,
             context,
             score: analysis.score,
             why_matched: analysis.why_matched,
             citations: analysis.citations,
             primary_hit: analysis.primary_hit,
-        }))
+        })
     } else {
-        Ok(None)
+        None
     }
 }
 
-fn hydrate_record_context(
+fn hydrate_record_contexts(
     store: &Store,
-    record_id: Uuid,
+    record_ids: &[Uuid],
     file_filter: Option<&str>,
-) -> Result<RecordContext> {
-    let sessions = store.sessions_for_record(record_id)?;
-    let runs = store.runs_for_record(record_id)?;
-    let events = store.events_for_record(record_id)?;
-    let artifacts = store.artifacts_for_record(record_id)?;
-    let files_touched =
+) -> Result<BTreeMap<Uuid, RecordContext>> {
+    let mut sessions = store.sessions_for_records(record_ids)?;
+    let mut runs = store.runs_for_records(record_ids)?;
+    let mut events = store.events_for_records(record_ids)?;
+    let mut artifacts = store.artifacts_for_records(record_ids)?;
+    let mut files_touched =
         if let Some(file) = file_filter.map(str::trim).filter(|value| !value.is_empty()) {
-            store.files_touched_for_record_matching(record_id, file)?
+            store.files_touched_for_records_matching(record_ids, file)?
         } else {
-            store.files_touched_for_record(record_id)?
+            store.files_touched_for_records(record_ids)?
         };
-    let vcs_changes = store.vcs_changes_for_record(record_id)?;
-    let summaries = store.summaries_for_record(record_id)?;
+    let mut vcs_changes = store.vcs_changes_for_records(record_ids)?;
+    let mut summaries = store.summaries_for_records(record_ids)?;
     let mut source_ids = BTreeSet::new();
-    for session in &sessions {
+    for session in sessions.values().flatten() {
         if let Some(id) = session.capture_source_id {
             source_ids.insert(id);
         }
     }
-    for run in &runs {
+    for run in runs.values().flatten() {
         if let Some(id) = run.source_id {
             source_ids.insert(id);
         }
     }
-    for event in &events {
+    for event in events.values().flatten() {
         if let Some(id) = event.capture_source_id {
             source_ids.insert(id);
         }
     }
-    for artifact in &artifacts {
+    for artifact in artifacts.values().flatten() {
         if let Some(id) = artifact.source_id {
             source_ids.insert(id);
         }
     }
-    for file in &files_touched {
+    for file in files_touched.values().flatten() {
         if let Some(id) = file.source_id {
             source_ids.insert(id);
         }
     }
-    for change in &vcs_changes {
+    for change in vcs_changes.values().flatten() {
         if let Some(id) = change.source_id {
             source_ids.insert(id);
         }
     }
-    for summary in &summaries {
+    for summary in summaries.values().flatten() {
         if let Some(id) = summary.source_id {
             source_ids.insert(id);
         }
     }
-    let mut sources = BTreeMap::new();
-    for source_id in source_ids {
-        if let Ok(source) = store.get_capture_source(source_id) {
-            sources.insert(source_id, source);
-        }
-    }
+    let sources = store.capture_sources_for_ids(&source_ids.into_iter().collect::<Vec<_>>())?;
+    Ok(record_ids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|id| {
+            let mut context = RecordContext {
+                sessions: sessions.remove(&id).unwrap_or_default(),
+                runs: runs.remove(&id).unwrap_or_default(),
+                events: events.remove(&id).unwrap_or_default(),
+                artifacts: artifacts.remove(&id).unwrap_or_default(),
+                files_touched: files_touched.remove(&id).unwrap_or_default(),
+                vcs_changes: vcs_changes.remove(&id).unwrap_or_default(),
+                summaries: summaries.remove(&id).unwrap_or_default(),
+                sources: BTreeMap::new(),
+            };
+            context.sources = sources
+                .iter()
+                .filter(|(source_id, _)| context_references_source(&context, **source_id))
+                .map(|(id, source)| (*id, source.clone()))
+                .collect();
+            (id, context)
+        })
+        .collect())
+}
 
-    Ok(RecordContext {
-        sessions,
-        runs,
-        events,
-        artifacts,
-        files_touched,
-        vcs_changes,
-        summaries,
-        sources,
-    })
+fn context_references_source(context: &RecordContext, id: Uuid) -> bool {
+    context
+        .sessions
+        .iter()
+        .any(|item| item.capture_source_id == Some(id))
+        || context.runs.iter().any(|item| item.source_id == Some(id))
+        || context
+            .events
+            .iter()
+            .any(|item| item.capture_source_id == Some(id))
+        || context
+            .artifacts
+            .iter()
+            .any(|item| item.source_id == Some(id))
+        || context
+            .files_touched
+            .iter()
+            .any(|item| item.source_id == Some(id))
+        || context
+            .vcs_changes
+            .iter()
+            .any(|item| item.source_id == Some(id))
+        || context
+            .summaries
+            .iter()
+            .any(|item| item.source_id == Some(id))
 }
 
 struct MatchAnalysis {
@@ -3281,6 +3352,200 @@ mod tests {
         (temp, store)
     }
 
+    fn reference_record_context(store: &Store, id: Uuid, file: Option<&str>) -> RecordContext {
+        let sessions = store.sessions_for_record(id).unwrap();
+        let runs = store.runs_for_record(id).unwrap();
+        let events = store.events_for_record(id).unwrap();
+        let artifacts = store.artifacts_for_record(id).unwrap();
+        let files_touched = match file.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(file) => store.files_touched_for_record_matching(id, file).unwrap(),
+            None => store.files_touched_for_record(id).unwrap(),
+        };
+        let vcs_changes = store.vcs_changes_for_record(id).unwrap();
+        let summaries = store.summaries_for_record(id).unwrap();
+        let mut source_ids = BTreeSet::new();
+        source_ids.extend(sessions.iter().filter_map(|value| value.capture_source_id));
+        source_ids.extend(runs.iter().filter_map(|value| value.source_id));
+        source_ids.extend(events.iter().filter_map(|value| value.capture_source_id));
+        source_ids.extend(artifacts.iter().filter_map(|value| value.source_id));
+        source_ids.extend(files_touched.iter().filter_map(|value| value.source_id));
+        source_ids.extend(vcs_changes.iter().filter_map(|value| value.source_id));
+        source_ids.extend(summaries.iter().filter_map(|value| value.source_id));
+        let sources = source_ids
+            .into_iter()
+            .filter_map(|id| store.get_capture_source(id).ok().map(|source| (id, source)))
+            .collect();
+        RecordContext {
+            sessions,
+            runs,
+            events,
+            artifacts,
+            files_touched,
+            vcs_changes,
+            summaries,
+            sources,
+        }
+    }
+
+    #[test]
+    fn batched_contexts_match_single_record_reference_and_chunk_formula() {
+        let mut archive = synthetic_perf_archive(5_020, 10);
+        archive.files_touched[0].old_path = Some("legacy/perf_profile_old.rs".into());
+        // Exercise indirect ownership instead of relying only on direct record IDs.
+        archive.runs[1].history_record_id = None;
+        let indirect_session_id = archive.sessions[1].id;
+        archive
+            .events
+            .iter_mut()
+            .filter(|event| event.session_id == Some(indirect_session_id))
+            .for_each(|event| event.history_record_id = None);
+        archive.summaries[1].history_record_id = None;
+        archive.files_touched[1].history_record_id = None;
+        // One source is shared between records. Missing-source behavior is
+        // covered below at the bounded source-loader boundary because schema
+        // foreign keys prevent creating a dangling entity reference.
+        let shared_source = archive.capture_sources[0].id;
+        archive.sessions[1].capture_source_id = Some(shared_source);
+        archive.runs[1].source_id = Some(shared_source);
+        let (_temp, mut store) = test_store();
+        store.import_archive(&archive, false).unwrap();
+        let ids = archive
+            .records
+            .iter()
+            .map(|record| record.id)
+            .collect::<Vec<_>>();
+
+        for count in [1, 37, 500] {
+            let before = store.relation_batch_executions();
+            let contexts = hydrate_record_contexts(&store, &ids[..count], None).unwrap();
+            assert_eq!(
+                store.relation_batch_executions() - before,
+                8,
+                "one statement per relation for {count} candidates"
+            );
+            let mut samples = vec![ids[0], ids[count - 1]];
+            if count > 2 {
+                samples.push(ids[count / 2]);
+            }
+            for id in samples {
+                assert_eq!(contexts[&id], reference_record_context(&store, id, None));
+            }
+        }
+
+        let before = store.relation_batch_executions();
+        let contexts = hydrate_record_contexts(&store, &ids[..501], None).unwrap();
+        assert_eq!(
+            store.relation_batch_executions() - before,
+            16,
+            "eight relations times two SQLite-ID chunks"
+        );
+        assert_eq!(
+            contexts[&ids[0]],
+            reference_record_context(&store, ids[0], None)
+        );
+        assert_eq!(
+            contexts[&ids[500]],
+            reference_record_context(&store, ids[500], None)
+        );
+
+        let nonexistent = Uuid::from_u128(u128::MAX);
+        assert!(store
+            .capture_sources_for_ids(&[nonexistent])
+            .unwrap()
+            .is_empty());
+        let requested = [ids[0], ids[0], nonexistent];
+        let contexts = hydrate_record_contexts(&store, &requested, None).unwrap();
+        assert_eq!(contexts.len(), 2);
+        assert_eq!(
+            contexts[&ids[0]],
+            reference_record_context(&store, ids[0], None)
+        );
+        assert_eq!(contexts[&nonexistent], RecordContext::default());
+        assert!(hydrate_record_contexts(&store, &[], None)
+            .unwrap()
+            .is_empty());
+
+        for filter in [
+            "perf_profile.rs",
+            "profile.rs",
+            "perf_profile_old.rs",
+            "missing.rs",
+        ] {
+            let contexts = hydrate_record_contexts(&store, &ids[..3], Some(filter)).unwrap();
+            for id in &ids[..3] {
+                assert_eq!(
+                    contexts[id],
+                    reference_record_context(&store, *id, Some(filter))
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "targeted fallback hydration evidence"]
+    fn fallback_batch_hydration_evidence() {
+        let archive = synthetic_perf_archive(600, 5);
+        let (_temp, mut store) = test_store();
+        store.import_archive(&archive, false).unwrap();
+        let ids = archive
+            .records
+            .iter()
+            .map(|record| record.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), 120);
+
+        let reference = ids
+            .iter()
+            .map(|id| (*id, reference_record_context(&store, *id, None)))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            hydrate_record_contexts(&store, &ids, None).unwrap(),
+            reference
+        );
+
+        let mut reference_ms = Vec::new();
+        let mut batch_ms = Vec::new();
+        let before = store.relation_batch_executions();
+        for _ in 0..5 {
+            let started = std::time::Instant::now();
+            let actual = hydrate_record_contexts(&store, &ids, None).unwrap();
+            batch_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+            assert_eq!(actual, reference);
+
+            let started = std::time::Instant::now();
+            let actual = ids
+                .iter()
+                .map(|id| (*id, reference_record_context(&store, *id, None)))
+                .collect::<BTreeMap<_, _>>();
+            reference_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+            assert_eq!(actual, reference);
+        }
+        reference_ms.sort_by(f64::total_cmp);
+        batch_ms.sort_by(f64::total_cmp);
+        let batch_statements = (store.relation_batch_executions() - before) / 5;
+        let reference_statements = ids.len() as u64 * 8;
+        let reduction = 1.0 - batch_statements as f64 / reference_statements as f64;
+        let reference_p95 = reference_ms[4];
+        let batch_p95 = batch_ms[4];
+        assert!(reduction >= 0.40);
+        assert!(
+            batch_p95 <= reference_p95 * 1.05,
+            "targeted total regressed: batch={batch_p95:.3}ms reference={reference_p95:.3}ms"
+        );
+        println!(
+            "fallback batch hydration evidence: {}",
+            serde_json::json!({
+                "profile": "fallback-batch-hydration-v1", "candidates": ids.len(), "relations": 8,
+                "warm_samples": 5, "reference_samples_ms": reference_ms, "batch_samples_ms": batch_ms,
+                "reference_p95_ms": reference_p95, "batch_p95_ms": batch_p95,
+                "reference_statements": reference_statements, "batch_statements": batch_statements,
+                "statement_reduction_percent": reduction * 100.0,
+                "gate_basis": "statement reduction >=40% and targeted batch p95 <= reference p95 * 1.05",
+                "fallback_proof": "calls the production fallback hydrate_record_contexts and retained single-record reference directly"
+            })
+        );
+    }
+
     fn insert_match_mode_corpus(store: &Store, event_count: i64) -> Vec<Uuid> {
         let base_session_id = Uuid::parse_str("018f45d0-0000-7000-8000-000000001001").unwrap();
         let filler_record = HistoryRecord::new(
@@ -4465,6 +4730,46 @@ mod tests {
         .unwrap();
         assert!(secret_packet.results.is_empty());
 
+        let shared_record =
+            HistoryRecord::new("Shared relations", "plain", Vec::new(), "task", None);
+        store.insert_record(&shared_record).unwrap();
+        for (offset, target_type, target_id) in [
+            (1_u128, HistoryRecordLinkTargetType::Artifact, artifact.id),
+            (2_u128, HistoryRecordLinkTargetType::VcsChange, change.id),
+        ] {
+            store
+                .upsert_history_record_link(&HistoryRecordLink {
+                    id: Uuid::from_u128(shared_record.id.as_u128().wrapping_add(offset)),
+                    history_record_id: shared_record.id,
+                    target_type,
+                    target_id,
+                    link_type: HistoryRecordLinkType::References,
+                    confidence: Confidence::Explicit,
+                    source_id: None,
+                    timestamps: timestamps(),
+                    sync: sync_metadata(),
+                })
+                .unwrap();
+        }
+        let contexts =
+            hydrate_record_contexts(&store, &[record.id, shared_record.id], None).unwrap();
+        assert_eq!(
+            contexts[&record.id],
+            reference_record_context(&store, record.id, None)
+        );
+        assert_eq!(
+            contexts[&shared_record.id],
+            reference_record_context(&store, shared_record.id, None)
+        );
+        assert_eq!(
+            contexts[&record.id].artifacts[0].id,
+            contexts[&shared_record.id].artifacts[0].id
+        );
+        assert_eq!(
+            contexts[&record.id].vcs_changes[0].id,
+            contexts[&shared_record.id].vcs_changes[0].id
+        );
+
         maybe_write_synthetic_search_smoke_artifact();
     }
 
@@ -5133,6 +5438,25 @@ mod tests {
         };
         store.upsert_event(&event).unwrap();
         store.upsert_record(&record).unwrap();
+
+        // Call the fallback selector directly so this remains a targeted
+        // hydration regression even when the event fast path supports the
+        // same source filter.
+        let before = store.relation_batch_executions();
+        let fallback_options = PacketOptions {
+            limit: 10,
+            filters: SearchFilters {
+                history_source: Some("dorkos/default".into()),
+                ..SearchFilters::default()
+            },
+            ..PacketOptions::default()
+        };
+        let fallback_plan =
+            SearchQueryPlan::new(fallback_options.match_mode, ["dorkos-source-filter-needle"]);
+        let fallback =
+            ranked_candidates(&store, Some(&fallback_plan), &fallback_options, None).unwrap();
+        assert_eq!(fallback.candidates.len(), 1);
+        assert_eq!(store.relation_batch_executions() - before, 8);
 
         let packet = search_packet(
             &store,

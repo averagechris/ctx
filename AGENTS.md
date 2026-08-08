@@ -20,6 +20,19 @@ This is a hard fork of [ctxrs/ctx](https://github.com/ctxrs/ctx) maintained at
 - `crates/ctx-cli/tests/cli.rs` is the behavioral contract — lean on it when
   refactoring; extend it when changing command behavior.
 
+## Issue tracker
+
+- Use todo.sr.ht tracker `~averagechris/projects`; the local `srht` CLI
+  automatically scopes this repository with `repo:ctx`.
+- Apply exactly one conventional-commit type label (`chore`, `fix`, `feature`,
+  `security`, `docs`, `refactor`, or `perf`). Add an optional Fibonacci
+  `points:N` label for estimated work; tracking/index tickets need no points.
+- Common JSON commands: `srht --json todo list`, `srht --json todo show ID`,
+  `srht --json todo new 'Title' -l TYPE -l points:N`,
+  `srht --json todo start ID`, and
+  `srht --json todo done ID --resolution fixed`. Use
+  `-t '~averagechris/projects'` when explicit tracker selection matters.
+
 ## Fork guardrails
 
 - **No network calls from the binary, ever.** This fork removed telemetry

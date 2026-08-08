@@ -313,6 +313,7 @@ dependencies = [
  "ctx-history-store",
  "libc",
  "regex",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

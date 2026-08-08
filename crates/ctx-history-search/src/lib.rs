@@ -7778,6 +7778,226 @@ mod tests {
 
     const SQLITE_SEARCH_BASELINE_COMMAND: &str = "cargo test -q -p ctx-history-search --release tests::synthetic_search_sqlite_baseline_evidence -- --ignored --exact --nocapture";
 
+    const SQLITE_CACHE_TUNING_COMMAND: &str = "cargo test -q -p ctx-history-search --release tests::synthetic_search_sqlite_cache_tuning_evidence -- --ignored --exact --nocapture";
+
+    // These are the two SQLite phases used by the large-event search path,
+    // reduced to their database work so each arm can use an explicitly tuned,
+    // disposable read-only connection. Keep the SQL here byte-for-byte
+    // representative of the production candidate ordering and joins; this is
+    // evidence code, not an alternate production query implementation.
+    const SQLITE_TUNING_UNFILTERED_SQL: &str = r#"
+        SELECT event_search.event_id
+        FROM event_search
+        JOIN events e ON e.id = event_search.event_id
+        WHERE event_search MATCH ?1
+        ORDER BY bm25(event_search), e.occurred_at_ms DESC, e.seq DESC, event_search.event_id
+        LIMIT ?2 OFFSET ?3
+    "#;
+
+    const SQLITE_TUNING_FILTERED_SQL: &str = r#"
+        SELECT event_search.event_id
+        FROM event_search
+        JOIN events e ON e.id = event_search.event_id
+        LEFT JOIN runs r ON r.id = e.run_id
+        LEFT JOIN sessions s ON s.id = COALESCE(e.session_id, event_search.session_id)
+        LEFT JOIN sessions rs ON rs.id = r.session_id
+        LEFT JOIN capture_sources event_source ON event_source.id = e.capture_source_id
+        LEFT JOIN capture_sources session_source ON session_source.id = COALESCE(s.capture_source_id, rs.capture_source_id)
+        LEFT JOIN capture_sources run_source ON run_source.id = r.source_id
+        WHERE event_search MATCH ?1
+          AND COALESCE(s.provider, rs.provider, event_source.provider, session_source.provider, run_source.provider) = ?4
+          AND e.event_type = ?5
+        ORDER BY bm25(event_search), e.occurred_at_ms DESC, e.seq DESC, event_search.event_id
+        LIMIT ?2 OFFSET ?3
+    "#;
+
+    #[test]
+    #[ignore = "evidence-only SQLite cache-size tuning; intentionally has no performance gates"]
+    fn synthetic_search_sqlite_cache_tuning_evidence() {
+        let provenance = local_jj_provenance().unwrap_or_else(|error| {
+            panic!("SQLite tuning requires jj commit/change provenance: {error}")
+        });
+        let evidence = sqlite_cache_tuning_evidence(200_000, 50, 5, &provenance);
+        println!(
+            "sqlite cache tuning evidence: {}",
+            serde_json::to_string(&evidence).unwrap()
+        );
+    }
+
+    fn sqlite_cache_tuning_evidence(
+        event_count: usize,
+        events_per_record: usize,
+        sample_count: usize,
+        provenance: &BaselineProvenance,
+    ) -> serde_json::Value {
+        assert_eq!(event_count, 200_000, "this spike is fixed at 200k events");
+        assert_eq!(sample_count, 5, "this spike is fixed at five warm samples");
+        let archive = synthetic_perf_archive(event_count, events_per_record);
+        let (_temp, mut store) = test_store();
+        store.import_archive(&archive, false).unwrap();
+        let db_path = store.path().to_path_buf();
+        drop(store);
+
+        let plans = sqlite_tuning_plans(&db_path);
+        let opening_a = sqlite_cache_tuning_arm(&db_path, -32_768, sample_count);
+        let b = sqlite_cache_tuning_arm(&db_path, -131_072, sample_count);
+        let closing_a = sqlite_cache_tuning_arm(&db_path, -32_768, sample_count);
+        let integrity = sqlite_tuning_integrity(&db_path);
+        assert_eq!(opening_a["effective_cache_size_kib"], -32_768);
+        assert_eq!(b["effective_cache_size_kib"], -131_072);
+        assert_eq!(closing_a["effective_cache_size_kib"], -32_768);
+        assert_eq!(opening_a["result_summary"], b["result_summary"]);
+        assert_eq!(opening_a["result_summary"], closing_a["result_summary"]);
+        assert_eq!(integrity, "ok");
+
+        serde_json::json!({
+            "profile": "sqlite-cache-size-tuning-v1",
+            "hypothesis": "32 MiB SQLite page cache versus 128 MiB on disposable read-only connections",
+            "corpus": {
+                "events": event_count,
+                "events_per_record": events_per_record,
+                "records": archive.records.len(),
+                "capture_sources": archive.capture_sources.len(),
+                "sessions": archive.sessions.len(),
+                "runs": archive.runs.len(),
+                "summaries": archive.summaries.len(),
+                "files_touched": archive.files_touched.len()
+            },
+            "db_size_bytes": sqlite_footprint_bytes(&db_path),
+            "schema_integrity_check": integrity,
+            "plans": plans,
+            "arms_in_order": {
+                "opening_a_32_mib": opening_a,
+                "b_128_mib": b,
+                "closing_a_32_mib": closing_a
+            },
+            "warm_samples": sample_count,
+            "sample_order": "A/B/A; five warm samples per arm",
+            "canonical_reproduction_command": SQLITE_CACHE_TUNING_COMMAND,
+            "executed_test_invocation": current_test_invocation(),
+            "jj_commit_id": provenance.commit_id,
+            "jj_change_id": provenance.change_id,
+            "index_hypothesis": "not tested; this bounded spike used only the cache-size hypothesis"
+        })
+    }
+
+    fn sqlite_tuning_connection(path: &Path, cache_size_kib: i64) -> rusqlite::Connection {
+        let conn =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        conn.execute_batch(&format!(
+            "PRAGMA query_only = ON; PRAGMA temp_store = MEMORY; PRAGMA cache_size = {cache_size_kib};"
+        ))
+        .unwrap();
+        conn
+    }
+
+    fn sqlite_tuning_plans(path: &Path) -> serde_json::Value {
+        let conn = sqlite_tuning_connection(path, -32_768);
+        serde_json::json!({
+            "unfiltered": sqlite_tuning_explain(&conn, SQLITE_TUNING_UNFILTERED_SQL, false),
+            "filtered": sqlite_tuning_explain(&conn, SQLITE_TUNING_FILTERED_SQL, true)
+        })
+    }
+
+    fn sqlite_tuning_explain(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        filtered: bool,
+    ) -> Vec<String> {
+        let explain = format!("EXPLAIN QUERY PLAN {sql}");
+        let mut stmt = conn.prepare(&explain).unwrap();
+        let params: &[&dyn rusqlite::ToSql] = if filtered {
+            &[&"perfneedle", &192_i64, &0_i64, &"codex", &"tool_call"]
+        } else {
+            &[&"perfneedle", &192_i64, &0_i64]
+        };
+        stmt.query_map(params, |row| row.get(3))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect()
+    }
+
+    fn sqlite_cache_tuning_arm(
+        path: &Path,
+        cache_size_kib: i64,
+        sample_count: usize,
+    ) -> serde_json::Value {
+        let conn = sqlite_tuning_connection(path, cache_size_kib);
+        let effective_cache_size_kib: i64 = conn
+            .query_row("PRAGMA cache_size", [], |row| row.get(0))
+            .unwrap();
+        let warm_params_unfiltered: [&dyn rusqlite::ToSql; 3] = [&"perfneedle", &192_i64, &0_i64];
+        let warm_params_filtered: [&dyn rusqlite::ToSql; 5] =
+            [&"perfneedle", &192_i64, &0_i64, &"codex", &"tool_call"];
+        sqlite_tuning_query(&conn, SQLITE_TUNING_UNFILTERED_SQL, &warm_params_unfiltered);
+        sqlite_tuning_query(&conn, SQLITE_TUNING_FILTERED_SQL, &warm_params_filtered);
+
+        let mut unfiltered_samples = Vec::with_capacity(sample_count);
+        let mut filtered_samples = Vec::with_capacity(sample_count);
+        let mut total_samples = Vec::with_capacity(sample_count);
+        let mut unfiltered_ids = Vec::new();
+        let mut filtered_ids = Vec::new();
+        for _ in 0..sample_count {
+            let total_started = std::time::Instant::now();
+            let started = std::time::Instant::now();
+            let current_unfiltered =
+                sqlite_tuning_query(&conn, SQLITE_TUNING_UNFILTERED_SQL, &warm_params_unfiltered);
+            unfiltered_samples.push(elapsed_ms(started.elapsed()));
+            let started = std::time::Instant::now();
+            let current_filtered =
+                sqlite_tuning_query(&conn, SQLITE_TUNING_FILTERED_SQL, &warm_params_filtered);
+            filtered_samples.push(elapsed_ms(started.elapsed()));
+            total_samples.push(elapsed_ms(total_started.elapsed()));
+            if unfiltered_ids.is_empty() {
+                unfiltered_ids = current_unfiltered;
+                filtered_ids = current_filtered;
+            } else {
+                assert_eq!(unfiltered_ids, current_unfiltered);
+                assert_eq!(filtered_ids, current_filtered);
+            }
+        }
+
+        serde_json::json!({
+            "requested_cache_size_kib": cache_size_kib,
+            "effective_cache_size_kib": effective_cache_size_kib,
+            "effective_cache_size_mib": (-effective_cache_size_kib) as f64 / 1024.0,
+            "unfiltered": timing_stats(&unfiltered_samples).to_json(),
+            "filtered": timing_stats(&filtered_samples).to_json(),
+            "total": timing_stats(&total_samples).to_json(),
+            "result_summary": {
+                "unfiltered": sqlite_tuning_result_summary(&unfiltered_ids),
+                "filtered": sqlite_tuning_result_summary(&filtered_ids)
+            }
+        })
+    }
+
+    fn sqlite_tuning_result_summary(ids: &[String]) -> serde_json::Value {
+        serde_json::json!({
+            "count": ids.len(),
+            "first": ids.first(),
+            "last": ids.last()
+        })
+    }
+
+    fn sqlite_tuning_query(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        params: &[&dyn rusqlite::ToSql],
+    ) -> Vec<String> {
+        let mut stmt = conn.prepare(sql).unwrap();
+        stmt.query_map(params, |row| row.get(0))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect()
+    }
+
+    fn sqlite_tuning_integrity(path: &Path) -> String {
+        let conn = sqlite_tuning_connection(path, -32_768);
+        conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap()
+    }
+
     #[test]
     #[ignore = "evidence-only SQLite search baseline; intentionally has no performance gates"]
     fn synthetic_search_sqlite_baseline_evidence() {

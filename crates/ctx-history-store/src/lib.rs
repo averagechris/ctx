@@ -1177,6 +1177,107 @@ pub struct RecordSearchHit {
     pub score: f64,
 }
 
+/// Narrow, store-owned projections for fallback search hydration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchSessionRow {
+    pub id: Uuid,
+    pub parent_session_id: Option<Uuid>,
+    pub root_session_id: Option<Uuid>,
+    pub capture_source_id: Option<Uuid>,
+    pub provider: CaptureProvider,
+    pub external_session_id: Option<String>,
+    pub external_agent_id: Option<String>,
+    pub agent_type: AgentType,
+    pub role_hint: Option<String>,
+    pub is_primary: bool,
+    pub status: SessionStatus,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: Option<DateTime<Utc>>,
+    pub metadata: Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchRunRow {
+    pub id: Uuid,
+    pub session_id: Option<Uuid>,
+    pub run_type: RunType,
+    pub status: RunStatus,
+    pub started_at: DateTime<Utc>,
+    pub exit_code: Option<i32>,
+    pub cwd: Option<String>,
+    pub command_preview: Option<String>,
+    pub source_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchEventRow {
+    pub id: Uuid,
+    pub seq: u64,
+    pub session_id: Option<Uuid>,
+    pub run_id: Option<Uuid>,
+    pub event_type: EventType,
+    pub role: Option<EventRole>,
+    pub occurred_at: DateTime<Utc>,
+    pub capture_source_id: Option<Uuid>,
+    pub payload: Value,
+    pub dedupe_key: Option<String>,
+    pub redaction_state: RedactionState,
+    pub metadata: Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchArtifactRow {
+    pub id: Uuid,
+    pub kind: ArtifactKind,
+    pub blob_path: String,
+    pub media_type: Option<String>,
+    pub preview_text: Option<String>,
+    pub updated_at: DateTime<Utc>,
+    pub source_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchFileTouchedRow {
+    pub id: Uuid,
+    pub event_id: Option<Uuid>,
+    pub path: String,
+    pub change_kind: Option<ctx_history_core::FileChangeKind>,
+    pub old_path: Option<String>,
+    pub updated_at: DateTime<Utc>,
+    pub source_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchVcsChangeRow {
+    pub id: Uuid,
+    pub kind: ctx_history_core::VcsChangeKind,
+    pub change_id: String,
+    pub parent_change_ids: Vec<String>,
+    pub branch_or_bookmark: Option<String>,
+    pub tree_hash: Option<String>,
+    pub author_time: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+    pub source_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchSummaryRow {
+    pub id: Uuid,
+    pub text: String,
+    pub updated_at: DateTime<Utc>,
+    pub source_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchCaptureSourceRow {
+    pub id: Uuid,
+    pub provider: CaptureProvider,
+    pub cwd: Option<String>,
+    pub raw_source_path: Option<String>,
+    pub external_session_id: Option<String>,
+    pub metadata: Value,
+}
+
 /// Agent-scope predicate that can be enforced inside the ranked event-search
 /// SQL page. For schema-valid rows produced by supported store write paths,
 /// both variants mirror `event_hit_matches_agent_scope` in
@@ -2083,6 +2184,8 @@ pub struct Store {
     record_list_page_executions: std::cell::Cell<u64>,
     #[cfg(feature = "test-utils")]
     relation_batch_executions: std::cell::Cell<u64>,
+    #[cfg(feature = "test-utils")]
+    search_hydration_loader_executions: std::cell::Cell<[u64; 2]>,
 }
 
 impl Store {
@@ -2125,6 +2228,8 @@ impl Store {
             record_list_page_executions: std::cell::Cell::new(0),
             #[cfg(feature = "test-utils")]
             relation_batch_executions: std::cell::Cell::new(0),
+            #[cfg(feature = "test-utils")]
+            search_hydration_loader_executions: std::cell::Cell::new([0; 2]),
         })
     }
 
@@ -2223,6 +2328,8 @@ impl Store {
             record_list_page_executions: std::cell::Cell::new(0),
             #[cfg(feature = "test-utils")]
             relation_batch_executions: std::cell::Cell::new(0),
+            #[cfg(feature = "test-utils")]
+            search_hydration_loader_executions: std::cell::Cell::new([0; 2]),
         };
         // Schema validation is deliberately the first operation for an
         // existing database. Unsupported versions must not trigger chmod,
@@ -2655,6 +2762,8 @@ impl Store {
     }
 
     pub fn capture_sources_for_ids(&self, ids: &[Uuid]) -> Result<BTreeMap<Uuid, CaptureSource>> {
+        #[cfg(feature = "test-utils")]
+        self.increment_search_hydration_loader(false);
         let mut sources = BTreeMap::new();
         for chunk in distinct_uuid_chunks(ids) {
             #[cfg(feature = "test-utils")]
@@ -2663,6 +2772,28 @@ impl Store {
             let sql = format!("SELECT id, kind, provider, machine_id, process_id, cwd, raw_source_path, external_session_id, started_at_ms, ended_at_ms, fidelity, visibility, sync_state, sync_version, metadata_json FROM capture_sources WHERE id IN ({}) ORDER BY id", sql_placeholders(chunk.len()));
             let mut stmt = self.conn.prepare(&sql)?;
             let rows = stmt.query_map(uuid_values(&chunk), capture_source_from_row)?;
+            for row in rows {
+                let source = row?;
+                sources.insert(source.id, source);
+            }
+        }
+        Ok(sources)
+    }
+
+    pub fn search_capture_sources_for_ids(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<BTreeMap<Uuid, SearchCaptureSourceRow>> {
+        #[cfg(feature = "test-utils")]
+        self.increment_search_hydration_loader(true);
+        let mut sources = BTreeMap::new();
+        for chunk in distinct_uuid_chunks(ids) {
+            #[cfg(feature = "test-utils")]
+            self.relation_batch_executions
+                .set(self.relation_batch_executions.get().saturating_add(1));
+            let sql = format!("SELECT id, provider, cwd, raw_source_path, external_session_id, metadata_json FROM capture_sources WHERE id IN ({}) ORDER BY id", sql_placeholders(chunk.len()));
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(uuid_values(&chunk), search_capture_source_from_row)?;
             for row in rows {
                 let source = row?;
                 sources.insert(source.id, source);
@@ -3567,6 +3698,8 @@ impl Store {
     }
 
     pub fn sessions_for_records(&self, ids: &[Uuid]) -> Result<BTreeMap<Uuid, Vec<Session>>> {
+        #[cfg(feature = "test-utils")]
+        self.increment_search_hydration_loader(false);
         self.relations_for_records(
             ids,
             session_select_sql(""),
@@ -3575,6 +3708,24 @@ impl Store {
             "sessions.started_at_ms, sessions.id",
             23,
             session_from_row,
+            &[],
+        )
+    }
+
+    pub fn search_sessions_for_records(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<BTreeMap<Uuid, Vec<SearchSessionRow>>> {
+        #[cfg(feature = "test-utils")]
+        self.increment_search_hydration_loader(true);
+        self.relations_for_records(
+            ids,
+            search_session_select_sql(""),
+            "FROM sessions",
+            "sessions.history_record_id = requested.record_id",
+            "sessions.started_at_ms, sessions.id",
+            14,
+            search_session_from_row,
             &[],
         )
     }
@@ -3797,7 +3948,18 @@ impl Store {
     }
 
     pub fn runs_for_records(&self, ids: &[Uuid]) -> Result<BTreeMap<Uuid, Vec<Run>>> {
+        #[cfg(feature = "test-utils")]
+        self.increment_search_hydration_loader(false);
         self.relations_for_records(ids, run_select_sql(""), "FROM runs", "runs.history_record_id = requested.record_id OR runs.session_id IN (SELECT id FROM sessions WHERE history_record_id = requested.record_id)", "runs.started_at_ms, runs.id", 21, run_from_row, &[])
+    }
+
+    pub fn search_runs_for_records(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<BTreeMap<Uuid, Vec<SearchRunRow>>> {
+        #[cfg(feature = "test-utils")]
+        self.increment_search_hydration_loader(true);
+        self.relations_for_records(ids, search_run_select_sql(""), "FROM runs", "runs.history_record_id = requested.record_id OR runs.session_id IN (SELECT id FROM sessions WHERE history_record_id = requested.record_id)", "runs.started_at_ms, runs.id", 9, search_run_from_row, &[])
     }
 
     fn list_runs(&self) -> Result<Vec<Run>> {
@@ -4224,7 +4386,18 @@ impl Store {
     }
 
     pub fn events_for_records(&self, ids: &[Uuid]) -> Result<BTreeMap<Uuid, Vec<Event>>> {
+        #[cfg(feature = "test-utils")]
+        self.increment_search_hydration_loader(false);
         self.relations_for_records(ids, event_select_sql(""), "FROM events", "events.history_record_id = requested.record_id OR events.session_id IN (SELECT id FROM sessions WHERE history_record_id = requested.record_id) OR events.run_id IN (SELECT id FROM runs WHERE history_record_id = requested.record_id OR session_id IN (SELECT id FROM sessions WHERE history_record_id = requested.record_id))", "events.seq, events.occurred_at_ms", 19, event_from_row, &[])
+    }
+
+    pub fn search_events_for_records(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<BTreeMap<Uuid, Vec<SearchEventRow>>> {
+        #[cfg(feature = "test-utils")]
+        self.increment_search_hydration_loader(true);
+        self.relations_for_records(ids, search_event_select_sql(""), "FROM events", "events.history_record_id = requested.record_id OR events.session_id IN (SELECT id FROM sessions WHERE history_record_id = requested.record_id) OR events.run_id IN (SELECT id FROM runs WHERE history_record_id = requested.record_id OR session_id IN (SELECT id FROM sessions WHERE history_record_id = requested.record_id))", "events.seq, events.occurred_at_ms", 12, search_event_from_row, &[])
     }
 
     fn list_events(&self) -> Result<Vec<Event>> {
@@ -4649,12 +4822,28 @@ impl Store {
     }
 
     pub fn artifacts_for_records(&self, ids: &[Uuid]) -> Result<BTreeMap<Uuid, Vec<Artifact>>> {
+        #[cfg(feature = "test-utils")]
+        self.increment_search_hydration_loader(false);
         self.relations_for_records(ids, artifact_select_sql(""), "FROM artifacts", r#"artifacts.id IN (
             SELECT transcript_blob_id FROM sessions WHERE history_record_id = requested.record_id AND transcript_blob_id IS NOT NULL
             UNION SELECT input_blob_id FROM runs WHERE (history_record_id = requested.record_id OR session_id IN (SELECT id FROM sessions WHERE history_record_id = requested.record_id)) AND input_blob_id IS NOT NULL
             UNION SELECT output_blob_id FROM runs WHERE (history_record_id = requested.record_id OR session_id IN (SELECT id FROM sessions WHERE history_record_id = requested.record_id)) AND output_blob_id IS NOT NULL
             UNION SELECT payload_blob_id FROM events WHERE (history_record_id = requested.record_id OR session_id IN (SELECT id FROM sessions WHERE history_record_id = requested.record_id)) AND payload_blob_id IS NOT NULL
             UNION SELECT target_id FROM history_record_links WHERE history_record_id = requested.record_id AND target_type = 'artifact')"#, "artifacts.updated_at_ms DESC, artifacts.id", 17, artifact_from_row, &[])
+    }
+
+    pub fn search_artifacts_for_records(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<BTreeMap<Uuid, Vec<SearchArtifactRow>>> {
+        #[cfg(feature = "test-utils")]
+        self.increment_search_hydration_loader(true);
+        self.relations_for_records(ids, search_artifact_select_sql(""), "FROM artifacts", r#"artifacts.id IN (
+            SELECT transcript_blob_id FROM sessions WHERE history_record_id = requested.record_id AND transcript_blob_id IS NOT NULL
+            UNION SELECT input_blob_id FROM runs WHERE (history_record_id = requested.record_id OR session_id IN (SELECT id FROM sessions WHERE history_record_id = requested.record_id)) AND input_blob_id IS NOT NULL
+            UNION SELECT output_blob_id FROM runs WHERE (history_record_id = requested.record_id OR session_id IN (SELECT id FROM sessions WHERE history_record_id = requested.record_id)) AND output_blob_id IS NOT NULL
+            UNION SELECT payload_blob_id FROM events WHERE (history_record_id = requested.record_id OR session_id IN (SELECT id FROM sessions WHERE history_record_id = requested.record_id)) AND payload_blob_id IS NOT NULL
+            UNION SELECT target_id FROM history_record_links WHERE history_record_id = requested.record_id AND target_type = 'artifact')"#, "artifacts.updated_at_ms DESC, artifacts.id", 7, search_artifact_from_row, &[])
     }
 
     pub fn vcs_changes_for_record(&self, record_id: Uuid) -> Result<Vec<VcsChange>> {
@@ -4676,7 +4865,18 @@ impl Store {
     }
 
     pub fn vcs_changes_for_records(&self, ids: &[Uuid]) -> Result<BTreeMap<Uuid, Vec<VcsChange>>> {
+        #[cfg(feature = "test-utils")]
+        self.increment_search_hydration_loader(false);
         self.relations_for_records(ids, vcs_change_select_sql(""), "FROM vcs_changes", "vcs_changes.id IN (SELECT target_id FROM history_record_links WHERE history_record_id = requested.record_id AND target_type = 'vcs_change')", "vcs_changes.updated_at_ms DESC, vcs_changes.id", 18, vcs_change_from_row, &[])
+    }
+
+    pub fn search_vcs_changes_for_records(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<BTreeMap<Uuid, Vec<SearchVcsChangeRow>>> {
+        #[cfg(feature = "test-utils")]
+        self.increment_search_hydration_loader(true);
+        self.relations_for_records(ids, search_vcs_change_select_sql(""), "FROM vcs_changes", "vcs_changes.id IN (SELECT target_id FROM history_record_links WHERE history_record_id = requested.record_id AND target_type = 'vcs_change')", "vcs_changes.updated_at_ms DESC, vcs_changes.id", 9, search_vcs_change_from_row, &[])
     }
 
     pub fn summaries_for_record(&self, record_id: Uuid) -> Result<Vec<Summary>> {
@@ -4695,7 +4895,18 @@ impl Store {
     }
 
     pub fn summaries_for_records(&self, ids: &[Uuid]) -> Result<BTreeMap<Uuid, Vec<Summary>>> {
+        #[cfg(feature = "test-utils")]
+        self.increment_search_hydration_loader(false);
         self.relations_for_records(ids, summary_select_sql(""), "FROM summaries", "summaries.history_record_id = requested.record_id OR summaries.session_id IN (SELECT id FROM sessions WHERE history_record_id = requested.record_id)", "summaries.updated_at_ms DESC, summaries.id", 16, summary_from_row, &[])
+    }
+
+    pub fn search_summaries_for_records(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<BTreeMap<Uuid, Vec<SearchSummaryRow>>> {
+        #[cfg(feature = "test-utils")]
+        self.increment_search_hydration_loader(true);
+        self.relations_for_records(ids, search_summary_select_sql(""), "FROM summaries", "summaries.history_record_id = requested.record_id OR summaries.session_id IN (SELECT id FROM sessions WHERE history_record_id = requested.record_id)", "summaries.updated_at_ms DESC, summaries.id", 4, search_summary_from_row, &[])
     }
 
     pub fn files_touched_for_record(&self, record_id: Uuid) -> Result<Vec<FileTouched>> {
@@ -4726,6 +4937,8 @@ impl Store {
         &self,
         ids: &[Uuid],
     ) -> Result<BTreeMap<Uuid, Vec<FileTouched>>> {
+        #[cfg(feature = "test-utils")]
+        self.increment_search_hydration_loader(false);
         self.files_touched_for_records_inner(ids, None)
     }
 
@@ -4734,10 +4947,52 @@ impl Store {
         ids: &[Uuid],
         file: &str,
     ) -> Result<BTreeMap<Uuid, Vec<FileTouched>>> {
+        #[cfg(feature = "test-utils")]
+        self.increment_search_hydration_loader(false);
         let Some((exact, suffix)) = file_touch_match_values(file) else {
             return Ok(empty_relation_map(ids));
         };
         self.files_touched_for_records_inner(ids, Some((exact, suffix)))
+    }
+
+    pub fn search_files_touched_for_records(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<BTreeMap<Uuid, Vec<SearchFileTouchedRow>>> {
+        self.search_files_touched_for_records_inner(ids, None)
+    }
+
+    pub fn search_files_touched_for_records_matching(
+        &self,
+        ids: &[Uuid],
+        file: &str,
+    ) -> Result<BTreeMap<Uuid, Vec<SearchFileTouchedRow>>> {
+        let Some((exact, suffix)) = file_touch_match_values(file) else {
+            return Ok(empty_relation_map(ids));
+        };
+        self.search_files_touched_for_records_inner(ids, Some((exact, suffix)))
+    }
+
+    fn search_files_touched_for_records_inner(
+        &self,
+        ids: &[Uuid],
+        file: Option<(String, String)>,
+    ) -> Result<BTreeMap<Uuid, Vec<SearchFileTouchedRow>>> {
+        #[cfg(feature = "test-utils")]
+        self.increment_search_hydration_loader(true);
+        let mut extra = Vec::new();
+        let file_predicate = if let Some((exact, suffix)) = file {
+            extra = vec![
+                SqlValue::Text(exact.clone()),
+                SqlValue::Text(exact),
+                SqlValue::Text(suffix.clone()),
+                SqlValue::Text(suffix),
+            ];
+            " AND (files_touched.path = ? OR files_touched.old_path = ? OR files_touched.path LIKE ? ESCAPE '\\' OR files_touched.old_path LIKE ? ESCAPE '\\')"
+        } else {
+            ""
+        };
+        self.relations_for_records(ids, search_file_touched_select_sql(""), "FROM files_touched", &format!("(files_touched.history_record_id = requested.record_id OR files_touched.run_id IN (SELECT id FROM runs WHERE history_record_id = requested.record_id OR session_id IN (SELECT id FROM sessions WHERE history_record_id = requested.record_id)) OR files_touched.event_id IN (SELECT id FROM events WHERE history_record_id = requested.record_id OR session_id IN (SELECT id FROM sessions WHERE history_record_id = requested.record_id))){file_predicate}"), "files_touched.updated_at_ms DESC, files_touched.id", 7, search_file_touched_from_row, &extra)
     }
 
     fn files_touched_for_records_inner(
@@ -5465,6 +5720,26 @@ impl Store {
     #[doc(hidden)]
     pub fn relation_batch_executions(&self) -> u64 {
         self.relation_batch_executions.get()
+    }
+
+    #[cfg(feature = "test-utils")]
+    fn increment_search_hydration_loader(&self, narrow: bool) {
+        let mut counts = self.search_hydration_loader_executions.get();
+        counts[usize::from(narrow)] = counts[usize::from(narrow)].saturating_add(1);
+        self.search_hydration_loader_executions.set(counts);
+    }
+
+    /// Full and narrow relation-loader calls since the last reset.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn search_hydration_loader_executions(&self) -> [u64; 2] {
+        self.search_hydration_loader_executions.get()
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn reset_search_hydration_loader_executions(&self) {
+        self.search_hydration_loader_executions.set([0; 2]);
     }
 
     pub fn search_event_hits_plan_page(
@@ -9509,6 +9784,19 @@ fn capture_source_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CaptureS
     })
 }
 
+fn search_capture_source_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<SearchCaptureSourceRow> {
+    Ok(SearchCaptureSourceRow {
+        id: parse_uuid(row.get::<_, String>(0)?)?,
+        provider: parse_text_enum::<CaptureProvider>(row.get::<_, String>(1)?)?,
+        cwd: row.get(2)?,
+        raw_source_path: row.get(3)?,
+        external_session_id: row.get(4)?,
+        metadata: parse_json(row.get::<_, String>(5)?)?,
+    })
+}
+
 fn catalog_session_select_sql(tail: &str) -> String {
     format!(
         "SELECT source_path, provider, source_format, source_root, external_session_id, parent_external_session_id, agent_type, role_hint, external_agent_id, cwd, session_started_at_ms, file_size_bytes, file_modified_at_ms, cataloged_at_ms, metadata_json FROM catalog_sessions {tail}"
@@ -9658,6 +9946,29 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
     })
 }
 
+fn search_session_select_sql(tail: &str) -> String {
+    format!("SELECT id, parent_session_id, root_session_id, capture_source_id, provider, external_session_id, external_agent_id, agent_type, role_hint, is_primary, status, started_at_ms, ended_at_ms, metadata_json FROM sessions {tail}")
+}
+
+fn search_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SearchSessionRow> {
+    Ok(SearchSessionRow {
+        id: parse_uuid(row.get::<_, String>(0)?)?,
+        parent_session_id: parse_optional_uuid(row.get(1)?)?,
+        root_session_id: parse_optional_uuid(row.get(2)?)?,
+        capture_source_id: parse_optional_uuid(row.get(3)?)?,
+        provider: parse_text_enum::<CaptureProvider>(row.get::<_, String>(4)?)?,
+        external_session_id: row.get(5)?,
+        external_agent_id: row.get(6)?,
+        agent_type: parse_text_enum::<AgentType>(row.get::<_, String>(7)?)?,
+        role_hint: row.get(8)?,
+        is_primary: row.get::<_, i64>(9)? != 0,
+        status: parse_text_enum::<SessionStatus>(row.get::<_, String>(10)?)?,
+        started_at: ms_to_time(row.get(11)?)?,
+        ended_at: optional_ms_to_time(row.get(12)?)?,
+        metadata: parse_json(row.get::<_, String>(13)?)?,
+    })
+}
+
 fn run_select_sql(tail: &str) -> String {
     format!(
         "SELECT id, history_record_id, session_id, run_type, status, started_at_ms, ended_at_ms, exit_code, cwd, command_preview, input_blob_id, output_blob_id, created_at_ms, updated_at_ms, source_id, visibility, fidelity, sync_state, sync_version, deleted_at_ms, metadata_json FROM runs {tail}"
@@ -9684,6 +9995,24 @@ fn run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         },
         source_id: parse_optional_uuid(row.get(14)?)?,
         sync: sync_metadata_from_row(row, 15, 16, 17, 18, 19, 20)?,
+    })
+}
+
+fn search_run_select_sql(tail: &str) -> String {
+    format!("SELECT id, session_id, run_type, status, started_at_ms, exit_code, cwd, command_preview, source_id FROM runs {tail}")
+}
+
+fn search_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SearchRunRow> {
+    Ok(SearchRunRow {
+        id: parse_uuid(row.get::<_, String>(0)?)?,
+        session_id: parse_optional_uuid(row.get(1)?)?,
+        run_type: parse_text_enum::<RunType>(row.get::<_, String>(2)?)?,
+        status: parse_text_enum::<RunStatus>(row.get::<_, String>(3)?)?,
+        started_at: ms_to_time(row.get(4)?)?,
+        exit_code: row.get(5)?,
+        cwd: row.get(6)?,
+        command_preview: row.get(7)?,
+        source_id: parse_optional_uuid(row.get(8)?)?,
     })
 }
 
@@ -9833,6 +10162,30 @@ fn event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
     })
 }
 
+fn search_event_select_sql(tail: &str) -> String {
+    format!("SELECT id, seq, session_id, run_id, event_type, role, occurred_at_ms, capture_source_id, payload_json, dedupe_key, redaction_state, metadata_json FROM events {tail}")
+}
+
+fn search_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SearchEventRow> {
+    Ok(SearchEventRow {
+        id: parse_uuid(row.get::<_, String>(0)?)?,
+        seq: row.get::<_, i64>(1)? as u64,
+        session_id: parse_optional_uuid(row.get(2)?)?,
+        run_id: parse_optional_uuid(row.get(3)?)?,
+        event_type: parse_text_enum::<EventType>(row.get::<_, String>(4)?)?,
+        role: row
+            .get::<_, Option<String>>(5)?
+            .map(parse_text_enum::<EventRole>)
+            .transpose()?,
+        occurred_at: ms_to_time(row.get(6)?)?,
+        capture_source_id: parse_optional_uuid(row.get(7)?)?,
+        payload: parse_json(row.get::<_, String>(8)?)?,
+        dedupe_key: row.get(9)?,
+        redaction_state: parse_text_enum::<RedactionState>(row.get::<_, String>(10)?)?,
+        metadata: parse_json(row.get::<_, String>(11)?)?,
+    })
+}
+
 fn artifact_select_sql(tail: &str) -> String {
     format!(
         "SELECT id, kind, blob_hash, blob_path, byte_size, media_type, preview_text, redaction_state, created_at_ms, updated_at_ms, source_id, visibility, fidelity, sync_state, sync_version, deleted_at_ms, metadata_json FROM artifacts {tail}"
@@ -9855,6 +10208,22 @@ fn artifact_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Artifact> {
         },
         source_id: parse_optional_uuid(row.get(10)?)?,
         sync: sync_metadata_from_row(row, 11, 12, 13, 14, 15, 16)?,
+    })
+}
+
+fn search_artifact_select_sql(tail: &str) -> String {
+    format!("SELECT id, kind, blob_path, media_type, preview_text, updated_at_ms, source_id FROM artifacts {tail}")
+}
+
+fn search_artifact_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SearchArtifactRow> {
+    Ok(SearchArtifactRow {
+        id: parse_uuid(row.get::<_, String>(0)?)?,
+        kind: parse_text_enum::<ArtifactKind>(row.get::<_, String>(1)?)?,
+        blob_path: row.get(2)?,
+        media_type: row.get(3)?,
+        preview_text: row.get(4)?,
+        updated_at: ms_to_time(row.get(5)?)?,
+        source_id: parse_optional_uuid(row.get(6)?)?,
     })
 }
 
@@ -9911,6 +10280,25 @@ fn vcs_change_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<VcsChange> {
     })
 }
 
+fn search_vcs_change_select_sql(tail: &str) -> String {
+    format!("SELECT id, kind, change_id, parent_change_ids_json, branch_or_bookmark, tree_hash, author_time_ms, updated_at_ms, source_id FROM vcs_changes {tail}")
+}
+
+fn search_vcs_change_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SearchVcsChangeRow> {
+    Ok(SearchVcsChangeRow {
+        id: parse_uuid(row.get::<_, String>(0)?)?,
+        kind: parse_text_enum::<ctx_history_core::VcsChangeKind>(row.get::<_, String>(1)?)?,
+        change_id: row.get(2)?,
+        parent_change_ids: serde_json::from_str(&row.get::<_, String>(3)?)
+            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
+        branch_or_bookmark: row.get(4)?,
+        tree_hash: row.get(5)?,
+        author_time: optional_ms_to_time(row.get(6)?)?,
+        updated_at: ms_to_time(row.get(7)?)?,
+        source_id: parse_optional_uuid(row.get(8)?)?,
+    })
+}
+
 fn summary_select_sql(tail: &str) -> String {
     format!(
         "SELECT id, history_record_id, session_id, kind, model_or_source, text, citations_json, created_at_ms, updated_at_ms, source_id, visibility, fidelity, sync_state, sync_version, deleted_at_ms, metadata_json FROM summaries {tail}"
@@ -9933,6 +10321,19 @@ fn summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Summary> {
         },
         source_id: parse_optional_uuid(row.get(9)?)?,
         sync: sync_metadata_from_row(row, 10, 11, 12, 13, 14, 15)?,
+    })
+}
+
+fn search_summary_select_sql(tail: &str) -> String {
+    format!("SELECT id, text, updated_at_ms, source_id FROM summaries {tail}")
+}
+
+fn search_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SearchSummaryRow> {
+    Ok(SearchSummaryRow {
+        id: parse_uuid(row.get::<_, String>(0)?)?,
+        text: row.get(1)?,
+        updated_at: ms_to_time(row.get(2)?)?,
+        source_id: parse_optional_uuid(row.get(3)?)?,
     })
 }
 
@@ -9963,6 +10364,25 @@ fn file_touched_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileTouche
         },
         source_id: parse_optional_uuid(row.get(12)?)?,
         sync: sync_metadata_from_row(row, 13, 14, 15, 16, 17, 18)?,
+    })
+}
+
+fn search_file_touched_select_sql(tail: &str) -> String {
+    format!("SELECT id, event_id, path, change_kind, old_path, updated_at_ms, source_id FROM files_touched {tail}")
+}
+
+fn search_file_touched_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SearchFileTouchedRow> {
+    Ok(SearchFileTouchedRow {
+        id: parse_uuid(row.get::<_, String>(0)?)?,
+        event_id: parse_optional_uuid(row.get(1)?)?,
+        path: row.get(2)?,
+        change_kind: row
+            .get::<_, Option<String>>(3)?
+            .map(parse_text_enum::<ctx_history_core::FileChangeKind>)
+            .transpose()?,
+        old_path: row.get(4)?,
+        updated_at: ms_to_time(row.get(5)?)?,
+        source_id: parse_optional_uuid(row.get(6)?)?,
     })
 }
 

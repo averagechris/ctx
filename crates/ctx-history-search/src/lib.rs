@@ -11,7 +11,9 @@ use ctx_history_core::{
     RedactionState, Run, SearchMatchMode, SearchQueryPlan, Session, Summary, VcsChange, Visibility,
 };
 use ctx_history_store::{
-    EventSearchAgentScope, EventSearchHit, EventSearchSqlFilters, FileTouchScope, Store,
+    EventSearchAgentScope, EventSearchHit, EventSearchSqlFilters, FileTouchScope,
+    SearchArtifactRow, SearchCaptureSourceRow, SearchEventRow, SearchFileTouchedRow, SearchRunRow,
+    SearchSessionRow, SearchSummaryRow, SearchVcsChangeRow, Store,
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -242,6 +244,18 @@ struct Candidate {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 struct RecordContext {
+    sessions: Vec<SearchSessionRow>,
+    runs: Vec<SearchRunRow>,
+    events: Vec<SearchEventRow>,
+    artifacts: Vec<SearchArtifactRow>,
+    files_touched: Vec<SearchFileTouchedRow>,
+    vcs_changes: Vec<SearchVcsChangeRow>,
+    summaries: Vec<SearchSummaryRow>,
+    sources: BTreeMap<Uuid, SearchCaptureSourceRow>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+struct FullRecordContext {
     sessions: Vec<Session>,
     runs: Vec<Run>,
     events: Vec<Event>,
@@ -250,6 +264,13 @@ struct RecordContext {
     vcs_changes: Vec<VcsChange>,
     summaries: Vec<Summary>,
     sources: BTreeMap<Uuid, ctx_history_core::CaptureSource>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HydrationIntent {
+    #[default]
+    Full,
+    Compact,
 }
 
 #[derive(Debug, Clone)]
@@ -289,12 +310,22 @@ struct CandidateSearch {
 }
 
 pub fn search_packet(store: &Store, query: &str, options: &PacketOptions) -> Result<SearchPacket> {
+    search_packet_with_hydration(store, query, options, HydrationIntent::Full)
+}
+
+pub fn search_packet_with_hydration(
+    store: &Store,
+    query: &str,
+    options: &PacketOptions,
+    hydration: HydrationIntent,
+) -> Result<SearchPacket> {
     validate_query_request(query, &[])?;
     search_packet_plan(
         store,
         SearchQueryPlan::new(options.match_mode, [query]),
         query,
         options,
+        hydration,
     )
 }
 
@@ -303,6 +334,7 @@ fn search_packet_plan(
     plan: SearchQueryPlan,
     display_query: &str,
     options: &PacketOptions,
+    hydration: HydrationIntent,
 ) -> Result<SearchPacket> {
     let options = normalized_options(options);
     if let Some(provider) = options.filters.provider {
@@ -322,7 +354,7 @@ fn search_packet_plan(
     let CandidateSearch {
         candidates,
         scan_budget_exhausted,
-    } = ranked_candidates(store, Some(&plan), &options, file_scope.as_ref())?;
+    } = ranked_candidates(store, Some(&plan), &options, file_scope.as_ref(), hydration)?;
     let mut truncation = ContextTruncation::default();
     let mut results = Vec::new();
 
@@ -359,6 +391,16 @@ pub fn search_packet_terms(
     terms: &[String],
     options: &PacketOptions,
 ) -> Result<SearchPacket> {
+    search_packet_terms_with_hydration(store, query, terms, options, HydrationIntent::Full)
+}
+
+pub fn search_packet_terms_with_hydration(
+    store: &Store,
+    query: &str,
+    terms: &[String],
+    options: &PacketOptions,
+    hydration: HydrationIntent,
+) -> Result<SearchPacket> {
     validate_query_request(query, terms)?;
     let options = normalized_options(options);
     let search_terms = composed_search_terms(query, terms)
@@ -366,10 +408,11 @@ pub fn search_packet_terms(
         .filter(|term| !SearchQueryPlan::new(options.match_mode, [term.as_str()]).is_empty())
         .collect::<Vec<_>>();
     if search_terms.len() <= 1 {
-        return search_packet(
+        return search_packet_with_hydration(
             store,
             search_terms.first().map_or(query, String::as_str),
             &options,
+            hydration,
         );
     }
 
@@ -385,7 +428,7 @@ pub fn search_packet_terms(
     let mut truncated = false;
     let mut omitted_results = 0_u32;
     for term in &search_terms {
-        let packet = search_packet(store, term, &child_options)?;
+        let packet = search_packet_with_hydration(store, term, &child_options, hydration)?;
         truncated |= packet.truncation.truncated;
         omitted_results = omitted_results.saturating_add(packet.truncation.omitted_results);
         for mut result in packet.results {
@@ -1474,6 +1517,7 @@ fn ranked_candidates(
     plan: Option<&SearchQueryPlan>,
     options: &PacketOptions,
     file_scope: Option<&FileTouchScope>,
+    hydration: HydrationIntent,
 ) -> Result<CandidateSearch> {
     let target_candidates = options.limit.saturating_add(1);
     let terms = plan
@@ -1516,6 +1560,7 @@ fn ranked_candidates(
             &terms,
             &options.filters,
             file_scope,
+            hydration,
         )?);
         normalize_scores(&mut candidates);
         candidates.sort_by(compare_candidates);
@@ -1561,6 +1606,7 @@ fn ranked_candidates(
                     &terms,
                     &options.filters,
                     file_scope,
+                    hydration,
                 )?);
                 if candidates.len() >= target_candidates || page_len < page_size {
                     break;
@@ -1611,6 +1657,7 @@ fn ranked_candidates(
                         &terms,
                         &options.filters,
                         file_scope,
+                        hydration,
                     )?);
                     if candidates.len() >= target_candidates || page_len < page_size {
                         break;
@@ -1654,6 +1701,7 @@ fn ranked_candidates(
                         &terms,
                         &options.filters,
                         file_scope,
+                        hydration,
                     )?);
 
                     if candidates.len() >= target_candidates || page_len < page_size {
@@ -1698,6 +1746,7 @@ fn ranked_candidates(
             &terms,
             &options.filters,
             file_scope,
+            hydration,
         )?);
     }
 
@@ -1728,9 +1777,18 @@ fn candidates_for_records(
     terms: &[String],
     filters: &SearchFilters,
     file_scope: Option<&FileTouchScope>,
+    hydration: HydrationIntent,
 ) -> Result<Vec<Candidate>> {
     let ids = records.iter().map(|record| record.id).collect::<Vec<_>>();
-    let mut contexts = hydrate_record_contexts(store, &ids, filters.file.as_deref())?;
+    let mut contexts = match hydration {
+        HydrationIntent::Full => hydrate_record_contexts(store, &ids, filters.file.as_deref())?
+            .into_iter()
+            .map(|(id, context)| (id, context.into()))
+            .collect(),
+        HydrationIntent::Compact => {
+            hydrate_compact_record_contexts(store, &ids, filters.file.as_deref())?
+        }
+    };
     let mut candidates = Vec::new();
     for record in records {
         let context = contexts.remove(&record.id).unwrap_or_default();
@@ -1773,7 +1831,7 @@ fn hydrate_record_contexts(
     store: &Store,
     record_ids: &[Uuid],
     file_filter: Option<&str>,
-) -> Result<BTreeMap<Uuid, RecordContext>> {
+) -> Result<BTreeMap<Uuid, FullRecordContext>> {
     let mut sessions = store.sessions_for_records(record_ids)?;
     let mut runs = store.runs_for_records(record_ids)?;
     let mut events = store.events_for_records(record_ids)?;
@@ -1829,6 +1887,117 @@ fn hydrate_record_contexts(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .map(|id| {
+            let mut context = FullRecordContext {
+                sessions: sessions.remove(&id).unwrap_or_default(),
+                runs: runs.remove(&id).unwrap_or_default(),
+                events: events.remove(&id).unwrap_or_default(),
+                artifacts: artifacts.remove(&id).unwrap_or_default(),
+                files_touched: files_touched.remove(&id).unwrap_or_default(),
+                vcs_changes: vcs_changes.remove(&id).unwrap_or_default(),
+                summaries: summaries.remove(&id).unwrap_or_default(),
+                sources: BTreeMap::new(),
+            };
+            context.sources = sources
+                .iter()
+                .filter(|(source_id, _)| full_context_references_source(&context, **source_id))
+                .map(|(id, source)| (*id, source.clone()))
+                .collect();
+            (id, context)
+        })
+        .collect())
+}
+
+fn full_context_references_source(context: &FullRecordContext, id: Uuid) -> bool {
+    context
+        .sessions
+        .iter()
+        .any(|item| item.capture_source_id == Some(id))
+        || context.runs.iter().any(|item| item.source_id == Some(id))
+        || context
+            .events
+            .iter()
+            .any(|item| item.capture_source_id == Some(id))
+        || context
+            .artifacts
+            .iter()
+            .any(|item| item.source_id == Some(id))
+        || context
+            .files_touched
+            .iter()
+            .any(|item| item.source_id == Some(id))
+        || context
+            .vcs_changes
+            .iter()
+            .any(|item| item.source_id == Some(id))
+        || context
+            .summaries
+            .iter()
+            .any(|item| item.source_id == Some(id))
+}
+
+fn hydrate_compact_record_contexts(
+    store: &Store,
+    record_ids: &[Uuid],
+    file_filter: Option<&str>,
+) -> Result<BTreeMap<Uuid, RecordContext>> {
+    let mut sessions = store.search_sessions_for_records(record_ids)?;
+    let mut runs = store.search_runs_for_records(record_ids)?;
+    let mut events = store.search_events_for_records(record_ids)?;
+    let mut artifacts = store.search_artifacts_for_records(record_ids)?;
+    let mut files_touched =
+        if let Some(file) = file_filter.map(str::trim).filter(|value| !value.is_empty()) {
+            store.search_files_touched_for_records_matching(record_ids, file)?
+        } else {
+            store.search_files_touched_for_records(record_ids)?
+        };
+    let mut vcs_changes = store.search_vcs_changes_for_records(record_ids)?;
+    let mut summaries = store.search_summaries_for_records(record_ids)?;
+    let mut source_ids = BTreeSet::new();
+    source_ids.extend(
+        sessions
+            .values()
+            .flatten()
+            .filter_map(|item| item.capture_source_id),
+    );
+    source_ids.extend(runs.values().flatten().filter_map(|item| item.source_id));
+    source_ids.extend(
+        events
+            .values()
+            .flatten()
+            .filter_map(|item| item.capture_source_id),
+    );
+    source_ids.extend(
+        artifacts
+            .values()
+            .flatten()
+            .filter_map(|item| item.source_id),
+    );
+    source_ids.extend(
+        files_touched
+            .values()
+            .flatten()
+            .filter_map(|item| item.source_id),
+    );
+    source_ids.extend(
+        vcs_changes
+            .values()
+            .flatten()
+            .filter_map(|item| item.source_id),
+    );
+    source_ids.extend(
+        summaries
+            .values()
+            .flatten()
+            .filter_map(|item| item.source_id),
+    );
+    let sources =
+        store.search_capture_sources_for_ids(&source_ids.into_iter().collect::<Vec<_>>())?;
+    Ok(record_ids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|id| {
             let mut context = RecordContext {
                 sessions: sessions.remove(&id).unwrap_or_default(),
                 runs: runs.remove(&id).unwrap_or_default(),
@@ -1842,7 +2011,7 @@ fn hydrate_record_contexts(
             context.sources = sources
                 .iter()
                 .filter(|(source_id, _)| context_references_source(&context, **source_id))
-                .map(|(id, source)| (*id, source.clone()))
+                .map(|(source_id, source)| (*source_id, source.clone()))
                 .collect();
             (id, context)
         })
@@ -1875,6 +2044,157 @@ fn context_references_source(context: &RecordContext, id: Uuid) -> bool {
             .summaries
             .iter()
             .any(|item| item.source_id == Some(id))
+}
+
+impl From<FullRecordContext> for RecordContext {
+    fn from(context: FullRecordContext) -> Self {
+        Self {
+            sessions: context
+                .sessions
+                .into_iter()
+                .map(search_session_from_full)
+                .collect(),
+            runs: context.runs.into_iter().map(search_run_from_full).collect(),
+            events: context
+                .events
+                .into_iter()
+                .map(search_event_from_full)
+                .collect(),
+            artifacts: context
+                .artifacts
+                .into_iter()
+                .map(search_artifact_from_full)
+                .collect(),
+            files_touched: context
+                .files_touched
+                .into_iter()
+                .map(search_file_from_full)
+                .collect(),
+            vcs_changes: context
+                .vcs_changes
+                .into_iter()
+                .map(search_vcs_from_full)
+                .collect(),
+            summaries: context
+                .summaries
+                .into_iter()
+                .map(search_summary_from_full)
+                .collect(),
+            sources: context
+                .sources
+                .into_iter()
+                .map(|(id, source)| (id, search_source_from_full(source)))
+                .collect(),
+        }
+    }
+}
+
+fn search_session_from_full(value: Session) -> SearchSessionRow {
+    SearchSessionRow {
+        id: value.id,
+        parent_session_id: value.parent_session_id,
+        root_session_id: value.root_session_id,
+        capture_source_id: value.capture_source_id,
+        provider: value.provider,
+        external_session_id: value.external_session_id,
+        external_agent_id: value.external_agent_id,
+        agent_type: value.agent_type,
+        role_hint: value.role_hint,
+        is_primary: value.is_primary,
+        status: value.status,
+        started_at: value.started_at,
+        ended_at: value.ended_at,
+        metadata: value.sync.metadata,
+    }
+}
+
+fn search_run_from_full(value: Run) -> SearchRunRow {
+    SearchRunRow {
+        id: value.id,
+        session_id: value.session_id,
+        run_type: value.run_type,
+        status: value.status,
+        started_at: value.started_at,
+        exit_code: value.exit_code,
+        cwd: value.cwd,
+        command_preview: value.command_preview,
+        source_id: value.source_id,
+    }
+}
+
+fn search_event_from_full(value: Event) -> SearchEventRow {
+    SearchEventRow {
+        id: value.id,
+        seq: value.seq,
+        session_id: value.session_id,
+        run_id: value.run_id,
+        event_type: value.event_type,
+        role: value.role,
+        occurred_at: value.occurred_at,
+        capture_source_id: value.capture_source_id,
+        payload: value.payload,
+        dedupe_key: value.dedupe_key,
+        redaction_state: value.redaction_state,
+        metadata: value.sync.metadata,
+    }
+}
+
+fn search_artifact_from_full(value: Artifact) -> SearchArtifactRow {
+    SearchArtifactRow {
+        id: value.id,
+        kind: value.kind,
+        blob_path: value.blob_path,
+        media_type: value.media_type,
+        preview_text: value.preview_text,
+        updated_at: value.timestamps.updated_at,
+        source_id: value.source_id,
+    }
+}
+
+fn search_file_from_full(value: FileTouched) -> SearchFileTouchedRow {
+    SearchFileTouchedRow {
+        id: value.id,
+        event_id: value.event_id,
+        path: value.path,
+        change_kind: value.change_kind,
+        old_path: value.old_path,
+        updated_at: value.timestamps.updated_at,
+        source_id: value.source_id,
+    }
+}
+
+fn search_vcs_from_full(value: VcsChange) -> SearchVcsChangeRow {
+    SearchVcsChangeRow {
+        id: value.id,
+        kind: value.kind,
+        change_id: value.change_id,
+        parent_change_ids: value.parent_change_ids,
+        branch_or_bookmark: value.branch_or_bookmark,
+        tree_hash: value.tree_hash,
+        author_time: value.author_time,
+        updated_at: value.timestamps.updated_at,
+        source_id: value.source_id,
+    }
+}
+
+fn search_summary_from_full(value: Summary) -> SearchSummaryRow {
+    SearchSummaryRow {
+        id: value.id,
+        text: value.text,
+        updated_at: value.timestamps.updated_at,
+        source_id: value.source_id,
+    }
+}
+
+fn search_source_from_full(value: ctx_history_core::CaptureSource) -> SearchCaptureSourceRow {
+    SearchCaptureSourceRow {
+        id: value.id,
+        provider: value.descriptor.provider,
+        cwd: value.descriptor.cwd,
+        raw_source_path: value.descriptor.raw_source_path,
+        external_session_id: value.descriptor.external_session_id,
+        metadata: value.sync.metadata,
+    }
 }
 
 struct MatchAnalysis {
@@ -2205,7 +2525,7 @@ fn search_sections(
                 ContextCitationType::Artifact,
                 artifact.id,
                 "artifact",
-                artifact.timestamps.updated_at,
+                artifact.updated_at,
             ),
             hit,
         });
@@ -2235,7 +2555,7 @@ fn search_sections(
                 ContextCitationType::File,
                 file.id,
                 "file touched",
-                file.timestamps.updated_at,
+                file.updated_at,
             ),
             hit,
         });
@@ -2251,7 +2571,7 @@ fn search_sections(
         let parent_change_ids = change.parent_change_ids.join(" ");
         let hit = source_hit(
             change.source_id,
-            change.author_time.unwrap_or(change.timestamps.updated_at),
+            change.author_time.unwrap_or(change.updated_at),
             context,
         );
         sections.push(SearchSection {
@@ -2269,7 +2589,7 @@ fn search_sections(
                 ContextCitationType::VcsChange,
                 change.id,
                 "vcs change",
-                change.author_time.unwrap_or(change.timestamps.updated_at),
+                change.author_time.unwrap_or(change.updated_at),
             ),
             hit,
         });
@@ -2282,7 +2602,7 @@ fn search_sections(
         if !item_matches_agent_scope(None, summary.source_id, context, filters) {
             continue;
         }
-        let hit = source_hit(summary.source_id, summary.timestamps.updated_at, context);
+        let hit = source_hit(summary.source_id, summary.updated_at, context);
         sections.push(SearchSection {
             reason: "summary",
             why_metadata: Vec::new(),
@@ -2292,7 +2612,7 @@ fn search_sections(
                 ContextCitationType::Summary,
                 summary.id,
                 "summary",
-                summary.timestamps.updated_at,
+                summary.updated_at,
             ),
             hit,
         });
@@ -2314,7 +2634,7 @@ fn is_agent_history_bookkeeping_record(record: &HistoryRecord) -> bool {
             .starts_with("Indexed custom agent history from ")
 }
 
-fn session_matches_agent_scope(session: &Session, filters: &SearchFilters) -> bool {
+fn session_matches_agent_scope(session: &SearchSessionRow, filters: &SearchFilters) -> bool {
     if filters.session == Some(session.id) {
         return true;
     }
@@ -2327,7 +2647,7 @@ fn session_matches_agent_scope(session: &Session, filters: &SearchFilters) -> bo
             && session.parent_session_id.is_none())
 }
 
-fn session_is_primary(session: &Session) -> bool {
+fn session_is_primary(session: &SearchSessionRow) -> bool {
     session.is_primary || session.agent_type == ctx_history_core::AgentType::Primary
 }
 
@@ -2395,13 +2715,16 @@ fn associated_session(
     session_id: Option<Uuid>,
     source_id: Option<Uuid>,
     context: &RecordContext,
-) -> Option<&Session> {
+) -> Option<&SearchSessionRow> {
     session_id
         .and_then(|id| context.sessions.iter().find(|session| session.id == id))
         .or_else(|| source_id.and_then(|id| associated_session_for_source(id, context)))
 }
 
-fn associated_session_for_source(source_id: Uuid, context: &RecordContext) -> Option<&Session> {
+fn associated_session_for_source(
+    source_id: Uuid,
+    context: &RecordContext,
+) -> Option<&SearchSessionRow> {
     context
         .sessions
         .iter()
@@ -2409,8 +2732,8 @@ fn associated_session_for_source(source_id: Uuid, context: &RecordContext) -> Op
         .or_else(|| {
             let source = context.sources.get(&source_id)?;
             context.sessions.iter().find(|session| {
-                session.provider == source.descriptor.provider
-                    && session.external_session_id == source.descriptor.external_session_id
+                session.provider == source.provider
+                    && session.external_session_id == source.external_session_id
             })
         })
 }
@@ -2441,7 +2764,7 @@ fn record_context_display_hit(
         .unwrap_or_else(|| empty_hit(time))
 }
 
-fn file_touched_search_text(file: &FileTouched) -> String {
+fn file_touched_search_text(file: &SearchFileTouchedRow) -> String {
     let path = file.path.as_str();
     let old_path = file.old_path.as_deref().unwrap_or_default();
     joined([
@@ -2495,7 +2818,7 @@ fn empty_hit(time: chrono::DateTime<Utc>) -> HitMetadata {
     }
 }
 
-fn session_hit(session: &Session, context: &RecordContext) -> HitMetadata {
+fn session_hit(session: &SearchSessionRow, context: &RecordContext) -> HitMetadata {
     let mut hit = source_hit(session.capture_source_id, session.started_at, context);
     hit.provider = Some(session.provider);
     hit.provider_session_id = session.external_session_id.clone();
@@ -2503,13 +2826,13 @@ fn session_hit(session: &Session, context: &RecordContext) -> HitMetadata {
     hit.parent_session_id = session.parent_session_id;
     hit.root_session_id = session.root_session_id;
     if hit.cwd.is_none() {
-        hit.cwd = source_for_id(session.capture_source_id, context)
-            .and_then(|source| source.descriptor.cwd.clone());
+        hit.cwd =
+            source_for_id(session.capture_source_id, context).and_then(|source| source.cwd.clone());
     }
     hit
 }
 
-fn run_hit(run: &Run, context: &RecordContext) -> HitMetadata {
+fn run_hit(run: &SearchRunRow, context: &RecordContext) -> HitMetadata {
     let mut hit = source_hit(run.source_id, run.started_at, context);
     hit.session_id = run.session_id;
     if let Some(session) = run
@@ -2531,7 +2854,7 @@ fn run_hit(run: &Run, context: &RecordContext) -> HitMetadata {
     hit
 }
 
-fn event_hit(event: &Event, context: &RecordContext) -> HitMetadata {
+fn event_hit(event: &SearchEventRow, context: &RecordContext) -> HitMetadata {
     let mut hit = source_hit(event.capture_source_id, event.occurred_at, context);
     hit.session_id = event.session_id;
     hit.event_id = Some(event.id);
@@ -2553,12 +2876,12 @@ fn event_hit(event: &Event, context: &RecordContext) -> HitMetadata {
     hit
 }
 
-fn artifact_hit(artifact: &Artifact, context: &RecordContext) -> HitMetadata {
-    source_hit(artifact.source_id, artifact.timestamps.updated_at, context)
+fn artifact_hit(artifact: &SearchArtifactRow, context: &RecordContext) -> HitMetadata {
+    source_hit(artifact.source_id, artifact.updated_at, context)
 }
 
-fn file_hit(file: &FileTouched, context: &RecordContext) -> HitMetadata {
-    let mut hit = source_hit(file.source_id, file.timestamps.updated_at, context);
+fn file_hit(file: &SearchFileTouchedRow, context: &RecordContext) -> HitMetadata {
+    let mut hit = source_hit(file.source_id, file.updated_at, context);
     hit.event_id = file.event_id;
     hit.session_id = file.event_id.and_then(|id| {
         context
@@ -2587,12 +2910,12 @@ fn source_hit(
     let Some(source) = source_for_id(source_id, context) else {
         return empty_hit(time);
     };
-    let raw_source_path = source.descriptor.raw_source_path.clone();
+    let raw_source_path = source.raw_source_path.clone();
     let identity = source_history_identity(source);
     let mut hit = HitMetadata {
         time,
-        provider: Some(source.descriptor.provider),
-        provider_session_id: source.descriptor.external_session_id.clone(),
+        provider: Some(source.provider),
+        provider_session_id: source.external_session_id.clone(),
         history_source: identity.history_source,
         history_source_plugin: identity.history_source_plugin,
         provider_key: identity.provider_key,
@@ -2603,7 +2926,7 @@ fn source_hit(
         root_session_id: None,
         event_id: None,
         event_seq: None,
-        cwd: source.descriptor.cwd.clone(),
+        cwd: source.cwd.clone(),
         raw_source_exists: raw_source_path
             .as_deref()
             .map(|path| Path::new(path).exists()),
@@ -2623,13 +2946,12 @@ fn source_hit(
 fn source_for_id(
     source_id: Option<Uuid>,
     context: &RecordContext,
-) -> Option<&ctx_history_core::CaptureSource> {
+) -> Option<&SearchCaptureSourceRow> {
     source_id.and_then(|id| context.sources.get(&id))
 }
 
-fn source_cursor(source: &ctx_history_core::CaptureSource) -> Option<String> {
+fn source_cursor(source: &SearchCaptureSourceRow) -> Option<String> {
     source
-        .sync
         .metadata
         .get("cursor")
         .and_then(|cursor| cursor.get("after"))
@@ -2647,8 +2969,8 @@ struct SourceHistoryIdentity {
     source_format: Option<String>,
 }
 
-fn source_history_identity(source: &ctx_history_core::CaptureSource) -> SourceHistoryIdentity {
-    let metadata = &source.sync.metadata;
+fn source_history_identity(source: &SearchCaptureSourceRow) -> SourceHistoryIdentity {
+    let metadata = &source.metadata;
     let source_metadata = metadata
         .get("source_metadata")
         .and_then(serde_json::Value::as_object);
@@ -2729,7 +3051,7 @@ fn has_history_source_filter(filters: &SearchFilters) -> bool {
 }
 
 fn source_matches_history_source_filter(
-    source: &ctx_history_core::CaptureSource,
+    source: &SearchCaptureSourceRow,
     filters: &SearchFilters,
 ) -> bool {
     let identity = source_history_identity(source);
@@ -2807,7 +3129,7 @@ fn source_identity_matches_history_source_filter(
     true
 }
 
-fn event_cursor(event: &Event) -> Option<String> {
+fn event_cursor(event: &SearchEventRow) -> Option<String> {
     event
         .payload
         .get("cursor")
@@ -2815,7 +3137,6 @@ fn event_cursor(event: &Event) -> Option<String> {
         .map(str::to_owned)
         .or_else(|| {
             event
-                .sync
                 .metadata
                 .get("cursor")
                 .and_then(|value| value.as_str())
@@ -2831,7 +3152,7 @@ fn joined<const N: usize>(parts: [&str; N]) -> String {
         .join(" ")
 }
 
-fn event_weight(event: &Event) -> f32 {
+fn event_weight(event: &SearchEventRow) -> f32 {
     let base = match event.event_type {
         ctx_history_core::EventType::Message => 4.0,
         ctx_history_core::EventType::ToolCall | ctx_history_core::EventType::ToolOutput => 3.5,
@@ -2843,7 +3164,7 @@ fn event_weight(event: &Event) -> f32 {
     base * event_relevance_penalty_for(event.event_type, event.role)
 }
 
-fn event_is_excluded_tool_noise(event: &Event, filters: &SearchFilters) -> bool {
+fn event_is_excluded_tool_noise(event: &SearchEventRow, filters: &SearchFilters) -> bool {
     if filters.exclude_tool_noise
         && matches!(
             event.event_type,
@@ -2862,7 +3183,7 @@ fn event_is_excluded_tool_noise(event: &Event, filters: &SearchFilters) -> bool 
         })
 }
 
-fn run_is_excluded_tool_noise(run: &Run, filters: &SearchFilters) -> bool {
+fn run_is_excluded_tool_noise(run: &SearchRunRow, filters: &SearchFilters) -> bool {
     if filters.exclude_tool_noise {
         return true;
     }
@@ -2885,7 +3206,7 @@ fn is_tool_or_command_event(event_type: EventType) -> bool {
     )
 }
 
-fn event_tool_names(event: &Event) -> Vec<String> {
+fn event_tool_names(event: &SearchEventRow) -> Vec<String> {
     let mut names = Vec::new();
     collect_tool_names(&event.payload, &mut names);
     names.sort();
@@ -2922,8 +3243,8 @@ fn normalized_tool_name(value: &str) -> String {
     value.trim().to_ascii_lowercase()
 }
 
-fn event_text(event: &Event) -> String {
-    let payload_text = event_preview_text(event);
+fn event_text(event: &SearchEventRow) -> String {
+    let payload_text = search_event_preview_text(event);
     let dedupe_key = event.dedupe_key.as_deref().unwrap_or_default();
     joined([
         event.event_type.as_str(),
@@ -2931,6 +3252,22 @@ fn event_text(event: &Event) -> String {
         payload_text.as_str(),
         dedupe_key,
     ])
+}
+
+fn search_event_preview_text(event: &SearchEventRow) -> String {
+    if matches!(
+        event.redaction_state,
+        RedactionState::Raw | RedactionState::Withheld
+    ) {
+        return "raw event payload withheld".to_owned();
+    }
+    if let Some(preview) = event_payload_preview(&event.payload) {
+        return local_snippet(&preview, 900);
+    }
+    if event.payload.is_object() || event.payload.is_array() {
+        return local_snippet(&event.payload.to_string(), 900);
+    }
+    String::new()
 }
 
 pub fn event_preview_text(event: &Event) -> String {
@@ -3121,7 +3458,7 @@ fn record_matches_filters(
         let source_match = context
             .sources
             .values()
-            .any(|source| source.descriptor.provider == provider);
+            .any(|source| source.provider == provider);
         if !session_match && !source_match {
             return false;
         }
@@ -3191,7 +3528,6 @@ fn record_matches_filters(
             .is_some_and(|workspace| workspace.to_lowercase().contains(&repo));
         let matches_session = context.sessions.iter().any(|session| {
             session
-                .sync
                 .metadata
                 .get("metadata")
                 .and_then(|value| value.as_object())
@@ -3203,7 +3539,6 @@ fn record_matches_filters(
         });
         let matches_source = context.sources.values().any(|source| {
             source
-                .descriptor
                 .cwd
                 .as_deref()
                 .is_some_and(|cwd| cwd.to_lowercase().contains(&repo))
@@ -3508,7 +3843,7 @@ mod tests {
         (temp, store)
     }
 
-    fn reference_record_context(store: &Store, id: Uuid, file: Option<&str>) -> RecordContext {
+    fn reference_record_context(store: &Store, id: Uuid, file: Option<&str>) -> FullRecordContext {
         let sessions = store.sessions_for_record(id).unwrap();
         let runs = store.runs_for_record(id).unwrap();
         let events = store.events_for_record(id).unwrap();
@@ -3531,7 +3866,7 @@ mod tests {
             .into_iter()
             .filter_map(|id| store.get_capture_source(id).ok().map(|source| (id, source)))
             .collect();
-        RecordContext {
+        FullRecordContext {
             sessions,
             runs,
             events,
@@ -3616,7 +3951,7 @@ mod tests {
             contexts[&ids[0]],
             reference_record_context(&store, ids[0], None)
         );
-        assert_eq!(contexts[&nonexistent], RecordContext::default());
+        assert_eq!(contexts[&nonexistent], FullRecordContext::default());
         assert!(hydrate_record_contexts(&store, &[], None)
             .unwrap()
             .is_empty());
@@ -3699,6 +4034,64 @@ mod tests {
                 "gate_basis": "statement reduction >=40% and targeted batch p95 <= reference p95 * 1.05",
                 "fallback_proof": "calls the production fallback hydrate_record_contexts and retained single-record reference directly"
             })
+        );
+    }
+
+    #[test]
+    #[ignore = "targeted compact fallback hydration evidence"]
+    fn compact_fallback_hydration_evidence() {
+        let archive = synthetic_perf_archive(1_000, 5);
+        let (_temp, mut store) = test_store();
+        store.import_archive(&archive, false).unwrap();
+        let options = PacketOptions {
+            limit: 100,
+            filters: SearchFilters {
+                repo: Some("ctx".into()),
+                ..SearchFilters::default()
+            },
+            ..PacketOptions::default()
+        };
+        for hydration in [HydrationIntent::Full, HydrationIntent::Compact] {
+            let packet =
+                search_packet_with_hydration(&store, "perfneedle", &options, hydration).unwrap();
+            assert!(!packet.results.is_empty());
+        }
+
+        let mut full_ms = Vec::new();
+        let mut narrow_ms = Vec::new();
+        for sample in 0..5 {
+            let mut pair = Vec::new();
+            let order = if sample % 2 == 0 {
+                [HydrationIntent::Compact, HydrationIntent::Full]
+            } else {
+                [HydrationIntent::Full, HydrationIntent::Compact]
+            };
+            for hydration in order {
+                let started = std::time::Instant::now();
+                let packet =
+                    search_packet_with_hydration(&store, "perfneedle", &options, hydration)
+                        .unwrap();
+                let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+                match hydration {
+                    HydrationIntent::Full => full_ms.push(elapsed),
+                    HydrationIntent::Compact => narrow_ms.push(elapsed),
+                }
+                pair.push((hydration, packet));
+            }
+            pair[0].1.generated_at = pair[1].1.generated_at;
+            assert_eq!(pair[0].1, pair[1].1);
+        }
+        full_ms.sort_by(f64::total_cmp);
+        narrow_ms.sort_by(f64::total_cmp);
+        let full_p95 = full_ms[4];
+        let narrow_p95 = narrow_ms[4];
+        let ratio = narrow_p95 / full_p95;
+        println!(
+            "compact fallback: full_ms={full_ms:?} narrow_ms={narrow_ms:?} full_p95={full_p95:.3}ms narrow_p95={narrow_p95:.3}ms ratio={ratio:.3}"
+        );
+        assert!(
+            ratio <= 1.05,
+            "narrow p95 regressed by more than 5%: {ratio:.3}"
         );
     }
 
@@ -4607,7 +5000,7 @@ mod tests {
             &filters
         ));
 
-        let context = RecordContext {
+        let context: RecordContext = FullRecordContext {
             sessions: vec![Session {
                 id: grandchild_session_id,
                 history_record_id: None,
@@ -4627,8 +5020,9 @@ mod tests {
                 timestamps: timestamps(),
                 sync: sync_metadata(),
             }],
-            ..RecordContext::default()
-        };
+            ..FullRecordContext::default()
+        }
+        .into();
         assert!(context_has_excluded_provider_session(&context, &filters));
     }
 
@@ -4810,16 +5204,26 @@ mod tests {
                 .unwrap();
         }
 
-        let packet = search_packet(
-            &store,
-            "needle",
-            &PacketOptions {
-                limit: 5,
-                snippet_chars: 600,
-                ..PacketOptions::default()
-            },
-        )
-        .unwrap();
+        let options = PacketOptions {
+            limit: 5,
+            snippet_chars: 600,
+            ..PacketOptions::default()
+        };
+        store.reset_search_hydration_loader_executions();
+        let mut packet =
+            search_packet_with_hydration(&store, "needle", &options, HydrationIntent::Full)
+                .unwrap();
+        assert_eq!(store.search_hydration_loader_executions(), [8, 0]);
+        store.reset_search_hydration_loader_executions();
+        let narrow =
+            search_packet_with_hydration(&store, "needle", &options, HydrationIntent::Compact)
+                .unwrap();
+        assert_eq!(store.search_hydration_loader_executions(), [0, 8]);
+        packet.generated_at = narrow.generated_at;
+        assert_eq!(
+            narrow, packet,
+            "narrow hydration changed fallback semantics"
+        );
 
         assert_eq!(packet.results.len(), 1);
         let result = &packet.results[0];
@@ -5609,8 +6013,14 @@ mod tests {
         };
         let fallback_plan =
             SearchQueryPlan::new(fallback_options.match_mode, ["dorkos-source-filter-needle"]);
-        let fallback =
-            ranked_candidates(&store, Some(&fallback_plan), &fallback_options, None).unwrap();
+        let fallback = ranked_candidates(
+            &store,
+            Some(&fallback_plan),
+            &fallback_options,
+            None,
+            HydrationIntent::Full,
+        )
+        .unwrap();
         assert_eq!(fallback.candidates.len(), 1);
         assert_eq!(store.relation_batch_executions() - before, 8);
 

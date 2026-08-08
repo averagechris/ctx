@@ -12,8 +12,9 @@ use ctx_history_core::{
     RedactionState, SearchMatchMode, SearchQueryPlan, Session, SessionStatus, Visibility,
 };
 use ctx_history_search::{
-    search_packet, search_packet_terms, validate_query_request, PacketOptions, SearchFilters,
-    SearchPacketResult, SearchResultMode, SearchResultScope, SEARCH_PACKET_SCHEMA_VERSION,
+    search_packet_terms_with_hydration, search_packet_with_hydration, validate_query_request,
+    HydrationIntent, PacketOptions, SearchFilters, SearchPacketResult, SearchResultMode,
+    SearchResultScope, SEARCH_PACKET_SCHEMA_VERSION,
 };
 use ctx_history_store::{RawSqlOptions, RawSqlResult, RawSqlValue, SelectedEventMode, Store};
 use serde::{Deserialize, Serialize};
@@ -39,6 +40,24 @@ pub const MAX_SNIPPET_BYTES: usize = MAX_ITEM_BYTES;
 const MAX_TOKEN_BYTES: usize = 4096;
 pub const LOW_SPACE_WARNING_BYTES: u64 = 512 * 1024 * 1024;
 pub const LOW_SPACE_CRITICAL_BYTES: u64 = 128 * 1024 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_FULL_SEARCH_HYDRATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn with_full_search_hydration_reference<T>(run: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FORCE_FULL_SEARCH_HYDRATION.set(self.0);
+        }
+    }
+    let previous = FORCE_FULL_SEARCH_HYDRATION.replace(true);
+    let _reset = Reset(previous);
+    run()
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum QueryError {
@@ -995,12 +1014,22 @@ impl<'a> QueryService<'a> {
         // page offset nor requested page size changes candidate generation.
         let mut pool_options = options.clone();
         pool_options.limit = ctx_history_search::MAX_RESULT_LIMIT;
+        let hydration = match fields {
+            FieldSet::Full => HydrationIntent::Full,
+            FieldSet::Compact => HydrationIntent::Compact,
+        };
+        #[cfg(test)]
+        let hydration = if FORCE_FULL_SEARCH_HYDRATION.get() {
+            HydrationIntent::Full
+        } else {
+            hydration
+        };
         let packet = if terms.is_empty() {
-            search_packet(self.store, query, &pool_options)?
+            search_packet_with_hydration(self.store, query, &pool_options, hydration)?
         } else {
             // Do not pre-deduplicate: the canonical request preserves the exact
             // repeated term vector even though search-core may normalize it.
-            search_packet_terms(self.store, query, terms, &pool_options)?
+            search_packet_terms_with_hydration(self.store, query, terms, &pool_options, hydration)?
         };
         let pool_total = packet.results.len();
         if token.is_some() && (offset == 0 || offset >= pool_total) {
@@ -2208,7 +2237,8 @@ fn available_space_bytes(_path: &Path) -> Option<u64> {
 mod tests {
     use super::*;
     use ctx_history_core::{
-        ContextCitation, EntityTimestamps, HistoryRecord, SyncMetadata, SyncState,
+        CaptureSourceDescriptor, ContextCitation, EntityTimestamps, HistoryRecord, SyncMetadata,
+        SyncState,
     };
     use std::time::{Duration, Instant};
 
@@ -3884,6 +3914,114 @@ mod tests {
             ),
             Err(QueryError::StaleContinuation)
         ));
+    }
+
+    #[test]
+    fn compact_fallback_uses_narrow_hydration_and_matches_full_reference() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("work.sqlite");
+        let store = Store::open(&path).unwrap();
+        let record = HistoryRecord {
+            id: Uuid::from_u128(26_400),
+            title: "compact hydration oracle".into(),
+            body: "fallbackneedle body".into(),
+            tags: vec!["fallbackneedle-tag".into()],
+            kind: "test".into(),
+            workspace: Some("/repo/compact".into()),
+            created_at: fixed_time(),
+            updated_at: fixed_time(),
+        };
+        store.insert_record(&record).unwrap();
+        let source_id = Uuid::from_u128(26_401);
+        store
+            .upsert_capture_source(&CaptureSource {
+                id: source_id,
+                descriptor: CaptureSourceDescriptor {
+                    kind: CaptureSourceKind::ProviderImport,
+                    provider: CaptureProvider::Codex,
+                    machine_id: "test-machine".into(),
+                    process_id: None,
+                    cwd: Some("/repo/compact".into()),
+                    raw_source_path: None,
+                    external_session_id: Some("compact-session".into()),
+                },
+                started_at: fixed_time(),
+                ended_at: None,
+                sync: SyncMetadata {
+                    metadata: json!({"source_metadata":{"ctx_history_plugin":{"plugin_name":"plugin","plugin_source_id":"fixture","history_source":"plugin/fixture"}},"cursor":{"after":{"cursor":"cursor-1"}}}),
+                    ..sync()
+                },
+            })
+            .unwrap();
+        let mut fixture_session = session(Uuid::from_u128(26_402));
+        fixture_session.history_record_id = Some(record.id);
+        fixture_session.capture_source_id = Some(source_id);
+        store.upsert_session(&fixture_session).unwrap();
+        let mut fixture_event = event(
+            fixture_session.id,
+            1,
+            EventType::Message,
+            Some(EventRole::User),
+            "fallbackneedle event text",
+        );
+        fixture_event.id = Uuid::from_u128(26_403);
+        fixture_event.history_record_id = Some(record.id);
+        fixture_event.capture_source_id = Some(source_id);
+        store.upsert_event(&fixture_event).unwrap();
+
+        let options = PacketOptions {
+            limit: 1,
+            filters: SearchFilters {
+                history_source: Some("plugin/fixture".into()),
+                repo: Some("compact".into()),
+                ..SearchFilters::default()
+            },
+            ..PacketOptions::default()
+        };
+        store.reset_search_hydration_loader_executions();
+        let narrow = QueryService::new(&store)
+            .search(
+                "fallbackneedle",
+                &[],
+                options.clone(),
+                None,
+                FieldSet::Compact,
+                bytes(),
+            )
+            .unwrap();
+        assert_eq!(store.search_hydration_loader_executions(), [0, 8]);
+        store.reset_search_hydration_loader_executions();
+        let mut reference = with_full_search_hydration_reference(|| {
+            QueryService::new(&store).search(
+                "fallbackneedle",
+                &[],
+                options.clone(),
+                None,
+                FieldSet::Compact,
+                bytes(),
+            )
+        })
+        .unwrap();
+        assert_eq!(store.search_hydration_loader_executions(), [8, 0]);
+        reference.generated_at = narrow.generated_at;
+        assert_eq!(narrow, reference);
+        let compact_json = serde_json::to_value(&narrow).unwrap();
+        assert!(compact_json["results"][0].get("citations").is_none());
+        assert!(compact_json["results"][0].get("provider").is_none());
+
+        store.reset_search_hydration_loader_executions();
+        let full = QueryService::new(&store)
+            .search(
+                "fallbackneedle",
+                &[],
+                options,
+                None,
+                FieldSet::Full,
+                bytes(),
+            )
+            .unwrap();
+        assert_eq!(store.search_hydration_loader_executions(), [8, 0]);
+        assert_eq!(full.results.len(), narrow.results.len());
     }
 
     #[test]

@@ -22,4 +22,5 @@ uuid.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
+ctx-history-store = { path = "../ctx-history-store", features = ["test-utils"] }
 tempfile.workspace = true

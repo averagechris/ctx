@@ -640,6 +640,55 @@ fn mcp_roundtrip(temp: &TempDir, messages: &[Value]) -> Vec<Value> {
     mcp_roundtrip_with_env(temp, messages, &[])
 }
 
+fn mcp_search_two_pages_same_process(temp: &TempDir) -> (Value, Value) {
+    let mut child = StdCommand::new(assert_cmd::cargo::cargo_bin("ctx"))
+        .args(["mcp", "serve"])
+        .env("CTX_DATA_ROOT", temp.path())
+        .env("HOME", temp.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut stdout = BufReader::new(stdout);
+    let send = |stdin: &mut std::process::ChildStdin, message: Value| {
+        writeln!(stdin, "{}", serde_json::to_string(&message).unwrap()).unwrap();
+        stdin.flush().unwrap();
+    };
+    let receive = |stdout: &mut BufReader<std::process::ChildStdout>| {
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        serde_json::from_str::<Value>(line.trim()).unwrap()
+    };
+
+    send(
+        &mut stdin,
+        json!({"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ctx-267-evidence","version":"0"}}}),
+    );
+    let initialize = receive(&mut stdout);
+    assert!(initialize["result"].is_object(), "{initialize:#}");
+    send(
+        &mut stdin,
+        json!({"jsonrpc":"2.0","id":"page-1","method":"tools/call","params":{"name":"search","arguments":{"query":"pagingneedle","events":true,"fields":"compact","limit":2}}}),
+    );
+    let page1 = receive(&mut stdout);
+    let token = page1["result"]["structuredContent"]["next"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    send(
+        &mut stdin,
+        json!({"jsonrpc":"2.0","id":"page-2","method":"tools/call","params":{"name":"search","arguments":{"query":"pagingneedle","events":true,"fields":"compact","limit":2,"continue":token}}}),
+    );
+    let page2 = receive(&mut stdout);
+    drop(stdin);
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "MCP stderr: {:?}", output.stderr);
+    (page1, page2)
+}
+
 fn mcp_roundtrip_with_env(temp: &TempDir, messages: &[Value], envs: &[(&str, &str)]) -> Vec<Value> {
     let mut stdin = String::new();
     for message in messages {
@@ -4651,6 +4700,29 @@ fn mcp_search_and_show_pagination_match_cli_query_pages() {
     assert_eq!(mcp_show["events"], cli_show["events"]);
     assert_eq!(mcp_show["pagination"], cli_show["pagination"]);
     assert_eq!(mcp_show["bytes"], cli_show["bytes"]);
+}
+
+#[test]
+#[ignore = "issue #267 MCP lifetime evidence; run explicitly"]
+fn issue_267_mcp_process_serves_both_pages_before_exit() {
+    let temp = tempdir();
+    import_distinct_search_fixtures(&temp, 4);
+    let (page1, page2) = mcp_search_two_pages_same_process(&temp);
+    let page1 = &page1["result"]["structuredContent"];
+    let page2 = &page2["result"]["structuredContent"];
+    assert_eq!(page1["pagination"]["offset"], 0);
+    assert_eq!(page2["pagination"]["offset"], 2);
+    let page1_ids = page1["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["item_id"].as_str().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(page2["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|item| !page1_ids.contains(item["item_id"].as_str().unwrap())));
 }
 
 #[test]

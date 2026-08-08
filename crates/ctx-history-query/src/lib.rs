@@ -3958,4 +3958,135 @@ mod tests {
             Err(QueryError::ItemExceedsPageBudget { .. })
         ));
     }
+
+    #[test]
+    #[ignore = "issue #267 evidence spike; run in release mode with --ignored --nocapture"]
+    fn issue_267_same_process_query_replays_fixed_candidate_pool() {
+        const RECORD_COUNT: usize = 200_000;
+        const PAGE_SIZE: usize = 100;
+        const WARMUP_PAIRS: usize = 1;
+        const SAMPLES: usize = 5;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("work.sqlite");
+        let writable = Store::open(&path).unwrap();
+        let created_at = fixed_time();
+        for start in (0..RECORD_COUNT).step_by(5_000) {
+            let records = (start..(start + 5_000).min(RECORD_COUNT))
+                .map(|index| HistoryRecord {
+                    id: Uuid::from_u128(index as u128 + 1),
+                    title: "issue-267 continuation fixture".to_owned(),
+                    body: "needle continuation replay fixture".to_owned(),
+                    tags: vec![],
+                    kind: "issue-267".to_owned(),
+                    workspace: None,
+                    created_at,
+                    updated_at: created_at,
+                })
+                .collect::<Vec<_>>();
+            writable.upsert_records(&records).unwrap();
+        }
+        drop(writable);
+
+        let store = Store::open_read_only(&path).unwrap();
+        let query = QueryService::new(&store);
+        let options = PacketOptions {
+            limit: PAGE_SIZE,
+            ..PacketOptions::default()
+        };
+
+        let run_pair = |query: &QueryService<'_>, options: &PacketOptions| {
+            let started = Instant::now();
+            let page1 = query
+                .search(
+                    "needle",
+                    &[],
+                    options.clone(),
+                    None,
+                    FieldSet::Compact,
+                    bytes(),
+                )
+                .unwrap();
+            let page1_elapsed = started.elapsed();
+            let token = page1.pagination.continuation.clone().unwrap();
+            let page2_started = Instant::now();
+            let page2 = query
+                .search(
+                    "needle",
+                    &[],
+                    options.clone(),
+                    Some(&token),
+                    FieldSet::Compact,
+                    bytes(),
+                )
+                .unwrap();
+            let page2_elapsed = page2_started.elapsed();
+            (
+                page1,
+                page2,
+                page1_elapsed,
+                page2_elapsed,
+                started.elapsed(),
+            )
+        };
+
+        for _ in 0..WARMUP_PAIRS {
+            let _ = run_pair(&query, &options);
+        }
+        let baseline_searches = store.record_search_page_executions();
+        let mut samples = Vec::with_capacity(SAMPLES);
+        for sample in 1..=SAMPLES {
+            let (page1, page2, page1_elapsed, page2_elapsed, total_elapsed) =
+                run_pair(&query, &options);
+            let page1_ids = page1
+                .results
+                .iter()
+                .map(search_projection_id)
+                .collect::<Vec<_>>();
+            let page2_ids = page2
+                .results
+                .iter()
+                .map(search_projection_id)
+                .collect::<Vec<_>>();
+            let expected_page1 = (1..=PAGE_SIZE)
+                .map(|id| Uuid::from_u128(id as u128))
+                .collect::<Vec<_>>();
+            let expected_page2 = ((PAGE_SIZE + 1)..=(PAGE_SIZE * 2))
+                .map(|id| Uuid::from_u128(id as u128))
+                .collect::<Vec<_>>();
+            assert_eq!(page1_ids, expected_page1, "page 1 ordering changed");
+            assert_eq!(page2_ids, expected_page2, "page 2 ordering changed");
+            assert_eq!(page1.pagination.offset, 0);
+            assert_eq!(page2.pagination.offset, PAGE_SIZE);
+            assert_eq!(page1.pool_total, 200);
+            assert_eq!(page2.pool_total, 200);
+
+            let after_searches = store.record_search_page_executions();
+            let reruns = after_searches.saturating_sub(baseline_searches);
+            assert_eq!(reruns, (sample * 2) as u64);
+            samples.push((page1_elapsed, page2_elapsed, total_elapsed, reruns));
+        }
+
+        println!(
+            "issue #267 fixture records={RECORD_COUNT} page_size={PAGE_SIZE} \
+             same_store_handle=true same_query_service=true"
+        );
+        for (index, (page1, page2, total, reruns)) in samples.into_iter().enumerate() {
+            println!(
+                "sample={} page1_us={} page2_us={} total_us={} \
+                 record_search_statements_since_warmup={reruns}",
+                index + 1,
+                page1.as_micros(),
+                page2.as_micros(),
+                total.as_micros(),
+            );
+        }
+    }
+
+    fn search_projection_id(result: &SearchResultProjectionV1) -> Uuid {
+        match result {
+            SearchResultProjectionV1::Full(value) => value.item_id,
+            SearchResultProjectionV1::Compact(value) => value.item_id,
+        }
+    }
 }

@@ -32,6 +32,7 @@ with an absolute output directory:
 ```sh
 CTX_LARGE_PROFILE_OUTPUT=/tmp/ctx-large-profile \
 CTX_LARGE_PROFILE_EVENTS=1250000 \
+CTX_LARGE_PROFILE_MEASUREMENT_REPEATS=5 \
 cargo test -p ctx-history-search --release streaming_large_profile_manual_release -- --ignored --nocapture
 ```
 
@@ -46,6 +47,13 @@ long runtimes. Use local scratch storage and remove it when done:
 ```sh
 rm -rf /tmp/ctx-large-profile
 ```
+
+`CTX_LARGE_PROFILE_MEASUREMENT_REPEATS` is bounded to 1–20 and defaults to 1
+for backward-compatible smoke/profile behavior. It repeats only the warm
+ordinary search, warm heavily filtered search, and replay no-op against the
+already generated corpus. Their artifact objects contain the ordered sample
+array, sample count, p50, p95, minimum, and maximum; the existing singular
+`*_ms` fields remain as the first sample for artifact consumers.
 
 Debug builds are refused. `CTX_LARGE_PROFILE_OUTPUT` must be explicit, absolute,
 must not resolve into `~/.ctx`, and must either not exist or contain the harness

@@ -7157,6 +7157,27 @@ mod tests {
     }
 
     #[test]
+    fn streaming_large_profile_records_requested_warm_samples() {
+        let temp = tempdir();
+        let mut cfg = LargeProfileConfig::smoke(temp.path().join("repeated"));
+        cfg.measurement_repeats = 5;
+        let artifact = run_streaming_large_profile(&cfg).unwrap();
+        assert_eq!(artifact["config"]["measurement_repeats"], 5);
+        for name in ["noop_replay", "warm_search", "filtered_search"] {
+            assert_eq!(artifact["measurements"][name]["sample_count"], 5);
+            assert_eq!(
+                artifact["measurements"][name]["samples_ms"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                5
+            );
+            assert!(artifact["measurements"][name]["p50_ms"].is_number());
+            assert!(artifact["measurements"][name]["p95_ms"].is_number());
+        }
+    }
+
+    #[test]
     fn streaming_large_profile_rejects_malformed_artifacts() {
         let temp = tempdir();
         let valid =
@@ -7362,6 +7383,7 @@ mod tests {
         manual: bool,
         release_build: bool,
         min_footprint_bytes: u64,
+        measurement_repeats: usize,
     }
 
     impl LargeProfileConfig {
@@ -7375,6 +7397,7 @@ mod tests {
                 manual: false,
                 release_build: !cfg!(debug_assertions),
                 min_footprint_bytes: 0,
+                measurement_repeats: 1,
             }
         }
         fn manual(output_dir: std::path::PathBuf) -> Self {
@@ -7392,6 +7415,9 @@ mod tests {
                 release_build: !cfg!(debug_assertions),
                 min_footprint_bytes: env_u64("CTX_LARGE_PROFILE_MIN_FOOTPRINT_BYTES")
                     .unwrap_or(10 * 1024 * 1024 * 1024),
+                measurement_repeats: env_usize("CTX_LARGE_PROFILE_MEASUREMENT_REPEATS")
+                    .unwrap_or(1)
+                    .clamp(1, 20),
             }
         }
     }
@@ -7468,13 +7494,17 @@ mod tests {
         let initial_ms = elapsed_ms(started.elapsed());
         let baseline_counts = profile_counts(&store)?;
         assert_expected_counts("baseline", baseline_counts, records as u64, imported as u64)?;
-        let noop_started = std::time::Instant::now();
-        write_synthetic_batch(&store, last_batch.as_ref().unwrap()).map_err(|e| e.to_string())?;
-        let noop_ms = elapsed_ms(noop_started.elapsed());
-        let noop_counts = profile_counts(&store)?;
-        if noop_counts != baseline_counts {
-            return Err("no-op replay changed base/FTS counts".into());
+        let mut noop_samples = Vec::with_capacity(cfg.measurement_repeats);
+        for _ in 0..cfg.measurement_repeats {
+            let noop_started = std::time::Instant::now();
+            write_synthetic_batch(&store, last_batch.as_ref().unwrap())
+                .map_err(|e| e.to_string())?;
+            noop_samples.push(elapsed_ms(noop_started.elapsed()));
+            if profile_counts(&store)? != baseline_counts {
+                return Err("no-op replay changed base/FTS counts".into());
+            }
         }
+        let noop_stats = timing_stats(&noop_samples);
         let inc_start = imported
             .div_ceil(cfg.events_per_record)
             .checked_mul(cfg.events_per_record)
@@ -7504,9 +7534,6 @@ mod tests {
             snippet_chars: 180,
             ..PacketOptions::default()
         };
-        let warm_started = std::time::Instant::now();
-        let warm = search_packet(&store, "perfneedle", &opts).map_err(|e| e.to_string())?;
-        let warm_ms = elapsed_ms(warm_started.elapsed());
         let filtered_opts = PacketOptions {
             filters: SearchFilters {
                 provider: Some(CaptureProvider::Codex),
@@ -7517,13 +7544,44 @@ mod tests {
             },
             ..opts.clone()
         };
-        let filt_started = std::time::Instant::now();
-        let filt =
-            search_packet(&store, "perfneedle", &filtered_opts).map_err(|e| e.to_string())?;
-        let filt_ms = elapsed_ms(filt_started.elapsed());
-        if warm.results.is_empty() || filt.results.is_empty() {
-            return Err("ordinary and filtered search results must be nonempty".into());
+        let mut warm_samples = Vec::with_capacity(cfg.measurement_repeats);
+        let mut filtered_samples = Vec::with_capacity(cfg.measurement_repeats);
+        let mut warm = None;
+        let mut filt = None;
+        for _ in 0..cfg.measurement_repeats {
+            let started = std::time::Instant::now();
+            let current = search_packet(&store, "perfneedle", &opts).map_err(|e| e.to_string())?;
+            warm_samples.push(elapsed_ms(started.elapsed()));
+            if current.results.is_empty() {
+                return Err("ordinary search results must be nonempty".into());
+            }
+            if let Some(first) = &warm {
+                if result_ids(first) != result_ids(&current) {
+                    return Err("ordinary search ordering changed between samples".into());
+                }
+            } else {
+                warm = Some(current);
+            }
+
+            let started = std::time::Instant::now();
+            let current =
+                search_packet(&store, "perfneedle", &filtered_opts).map_err(|e| e.to_string())?;
+            filtered_samples.push(elapsed_ms(started.elapsed()));
+            if current.results.is_empty() {
+                return Err("filtered search results must be nonempty".into());
+            }
+            if let Some(first) = &filt {
+                if result_ids(first) != result_ids(&current) {
+                    return Err("filtered search ordering changed between samples".into());
+                }
+            } else {
+                filt = Some(current);
+            }
         }
+        let warm = warm.unwrap();
+        let filt = filt.unwrap();
+        let warm_stats = timing_stats(&warm_samples);
+        let filt_stats = timing_stats(&filtered_samples);
         let middle_id = synthetic_event_id(imported / 2, cfg.seed)?;
         let window_started = std::time::Instant::now();
         let window = bounded_event_window(&store, middle_id, 1, 1)?;
@@ -7558,15 +7616,15 @@ mod tests {
             "schema_version": 1, "profile": "ctx-large-index-profile", "mode": if cfg.manual {"manual"} else {"smoke"},
             "requested": {"baseline_events": cfg.total_events, "min_footprint_bytes": cfg.min_footprint_bytes, "min_footprint_override_env": std::env::var("CTX_LARGE_PROFILE_MIN_FOOTPRINT_BYTES").ok()},
             "achieved": {"baseline_events": imported, "baseline_records": records, "incremental_events": inc.events.len(), "incremental_records": inc.records.len()},
-            "config": {"seed": cfg.seed, "events_per_record": cfg.events_per_record, "batch_records": cfg.batch_records, "batch_event_bound": batch_event_bound},
+            "config": {"seed": cfg.seed, "events_per_record": cfg.events_per_record, "batch_records": cfg.batch_records, "batch_event_bound": batch_event_bound, "measurement_repeats": cfg.measurement_repeats},
             "environment": {"os": std::env::consts::OS, "arch": std::env::consts::ARCH, "jj_change": local_jj_id("change"), "jj_commit": local_jj_id("commit"), "cache_state": "warm followed by reopen; true cold cache requires operator OS cache-drop steps"},
             "sqlite": sqlite,
             "paths": {"db": canonical_display(&db), "wal": canonical_display(&db.with_extension("sqlite-wal")), "shm": canonical_display(&db.with_extension("sqlite-shm")), "artifact": artifact_path.display().to_string()},
             "storage": {"pre_checkpoint": pre_checkpoint.to_json(), "post_checkpoint": post_checkpoint.to_json()},
             "counts": counts.to_json(),
             "generation": {"max_batch_events": max_batch_events, "bounded_by_batch_size": true},
-            "measurements": {"initial_import_ms": initial_ms, "noop_import_ms": noop_ms, "incremental_import_ms": inc_ms, "warm_search_ms": warm_ms, "filtered_search_ms": filt_ms, "noop_counts_unchanged": baseline_counts == noop_counts},
-            "search": {"ordinary_result_count": warm.results.len(), "filtered_result_count": filt.results.len(), "ordered_result_ids": warm_ids, "result_digest": warm_digest},
+            "measurements": {"initial_import_ms": initial_ms, "noop_import_ms": noop_stats.samples_ms[0], "incremental_import_ms": inc_ms, "warm_search_ms": warm_stats.samples_ms[0], "filtered_search_ms": filt_stats.samples_ms[0], "noop_replay": noop_stats.to_json(), "warm_search": warm_stats.to_json(), "filtered_search": filt_stats.to_json(), "noop_counts_unchanged": true},
+            "search": {"ordinary_result_count": warm.results.len(), "filtered_result_count": filt.results.len(), "ordered_result_ids": warm_ids, "result_digest": warm_digest, "filtered_ordered_result_ids": result_ids(&filt), "filtered_result_digest": digest_strings(&result_ids(&filt))},
             "event_window": {"target_event_id": middle_id.to_string(), "ids": window.iter().map(|e| e.id.to_string()).collect::<Vec<_>>(), "count": window.len(), "bound": 3, "contains_target": window.iter().any(|e| e.id == middle_id), "duration_ms": window_ms},
             "checkpoint": {"duration_ms": checkpoint_ms, "pre": pre_checkpoint.to_json(), "post": post_checkpoint.to_json()},
             "reopen": {"cache_state": "reopen_not_cold", "ordered_result_ids": reopened_ids, "result_digest": reopened_digest, "reopen_ms": reopen_ms},
@@ -7692,6 +7750,7 @@ mod tests {
         events_per_record: usize,
         batch_records: usize,
         batch_event_bound: usize,
+        measurement_repeats: usize,
     }
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -7756,7 +7815,20 @@ mod tests {
         incremental_import_ms: f64,
         warm_search_ms: f64,
         filtered_search_ms: f64,
+        noop_replay: ProfileTimingEvidence,
+        warm_search: ProfileTimingEvidence,
+        filtered_search: ProfileTimingEvidence,
         noop_counts_unchanged: bool,
+    }
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ProfileTimingEvidence {
+        sample_count: usize,
+        samples_ms: Vec<f64>,
+        p50_ms: f64,
+        p95_ms: f64,
+        min_ms: f64,
+        max_ms: f64,
     }
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(deny_unknown_fields)]
@@ -7765,6 +7837,8 @@ mod tests {
         filtered_result_count: usize,
         ordered_result_ids: Vec<String>,
         result_digest: String,
+        filtered_ordered_result_ids: Vec<String>,
+        filtered_result_digest: String,
     }
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -7870,6 +7944,22 @@ mod tests {
             }
             if self.search.result_digest != digest_strings(&self.search.ordered_result_ids) {
                 return Err("search digest mismatch".into());
+            }
+            if self.search.filtered_result_digest
+                != digest_strings(&self.search.filtered_ordered_result_ids)
+            {
+                return Err("filtered search digest mismatch".into());
+            }
+            for timing in [
+                &self.measurements.noop_replay,
+                &self.measurements.warm_search,
+                &self.measurements.filtered_search,
+            ] {
+                if timing.sample_count != self.config.measurement_repeats
+                    || timing.samples_ms.len() != self.config.measurement_repeats
+                {
+                    return Err("measurement repeat count mismatch".into());
+                }
             }
             if self.event_window.count != self.event_window.ids.len()
                 || self.event_window.count > self.event_window.bound

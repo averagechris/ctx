@@ -97,6 +97,700 @@ pub enum StoreError {
     NumericOutOfRange { field: &'static str },
 }
 
+/// Evidence-only FTS5 storage spike for SourceHut #269.
+///
+/// This deliberately does not use [`FTS_TABLES_SQL`]. The three schemas below
+/// are disposable benchmark schemas with identical columns and default FTS5
+/// storage settings; only `detail=full` (the current implicit setting),
+/// `detail=column`, and `detail=none` vary. In particular, this helper does
+/// not exercise contentless or external-content tables and cannot change a
+/// production schema or schema version.
+///
+/// Run exactly as follows when collecting evidence:
+///
+/// ```text
+/// cargo test -q -p ctx-history-store --release fts_storage_spike_evidence -- --ignored --nocapture --test-threads=1
+/// ```
+#[cfg(test)]
+mod fts_storage_spike_benches {
+    use super::*;
+
+    const CORPUS_ROWS: usize = 200_000;
+    const WARM_SAMPLES: usize = 5;
+    const SPIKE_COMMAND: &str = "cargo test -q -p ctx-history-store --release fts_storage_spike_evidence -- --ignored --nocapture --test-threads=1";
+
+    #[derive(Debug)]
+    struct VariantEvidence {
+        detail: &'static str,
+        db_size_bytes: u64,
+        fts_size_bytes: Option<u64>,
+        warm_samples_us: Vec<u64>,
+        rebuild_us: u64,
+        correctness: serde_json::Value,
+    }
+
+    #[test]
+    #[ignore = "evidence-only FTS5 storage spike for SourceHut #269"]
+    fn fts_storage_spike_evidence() {
+        let mut variants = Vec::new();
+        for detail in ["full", "column", "none"] {
+            variants.push(run_variant(detail));
+        }
+
+        let baseline = variants
+            .iter()
+            .find(|variant| variant.detail == "full")
+            .unwrap();
+        let candidate_reports = variants
+            .iter()
+            .filter(|variant| variant.detail != "full")
+            .map(|variant| {
+                let db_reduction = percent_reduction(baseline.db_size_bytes, variant.db_size_bytes);
+                let fts_reduction = match (baseline.fts_size_bytes, variant.fts_size_bytes) {
+                    (Some(before), Some(after)) => Some(percent_reduction(before, after)),
+                    _ => None,
+                };
+                let latency_regression = percent_change(
+                    p50(&variant.warm_samples_us),
+                    p50(&baseline.warm_samples_us),
+                );
+                let latency_p95_regression = percent_change(
+                    p95(&variant.warm_samples_us),
+                    p95(&baseline.warm_samples_us),
+                );
+                let rebuild_regression = percent_change(variant.rebuild_us, baseline.rebuild_us);
+                serde_json::json!({
+                    "detail": variant.detail,
+                    "db_size_reduction_percent": db_reduction,
+                    "fts_size_reduction_percent": fts_reduction,
+                    "warm_p50_regression_percent": latency_regression,
+                    "warm_p95_regression_percent": latency_p95_regression,
+                    "rebuild_regression_percent": rebuild_regression,
+                    "required_contracts_intact": variant.correctness["contract_intact"],
+                    "qualifies_individually": {
+                        "size_reduction_at_least_20_percent": db_reduction >= 20.0 || fts_reduction.is_some_and(|value| value >= 20.0),
+                        "required_contracts_intact": variant.correctness["contract_intact"],
+                        "warm_latency_regression_at_most_5_percent": latency_regression <= 5.0 && latency_p95_regression <= 5.0,
+                        "rebuild_regression_at_most_10_percent": rebuild_regression <= 10.0,
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let evidence = serde_json::json!({
+            "profile": "fts5-storage-spike-v1",
+            "issue": "~averagechris/projects#269",
+            "corpus": {
+                "rows": CORPUS_ROWS,
+                "shape": "one deterministic event_search projection plus identical base rows and empty sibling FTS projections",
+                "text": "ASCII deterministic tokens with six small correctness rows embedded at event-000000 through event-000005",
+            },
+            "schemas": {
+                "full": "current FTS5 storage: detail=full (explicit in disposable schema; production remains implicit default)",
+                "column": "FTS5 detail=column; all other FTS5 storage options unchanged",
+                "none": "FTS5 detail=none; all other FTS5 storage options unchanged",
+                "excluded": ["contentless", "external-content", "columnsize=0", "prefix indexes"],
+            },
+            "canonical_reproduction_command": SPIKE_COMMAND,
+            "jj": jj_provenance(),
+            "variants": variants.iter().map(|variant| {
+                serde_json::json!({
+                    "detail": variant.detail,
+                    "db_size_bytes": variant.db_size_bytes,
+                    "fts_specific_size_bytes": variant.fts_size_bytes,
+                    "warm_total_latency_us": {
+                        "sample_count": variant.warm_samples_us.len(),
+                        "samples": variant.warm_samples_us,
+                        "p50": p50(&variant.warm_samples_us),
+                        "p95": p95(&variant.warm_samples_us),
+                        "meaning": "end-to-end SELECT of the first 100 ordered event IDs and safe_preview_text values after one warmup query",
+                    },
+                    "rebuild_us": variant.rebuild_us,
+                    "correctness": variant.correctness,
+                })
+            }).collect::<Vec<_>>(),
+            "gate_comparison_to_current_full": candidate_reports,
+            "decision": {
+                "go": false,
+                "recommendation": "no-go; do not create a production detail migration from this spike",
+                "reason": "detail=column and detail=none both explicitly reject the public phrase-query contract; unsupported phrase semantics were not masked or rewritten",
+                "optional_1m": "not run: the 200k result is already a no-go on required-contract preservation",
+            },
+        });
+        println!(
+            "fts storage spike evidence: {}",
+            serde_json::to_string_pretty(&evidence).unwrap()
+        );
+    }
+
+    fn run_variant(detail: &'static str) -> VariantEvidence {
+        let root = std::env::current_dir().unwrap().join("target/test-data");
+        fs::create_dir_all(&root).unwrap();
+        let temp = tempfile::Builder::new()
+            .prefix("ctx-history-store-fts-spike-")
+            .tempdir_in(root)
+            .unwrap();
+        let path = temp.path().join(format!("{detail}.sqlite"));
+        let conn = Connection::open(&path).unwrap();
+        create_disposable_schema(&conn, detail);
+        populate_corpus(&conn);
+        rebuild_projection(&conn);
+
+        let mut correctness = check_correctness_matrix(&conn, detail);
+
+        // Exercise the write paths and the explicit rowid-map cache without
+        // changing the deterministic corpus used for the measurements.
+        correctness["insert_update_delete"] = exercise_insert_update_delete(&conn);
+        let rebuild_started = Instant::now();
+        rebuild_projection(&conn);
+        let rebuild_us = elapsed_us(rebuild_started.elapsed());
+        assert_eq!(
+            scalar_i64(&conn, "SELECT COUNT(*) FROM benchmark_events"),
+            CORPUS_ROWS as i64
+        );
+        assert_eq!(
+            scalar_i64(&conn, "SELECT COUNT(*) FROM event_search"),
+            CORPUS_ROWS as i64
+        );
+        assert_maps_are_exact(&conn);
+        correctness["rebuild"] = serde_json::json!({
+            "passed": true,
+            "base_rows": CORPUS_ROWS,
+            "projection_rows": CORPUS_ROWS,
+            "rowid_map_rows": CORPUS_ROWS,
+            "maps_exact_after_rebuild": true,
+        });
+
+        // VACUUM is outside the measured rebuild. It makes the size comparison
+        // compare compacted, otherwise identical disposable databases rather
+        // than free pages left by the CRUD exercise.
+        conn.execute_batch("VACUUM").unwrap();
+        assert_eq!(scalar_string(&conn, "PRAGMA integrity_check"), "ok");
+        drop(conn);
+
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(scalar_string(&conn, "PRAGMA integrity_check"), "ok");
+        assert_eq!(
+            scalar_i64(&conn, "SELECT COUNT(*) FROM event_search"),
+            CORPUS_ROWS as i64
+        );
+        assert_maps_are_exact(&conn);
+        let reopened_ids = ordered_ids(
+            &conn,
+            &SearchQueryPlan::new(SearchMatchMode::All, ["matrixall alpha"]),
+        )
+        .unwrap();
+        assert_eq!(reopened_ids, vec!["event-000000", "event-000001"]);
+        correctness["reopen_integrity"] = serde_json::json!({
+            "passed": true,
+            "sqlite_integrity_check": "ok",
+            "ordered_ids_after_reopen": reopened_ids,
+        });
+        correctness["fts_rowid_map"]["identity_after_reopen"] = true.into();
+
+        let benchmark_plan = SearchQueryPlan::new(SearchMatchMode::All, ["perfneedle commonterm"]);
+        let expected_sample_ids = benchmark_ids(&conn, &benchmark_plan);
+        let _ = benchmark_ids(&conn, &benchmark_plan); // one warmup, excluded from samples
+        let mut warm_samples_us = Vec::with_capacity(WARM_SAMPLES);
+        for _ in 0..WARM_SAMPLES {
+            let started = Instant::now();
+            let ids = benchmark_ids(&conn, &benchmark_plan);
+            let elapsed = elapsed_us(started.elapsed());
+            assert_eq!(ids, expected_sample_ids);
+            warm_samples_us.push(elapsed.max(1));
+        }
+        let fts_size_bytes = fts_dbstat_bytes(&conn);
+        drop(conn);
+
+        VariantEvidence {
+            detail,
+            db_size_bytes: fs::metadata(&path).unwrap().len(),
+            fts_size_bytes,
+            warm_samples_us,
+            rebuild_us,
+            correctness,
+        }
+    }
+
+    fn create_disposable_schema(conn: &Connection, detail: &str) {
+        assert!(matches!(detail, "full" | "column" | "none"));
+        conn.execute_batch(
+            r#"
+            PRAGMA journal_mode = DELETE;
+            PRAGMA synchronous = OFF;
+            CREATE TABLE benchmark_events (
+                event_id TEXT PRIMARY KEY,
+                safe_preview_text TEXT NOT NULL
+            );
+            CREATE TABLE event_search_rowids (
+                event_id TEXT PRIMARY KEY,
+                search_rowid INTEGER NOT NULL UNIQUE
+            ) WITHOUT ROWID;
+            "#,
+        )
+        .unwrap();
+        conn.execute_batch(&format!(
+            r#"
+            CREATE VIRTUAL TABLE ctx_history_search USING fts5(
+                record_id UNINDEXED, title, summary, primary_user_text,
+                decision_text, context_text, tag_text, detail={detail}
+            );
+            CREATE VIRTUAL TABLE event_search USING fts5(
+                event_id UNINDEXED, history_record_id UNINDEXED,
+                session_id UNINDEXED, role UNINDEXED, safe_preview_text,
+                rank_bucket UNINDEXED, detail={detail}
+            );
+            CREATE VIRTUAL TABLE artifact_search USING fts5(
+                artifact_id UNINDEXED, history_record_id UNINDEXED,
+                safe_preview_text, detail={detail}
+            );
+            "#
+        ))
+        .unwrap();
+    }
+
+    fn populate_corpus(conn: &Connection) {
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        {
+            let mut insert = conn
+                .prepare(
+                    "INSERT INTO benchmark_events (event_id, safe_preview_text) VALUES (?1, ?2)",
+                )
+                .unwrap();
+            for index in 0..CORPUS_ROWS {
+                let id = format!("event-{index:06}");
+                let text = match index {
+                    0 | 1 => "matrixall alpha ordered source".to_owned(),
+                    2 => "matrixanyalpha source".to_owned(),
+                    3 => "matrixanybeta source".to_owned(),
+                    4 => "matrixphrase ordered phrase source".to_owned(),
+                    5 => "matrixphrase ordered other source".to_owned(),
+                    index => format!(
+                        "perfneedle commonterm event {index:06} alpha{} beta{} gamma",
+                        if index % 2 == 0 { "" } else { "-absent" },
+                        if index % 3 == 0 { "" } else { "-absent" },
+                    ),
+                };
+                insert.execute(params![id, text]).unwrap();
+            }
+        }
+        conn.execute_batch("COMMIT").unwrap();
+    }
+
+    fn rebuild_projection(conn: &Connection) {
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        conn.execute("DELETE FROM event_search", []).unwrap();
+        conn.execute("DELETE FROM event_search_rowids", []).unwrap();
+        conn.execute(
+            "INSERT INTO event_search (event_id, history_record_id, session_id, role, safe_preview_text, rank_bucket)
+             SELECT event_id, NULL, NULL, 'user', safe_preview_text, 'message'
+             FROM benchmark_events ORDER BY event_id",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO event_search_rowids (event_id, search_rowid)
+             SELECT event_id, rowid FROM event_search",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch("COMMIT").unwrap();
+    }
+
+    fn check_correctness_matrix(conn: &Connection, detail: &'static str) -> serde_json::Value {
+        let all_plan = SearchQueryPlan::new(SearchMatchMode::All, ["matrixall alpha"]);
+        let any_plan = SearchQueryPlan::new(SearchMatchMode::Any, ["matrixanyalpha matrixanybeta"]);
+        let phrase_plan =
+            SearchQueryPlan::new(SearchMatchMode::Phrase, ["matrixphrase ordered phrase"]);
+        assert_eq!(
+            all_plan.fts_match_query().as_deref(),
+            Some("(\"matrixall\" AND \"alpha\")")
+        );
+        assert_eq!(
+            any_plan.fts_match_query().as_deref(),
+            Some("(\"matrixanyalpha\" OR \"matrixanybeta\")")
+        );
+        assert_eq!(
+            phrase_plan.fts_match_query().as_deref(),
+            Some("(\"matrixphrase ordered phrase\")")
+        );
+
+        let all_ids = ordered_ids(conn, &all_plan).unwrap();
+        let any_ids = ordered_ids(conn, &any_plan).unwrap();
+        assert_eq!(all_ids, vec!["event-000000", "event-000001"]);
+        assert_eq!(any_ids, vec!["event-000002", "event-000003"]);
+
+        let phrase_attempt = ordered_ids(conn, &phrase_plan);
+        let (phrase_supported, phrase_unsupported_error) = match phrase_attempt {
+            Ok(ids) => {
+                assert_eq!(ids, vec!["event-000004"]);
+                (true, None)
+            }
+            Err(error) => {
+                assert!(
+                    error.contains("phrase queries are not supported"),
+                    "{error}"
+                );
+                (false, Some(error))
+            }
+        };
+        assert_eq!(phrase_supported, detail == "full");
+
+        let snippet_rows = conn
+            .prepare(
+                "SELECT event_id, safe_preview_text FROM event_search
+                 WHERE event_search MATCH 'matrixall' ORDER BY rowid",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect::<Vec<_>>();
+        let snippet_source_available = snippet_rows.len() == 2
+            && snippet_rows
+                .iter()
+                .all(|(_, text)| text.contains("matrixall"));
+        assert!(snippet_source_available);
+        let snippet_auxiliary_available = conn
+            .query_row(
+                "SELECT snippet(event_search, 4, '<b>', '</b>', '…', 12)
+                 FROM event_search WHERE event_search MATCH 'matrixall' LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .map(|snippet| !snippet.is_empty())
+            .unwrap_or(false);
+        assert!(snippet_auxiliary_available);
+
+        let maps_exact_before_crud = maps_are_exact(conn);
+        assert!(maps_exact_before_crud);
+        serde_json::json!({
+            "fts_match_query": {
+                "all": all_plan.fts_match_query(),
+                "any": any_plan.fts_match_query(),
+                "phrase": phrase_plan.fts_match_query(),
+            },
+            "ordered_ids": {
+                "all": all_ids,
+                "any": any_ids,
+                "phrase": if phrase_supported { json_ids(&["event-000004"]) } else { serde_json::Value::Null },
+            },
+            "phrase": {
+                "supported": phrase_supported,
+                "explicit_unsupported_error": phrase_unsupported_error,
+                "expected_for_variant": detail == "full",
+            },
+            "snippet": {
+                "stored_safe_preview_source_available": snippet_source_available,
+                "sqlite_snippet_auxiliary_available": snippet_auxiliary_available,
+            },
+            "fts_rowid_map": {
+                "explicit_map_table": "event_search_rowids",
+                "identity_before_crud": maps_exact_before_crud,
+                "point_delete_with_verified_rowid_and_stale_fallback": true,
+            },
+            "contract_intact": phrase_supported
+                && snippet_source_available
+                && snippet_auxiliary_available
+                && maps_exact_before_crud,
+        })
+    }
+
+    fn exercise_insert_update_delete(conn: &Connection) -> serde_json::Value {
+        let insert_id = "crud-insert";
+        conn.execute(
+            "INSERT INTO benchmark_events (event_id, safe_preview_text) VALUES (?1, ?2)",
+            params![insert_id, "crud insert needle"],
+        )
+        .unwrap();
+        insert_projection(conn, insert_id, "crud insert needle");
+        assert_eq!(
+            ordered_ids(
+                conn,
+                &SearchQueryPlan::new(SearchMatchMode::All, ["crud insert"]),
+            )
+            .unwrap(),
+            vec![insert_id.to_owned()]
+        );
+
+        conn.execute(
+            "UPDATE benchmark_events SET safe_preview_text = ?2 WHERE event_id = ?1",
+            params![insert_id, "crud updated needle"],
+        )
+        .unwrap();
+        delete_projection(conn, insert_id);
+        insert_projection(conn, insert_id, "crud updated needle");
+        assert!(ordered_ids(
+            conn,
+            &SearchQueryPlan::new(SearchMatchMode::All, ["crud insert"])
+        )
+        .unwrap()
+        .is_empty());
+        assert_eq!(
+            ordered_ids(
+                conn,
+                &SearchQueryPlan::new(SearchMatchMode::All, ["crud updated"]),
+            )
+            .unwrap(),
+            vec![insert_id.to_owned()]
+        );
+
+        conn.execute(
+            "DELETE FROM benchmark_events WHERE event_id = ?1",
+            params![insert_id],
+        )
+        .unwrap();
+        delete_projection(conn, insert_id);
+        assert!(ordered_ids(
+            conn,
+            &SearchQueryPlan::new(SearchMatchMode::All, ["crud updated"])
+        )
+        .unwrap()
+        .is_empty());
+
+        let stale_id = "crud-stale-map";
+        conn.execute(
+            "INSERT INTO benchmark_events (event_id, safe_preview_text) VALUES (?1, ?2)",
+            params![stale_id, "crud stale needle"],
+        )
+        .unwrap();
+        insert_projection(conn, stale_id, "crud stale needle");
+        conn.execute(
+            "UPDATE event_search_rowids SET search_rowid = search_rowid + 999999 WHERE event_id = ?1",
+            params![stale_id],
+        )
+        .unwrap();
+        assert_eq!(delete_projection(conn, stale_id), "full_scan");
+        assert!(ordered_ids(
+            conn,
+            &SearchQueryPlan::new(SearchMatchMode::All, ["crud stale"])
+        )
+        .unwrap()
+        .is_empty());
+        conn.execute(
+            "DELETE FROM benchmark_events WHERE event_id = ?1",
+            params![stale_id],
+        )
+        .unwrap();
+        assert_maps_are_exact(conn);
+        serde_json::json!({
+            "passed": true,
+            "insert": "projection and rowid-map entry created",
+            "update": "verified point delete followed by replacement and map refresh",
+            "delete": "verified point delete followed by map removal",
+            "stale_map": "verified mismatch fell back to full-scan delete and removed stale map entry",
+        })
+    }
+
+    fn insert_projection(conn: &Connection, event_id: &str, text: &str) {
+        conn.execute(
+            "INSERT INTO event_search (event_id, history_record_id, session_id, role, safe_preview_text, rank_bucket)
+             VALUES (?1, NULL, NULL, 'user', ?2, 'message')",
+            params![event_id, text],
+        )
+        .unwrap();
+        let search_rowid = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT OR REPLACE INTO event_search_rowids (event_id, search_rowid) VALUES (?1, ?2)",
+            params![event_id, search_rowid],
+        )
+        .unwrap();
+    }
+
+    fn delete_projection(conn: &Connection, event_id: &str) -> &'static str {
+        let mapped = conn
+            .query_row(
+                "SELECT search_rowid FROM event_search_rowids WHERE event_id = ?1",
+                params![event_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .unwrap();
+        let point_delete = mapped.is_some_and(|search_rowid| {
+            conn.query_row(
+                "SELECT event_id FROM event_search WHERE rowid = ?1",
+                params![search_rowid],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .unwrap()
+            .is_some_and(|actual_id| actual_id == event_id)
+        });
+        if let Some(search_rowid) = mapped.filter(|_| point_delete) {
+            conn.execute(
+                "DELETE FROM event_search WHERE rowid = ?1",
+                params![search_rowid],
+            )
+            .unwrap();
+            conn.execute(
+                "DELETE FROM event_search_rowids WHERE event_id = ?1",
+                params![event_id],
+            )
+            .unwrap();
+            "point"
+        } else {
+            conn.execute(
+                "DELETE FROM event_search WHERE event_id = ?1",
+                params![event_id],
+            )
+            .unwrap();
+            conn.execute(
+                "DELETE FROM event_search_rowids WHERE event_id = ?1",
+                params![event_id],
+            )
+            .unwrap();
+            "full_scan"
+        }
+    }
+
+    fn ordered_ids(
+        conn: &Connection,
+        plan: &SearchQueryPlan,
+    ) -> std::result::Result<Vec<String>, String> {
+        let match_query = plan
+            .fts_match_query()
+            .ok_or_else(|| "empty FTS query".to_owned())?;
+        let mut stmt = conn
+            .prepare("SELECT event_id FROM event_search WHERE event_search MATCH ?1 ORDER BY rowid")
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(params![match_query], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string());
+        rows
+    }
+
+    fn benchmark_ids(conn: &Connection, plan: &SearchQueryPlan) -> Vec<String> {
+        let match_query = plan.fts_match_query().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT event_id, safe_preview_text FROM event_search
+                 WHERE event_search MATCH ?1 ORDER BY rowid LIMIT 100",
+            )
+            .unwrap();
+        stmt.query_map(params![match_query], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .map(|row| {
+            let (id, source) = row.unwrap();
+            assert!(!source.is_empty());
+            id
+        })
+        .collect()
+    }
+
+    fn maps_are_exact(conn: &Connection) -> bool {
+        scalar_i64(
+            conn,
+            "SELECT COUNT(*) FROM event_search f
+             JOIN event_search_rowids m ON m.event_id = f.event_id AND m.search_rowid = f.rowid",
+        ) == scalar_i64(conn, "SELECT COUNT(*) FROM event_search")
+            && scalar_i64(
+                conn,
+                "SELECT COUNT(*) FROM event_search_rowids m
+                 LEFT JOIN event_search f ON f.rowid = m.search_rowid AND f.event_id = m.event_id
+                 WHERE f.rowid IS NULL",
+            ) == 0
+    }
+
+    fn assert_maps_are_exact(conn: &Connection) {
+        assert!(
+            maps_are_exact(conn),
+            "event_search_rowids is not an exact FTS identity map"
+        );
+    }
+
+    fn fts_dbstat_bytes(conn: &Connection) -> Option<u64> {
+        let sql = "SELECT COALESCE(SUM(pgsize), 0) FROM dbstat
+                   WHERE (name = 'event_search' OR name LIKE 'event_search_%'
+                       OR name = 'ctx_history_search' OR name LIKE 'ctx_history_search_%'
+                       OR name = 'artifact_search' OR name LIKE 'artifact_search_%')
+                     AND name NOT IN ('event_search_rowids')";
+        conn.query_row(sql, [], |row| row.get::<_, i64>(0))
+            .ok()
+            .map(|bytes| bytes as u64)
+    }
+
+    fn scalar_i64(conn: &Connection, sql: &str) -> i64 {
+        conn.query_row(sql, [], |row| row.get(0)).unwrap()
+    }
+
+    fn scalar_string(conn: &Connection, sql: &str) -> String {
+        conn.query_row(sql, [], |row| row.get(0)).unwrap()
+    }
+
+    fn elapsed_us(duration: Duration) -> u64 {
+        duration.as_micros().min(u128::from(u64::MAX)) as u64
+    }
+
+    fn p50(samples: &[u64]) -> u64 {
+        percentile(samples, 50)
+    }
+
+    fn p95(samples: &[u64]) -> u64 {
+        percentile(samples, 95)
+    }
+
+    fn percentile(samples: &[u64], percentile: usize) -> u64 {
+        let mut sorted = samples.to_vec();
+        sorted.sort_unstable();
+        let index = ((sorted.len() * percentile).saturating_add(99) / 100).saturating_sub(1);
+        sorted[index.min(sorted.len().saturating_sub(1))]
+    }
+
+    fn percent_reduction(before: u64, after: u64) -> f64 {
+        if before == 0 {
+            return 0.0;
+        }
+        ((before.saturating_sub(after) as f64) / before as f64) * 100.0
+    }
+
+    fn percent_change(after: u64, before: u64) -> f64 {
+        if before == 0 {
+            return 0.0;
+        }
+        ((after as f64 - before as f64) / before as f64) * 100.0
+    }
+
+    fn json_ids(ids: &[&str]) -> serde_json::Value {
+        ids.iter()
+            .map(|id| serde_json::Value::String((*id).to_owned()))
+            .collect()
+    }
+
+    fn jj_provenance() -> serde_json::Value {
+        let output = std::process::Command::new("jj")
+            .args([
+                "log",
+                "-r",
+                "@",
+                "--no-graph",
+                "-T",
+                "commit_id ++ \"\\n\" ++ change_id ++ \"\\n\"",
+            ])
+            .output();
+        match output {
+            Ok(output) if output.status.success() => {
+                let ids = String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                serde_json::json!({
+                    "commit_id": ids.first(),
+                    "change_id": ids.get(1),
+                })
+            }
+            _ => serde_json::json!({"commit_id": null, "change_id": null}),
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, StoreError>;
 
 #[derive(Debug, Clone, PartialEq)]

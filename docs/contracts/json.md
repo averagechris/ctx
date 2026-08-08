@@ -416,15 +416,29 @@ event ID) inside the hex token so keyset paging can resume; this is not path,
 query, or provider metadata.
 
 Writable opens migrate known v0-v15 stores through the fork chain — v1000
-(durable FTS rowid maps) then v1001 (pagination indexes) — and existing v1000
-stores to v1001; reserved versions 16-999 and versions above 1001 fail closed
+(durable FTS rowid maps), v1001 (pagination indexes), then v1002 (path-free
+source health) — and existing v1000/v1001 stores to v1002; reserved versions
+16-999 and versions above 1002 fail closed
 without mutation. Index creation and `user_version = 1001` are one
 transaction, and the step touches neither the rowid maps nor the FTS
 projections. The v1001 migration adds exactly
 `idx_sessions_provider_external_session_started` on
 `sessions(provider, external_session_id, started_at_ms DESC, id)` and
 `idx_events_session_seq_id` on `events(session_id, seq, id)`. Read-only
-search/show/locate/MCP opens require exactly v1001 and never migrate or write.
+search/show/locate/MCP opens require exactly v1002 and never migrate or write.
+Restart long-lived processes such as `ctx mcp` after upgrading so they reopen
+through the v1002 gate.
+
+`ctx doctor --json` reports both the legacy
+`ledger_backed_zero_yield_anomalies` count and the path-free
+`source_level_anomalies`/`source_level_class_breakdown`, with coverage
+`all_import_paths_since_v1002` and compatibility field `not_persisted_for: []`.
+Default doctor remains read-only. `ctx doctor --acknowledge-source-health`
+explicitly clears only advisory source-health rows and reports the exact
+`acknowledged` count; it does not repair, suppress imports, or modify history,
+FTS projections, or rowid maps. Import strict mode also fails after printing a
+complete report when health persistence failed. Search refresh instead reports
+`degraded_health_persistence` and continues serving search after durable import.
 
 The migration was measured on 2026-07-11 with a temporary synthetic v15 SQLite
 database containing 100,000 events (100 sessions × 1,000 events) and 1,000

@@ -793,6 +793,93 @@ mod fts_storage_spike_benches {
             _ => serde_json::json!({"commit_id": null, "change_id": null}),
         }
     }
+
+    #[test]
+    fn hmac_sha256_matches_rfc4231_vector() {
+        assert_eq!(
+            hmac_sha256_hex(&[0x0b; 20], b"Hi There"),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+    }
+
+    #[test]
+    fn source_health_identity_is_stable_private_and_store_scoped() {
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let source = first_dir.path().join("secret-plugin-source.jsonl");
+        fs::write(&source, "secret transcript").unwrap();
+        let first_path = first_dir.path().join("work.sqlite");
+        let second_path = second_dir.path().join("work.sqlite");
+        let first = Store::open(&first_path).unwrap();
+        first
+            .upsert_source_health(
+                "private-provider",
+                "private-format",
+                &source,
+                "private-id",
+                SourceHealthClassification::ZeroYieldAnomaly,
+            )
+            .unwrap();
+        let key1: String = first
+            .conn
+            .query_row("SELECT source_key FROM source_health", [], |r| r.get(0))
+            .unwrap();
+        drop(first);
+        let reopened = Store::open(&first_path).unwrap();
+        reopened
+            .upsert_source_health(
+                "private-provider",
+                "private-format",
+                &source,
+                "private-id",
+                SourceHealthClassification::Healthy,
+            )
+            .unwrap();
+        let key2: String = reopened
+            .conn
+            .query_row("SELECT source_key FROM source_health", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(key1, key2);
+        assert_eq!(
+            reopened.source_health_counts().unwrap().zero_yield_anomaly,
+            0
+        );
+        assert_eq!(key1.len(), 64);
+        let schema_and_rows = format!(
+            "{} {:?}",
+            reopened.schema().unwrap(),
+            reopened
+                .conn
+                .query_row::<String, _, _>("SELECT classification FROM source_health", [], |r| r
+                    .get(0))
+                .unwrap()
+        );
+        for secret in [
+            "secret-plugin-source",
+            "private-provider",
+            "private-format",
+            "private-id",
+            "secret transcript",
+        ] {
+            assert!(!schema_and_rows.contains(secret));
+        }
+
+        let second = Store::open(&second_path).unwrap();
+        second
+            .upsert_source_health(
+                "private-provider",
+                "private-format",
+                &source,
+                "private-id",
+                SourceHealthClassification::Healthy,
+            )
+            .unwrap();
+        let key3: String = second
+            .conn
+            .query_row("SELECT source_key FROM source_health", [], |r| r.get(0))
+            .unwrap();
+        assert_ne!(key1, key3);
+    }
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -831,9 +918,9 @@ impl IdPrefixAmbiguity {
 /// Current schema version. The ported upstream migration chain is v1–v15;
 /// this fork's first schema divergence jumps to 1000 (docs/fork-plan.md,
 /// decision 9) so fork migrations can never collide with upstream's chain.
-/// v1000 is the landed rowid-map migration; v1001 adds the bounded
-/// pagination keyset indexes ([`V1001_INDEXES_SQL`]). The next fork
-/// migration is 1002.
+/// v1000 is the landed rowid-map migration; v1001 adds bounded pagination
+/// indexes and v1002 adds the path-free source-health ledger. The next fork
+/// migration is 1003.
 ///
 /// Any binary whose chain ends at v15 refuses to *open* a fork-versioned
 /// store, both read-only (exact-version check in [`Store::open_read_only`])
@@ -845,7 +932,7 @@ impl IdPrefixAmbiguity {
 /// open connection can keep writing until it restarts, which is why release
 /// guidance says to restart long-lived ctx processes after upgrading and
 /// why map entries are verified before every point delete.
-const SCHEMA_VERSION: i64 = 1001;
+const SCHEMA_VERSION: i64 = 1002;
 /// First schema version of this fork's migration chain (the v1000 rowid-map
 /// migration). Writable opens migrate every reviewed version at or above
 /// this up to [`SCHEMA_VERSION`]; the fork chain has no gaps.
@@ -859,8 +946,8 @@ const UPSTREAM_SCHEMA_VERSION_MAX: i64 = 15;
 /// True when a writable open of this binary can migrate the given on-disk
 /// schema version to the current one: everything at or below the ported
 /// upstream chain (≤ v15) migrates, and so does every reviewed fork version
-/// (currently exactly v1000, which upgrades in place to v1001 without
-/// touching the rowid maps or FTS projections). Versions in the (15, 1000)
+/// (currently v1000 and v1001, upgraded without touching rowid maps or FTS
+/// projections). Versions in the (15, 1000)
 /// gap and versions above [`SCHEMA_VERSION`] belong to other (newer or
 /// unreviewed) binaries and are rejected rather than migrated; callers
 /// should steer users toward upgrading ctx or restoring a matching database
@@ -2635,6 +2722,9 @@ impl Store {
         if user_version < 1001 {
             migrate_to_v1001(&self.conn)?;
         }
+        if user_version < 1002 {
+            migrate_to_v1002(&self.conn)?;
+        }
         create_fts_tables_if_supported(&self.conn)?;
         // Recreate dropped rowid map tables empty on open; an empty map is
         // always safe (writes degrade to the legacy full-scan path and each
@@ -3482,6 +3572,94 @@ impl Store {
             |row| row.get(0),
         )?;
         Ok(count.max(0) as usize)
+    }
+
+    /// Records reporting-only source health. Identity material is used only
+    /// as HMAC input and is never stored.
+    pub fn upsert_source_health(
+        &self,
+        provider: &str,
+        format: &str,
+        logical_path: &Path,
+        logical_id: &str,
+        classification: SourceHealthClassification,
+    ) -> Result<()> {
+        let source_key = self.source_health_key(provider, format, logical_path, logical_id)?;
+        self.conn.execute(
+            r#"INSERT INTO source_health(source_key, classification, updated_at_ms)
+               VALUES (?1, ?2, ?3)
+               ON CONFLICT(source_key) DO UPDATE SET
+                 classification = excluded.classification,
+                 updated_at_ms = excluded.updated_at_ms"#,
+            params![
+                source_key,
+                classification.as_str(),
+                utc_now().timestamp_millis()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn heal_source_health_if_present(
+        &self,
+        provider: &str,
+        format: &str,
+        logical_path: &Path,
+        logical_id: &str,
+    ) -> Result<usize> {
+        let source_key = self.source_health_key(provider, format, logical_path, logical_id)?;
+        Ok(self.conn.execute(
+            "UPDATE source_health SET classification = 'healthy', updated_at_ms = ?2 WHERE source_key = ?1",
+            params![source_key, utc_now().timestamp_millis()],
+        )?)
+    }
+
+    /// Explicitly acknowledges all advisory source-level health. Import,
+    /// history, search projections, and the per-store identity key are untouched.
+    pub fn acknowledge_source_health(&self) -> Result<usize> {
+        Ok(self.conn.execute("DELETE FROM source_health", [])?)
+    }
+
+    fn source_health_key(
+        &self,
+        provider: &str,
+        format: &str,
+        logical_path: &Path,
+        logical_id: &str,
+    ) -> Result<String> {
+        let canonical =
+            fs::canonicalize(logical_path).unwrap_or_else(|_| logical_path.to_path_buf());
+        let key: Vec<u8> = self.conn.query_row(
+            "SELECT key FROM source_health_key WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let mut input = Vec::new();
+        for component in [
+            provider.as_bytes(),
+            format.as_bytes(),
+            canonical.as_os_str().as_encoded_bytes(),
+            logical_id.as_bytes(),
+        ] {
+            input.extend_from_slice(&(component.len() as u64).to_be_bytes());
+            input.extend_from_slice(component);
+        }
+        Ok(hmac_sha256_hex(&key, &input))
+    }
+
+    pub fn source_health_counts(&self) -> Result<SourceHealthCounts> {
+        let total: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM source_health", [], |row| row.get(0))?;
+        let anomalies: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM source_health WHERE classification = 'zero_yield_anomaly'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(SourceHealthCounts {
+            total: total.max(0) as usize,
+            zero_yield_anomaly: anomalies.max(0) as usize,
+        })
     }
 
     pub fn catalog_session_count(&self) -> Result<usize> {
@@ -7835,6 +8013,84 @@ fn migrate_to_v1001(conn: &Connection) -> Result<()> {
             Err(err)
         }
     }
+}
+
+/// Reporting-only keyed source health. No searchable tables or rowid maps are
+/// read or changed by this migration.
+fn migrate_to_v1002(conn: &Connection) -> Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let migration = (|| -> Result<()> {
+        conn.execute_batch(r#"
+            CREATE TABLE IF NOT EXISTS source_health_key (
+              singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+              key BLOB NOT NULL CHECK (length(key) = 32)
+            );
+            INSERT OR IGNORE INTO source_health_key(singleton, key) VALUES (1, randomblob(32));
+            CREATE TABLE IF NOT EXISTS source_health (
+              source_key TEXT PRIMARY KEY CHECK (length(source_key) = 64 AND source_key NOT GLOB '*[^0-9a-f]*'),
+              classification TEXT NOT NULL CHECK (classification IN ('healthy', 'zero_yield_anomaly')),
+              updated_at_ms INTEGER NOT NULL
+            );
+            PRAGMA user_version = 1002;
+        "#)?;
+        Ok(())
+    })();
+    match migration {
+        Ok(()) => {
+            conn.execute_batch("COMMIT;")?;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(err)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceHealthClassification {
+    Healthy,
+    ZeroYieldAnomaly,
+}
+
+impl SourceHealthClassification {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::ZeroYieldAnomaly => "zero_yield_anomaly",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceHealthCounts {
+    pub total: usize,
+    pub zero_yield_anomaly: usize,
+}
+
+fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
+    const BLOCK: usize = 64;
+    let mut normalized = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        normalized[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        normalized[..key.len()].copy_from_slice(key);
+    }
+    let mut inner_pad = [0x36u8; BLOCK];
+    let mut outer_pad = [0x5cu8; BLOCK];
+    for index in 0..BLOCK {
+        inner_pad[index] ^= normalized[index];
+        outer_pad[index] ^= normalized[index];
+    }
+    let inner = Sha256::new()
+        .chain_update(inner_pad)
+        .chain_update(message)
+        .finalize();
+    let digest = Sha256::new()
+        .chain_update(outer_pad)
+        .chain_update(inner)
+        .finalize();
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn create_stable_sql_views(conn: &Connection) -> Result<()> {
@@ -14794,7 +15050,7 @@ mod search_rowid_map_tests {
         );
 
         let store = Store::open(&path).unwrap();
-        assert_eq!(user_version(&store), 1001);
+        assert_eq!(user_version(&store), 1002);
         assert_eq!(user_version(&store), SCHEMA_VERSION);
 
         // The maps exist and start empty: no backfill.
@@ -14849,7 +15105,7 @@ mod search_rowid_map_tests {
         let temp = tempdir();
         let store = Store::open(temp.path().join("work.sqlite")).unwrap();
         assert_eq!(user_version(&store), SCHEMA_VERSION);
-        assert_eq!(user_version(&store), 1001);
+        assert_eq!(user_version(&store), 1002);
         // The upstream chain ran first: its v13+ stable views exist.
         assert_eq!(
             count(
@@ -14903,15 +15159,15 @@ mod search_rowid_map_tests {
         drop(Store::open(&future_path).unwrap());
         Connection::open(&future_path)
             .unwrap()
-            .execute_batch("PRAGMA user_version = 1002;")
+            .execute_batch("PRAGMA user_version = 1003;")
             .unwrap();
         assert!(matches!(
             Store::open(&future_path),
-            Err(StoreError::UnsupportedSchemaVersion(1002))
+            Err(StoreError::UnsupportedSchemaVersion(1003))
         ));
         assert!(matches!(
             Store::open_read_only(&future_path),
-            Err(StoreError::UnsupportedSchemaVersion(1002))
+            Err(StoreError::UnsupportedSchemaVersion(1003))
         ));
 
         // Read-only open also requires the exact current version for fork
@@ -14962,7 +15218,7 @@ mod search_rowid_map_tests {
         // persistent PRAGMA (journal_mode = WAL) applied before the version
         // gate would show up as mutated bytes, a changed journal mode, or
         // WAL sidecar files.
-        for version in [16i64, 999, 1002] {
+        for version in [16i64, 999, 1003] {
             let path = temp.path().join(format!("foreign-{version}.sqlite"));
             {
                 let conn = Connection::open(&path).unwrap();
@@ -15075,7 +15331,7 @@ mod search_rowid_map_tests {
         // v1001 pagination indexes): data intact, maps recreated empty,
         // lazy healing resumes.
         let store = Store::open(&path).unwrap();
-        assert_eq!(user_version(&store), 1001);
+        assert_eq!(user_version(&store), 1002);
         assert_eq!(
             count(&store, "SELECT COUNT(*) FROM record_search_rowids"),
             0
@@ -15214,7 +15470,7 @@ mod search_rowid_map_tests {
 
         // A writable open migrates v1000 → v1001 in place.
         let store = Store::open(&path).unwrap();
-        assert_eq!(user_version(&store), 1001);
+        assert_eq!(user_version(&store), 1002);
         for index in [
             "idx_sessions_provider_external_session_started",
             "idx_events_session_seq_id",
@@ -16056,7 +16312,7 @@ mod catalog_tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(user_version, 1001);
+        assert_eq!(user_version, 1002);
         let event_plan = store
             .conn
             .prepare("EXPLAIN QUERY PLAN SELECT id FROM events WHERE session_id = ?1 AND (seq, id) > (?2, ?3) ORDER BY seq, id LIMIT ?4")
@@ -16117,7 +16373,7 @@ mod catalog_tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(migrated_version, 1001);
+        assert_eq!(migrated_version, 1002);
         for index in [
             "idx_events_session_seq_id",
             "idx_sessions_provider_external_session_started",
@@ -16131,7 +16387,7 @@ mod catalog_tests {
 
     #[test]
     fn writable_open_rejects_in_between_fork_schema_versions_without_mutation() {
-        for version in [16_i64, 999, 1002] {
+        for version in [16_i64, 999, 1003] {
             let temp = tempdir();
             let db = temp.path().join(format!("v{version}.sqlite"));
             let conn = Connection::open(&db).unwrap();

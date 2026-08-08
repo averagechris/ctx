@@ -160,7 +160,11 @@ bounded pagination — `idx_sessions_provider_external_session_started` and
 `idx_events_session_seq_id` — and nothing else. It runs on the first writable
 open after upgrading, upgrades v1000 stores in place, and touches neither the
 rowid maps nor the FTS projections; there is no rebuild and no reimport.
-Read-only commands require exactly v1001 and direct older stores to run one
+Schema v1002 adds a standalone path-free source-health ledger. It stores only
+keyed source identities, closed-vocabulary health, and bounded counts; it does
+not affect imports or search and does not rebuild/backfill FTS or rowid maps.
+
+Read-only commands require exactly v1002 and direct older stores to run one
 writable command first.
 
 Downgrading a fork-versioned store back to an older ctx binary is

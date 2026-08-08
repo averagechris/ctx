@@ -79,9 +79,9 @@ shipped.
   physical state (main DB plus WAL/SHM samples and PRAGMAs). Checkpoints or WAL
   changes can stale a token even when logical content appears unchanged.
 - Writable opens migrate known v0-v15 stores through the fork chain (v1000
-  rowid maps, then v1001 pagination indexes) and existing v1000 stores to
-  v1001, each step atomic; versions 16-999 and above 1001 fail closed.
-  Read-only search/show/locate/MCP require exactly v1001 and never
+  rowid maps, v1001 pagination indexes, then the v1002 path-free source-health
+  ledger) and existing v1000/v1001 stores to v1002, each step atomic; versions
+  16-999 and above 1002 fail closed. Read-only commands require exactly v1002 and never
   migrate/write.
 
 ## Operations

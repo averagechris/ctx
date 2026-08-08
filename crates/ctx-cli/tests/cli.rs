@@ -1347,8 +1347,10 @@ fn codex_zero_yield_anomaly_default_doctor_and_repair_flow() {
     );
     assert_eq!(
         doctor["import_health"]["coverage"],
-        "manifested_and_catalog_sources_only"
+        "all_import_paths_since_v1002"
     );
+    assert_eq!(doctor["import_health"]["source_level_anomalies"], 0);
+    assert_eq!(doctor["import_health"]["not_persisted_for"], json!([]));
     let doctor_text = doctor.to_string();
     assert!(!doctor_text.contains(sentinel), "{doctor_text}");
     assert!(
@@ -1414,6 +1416,78 @@ fn codex_zero_yield_anomaly_default_doctor_and_repair_flow() {
 }
 
 #[test]
+fn custom_source_health_round_trip_and_explicit_acknowledgement_are_path_free() {
+    let temp = tempdir();
+    let source = temp.path().join("never-print-this-source.jsonl");
+    fs::write(
+        &source,
+        r#"{"record_type":"manifest","schema_version":"ctx-history-jsonl-v1","metadata":{}}"#,
+    )
+    .unwrap();
+    json_output(ctx(&temp).args([
+        "import",
+        "--format",
+        "ctx-history-jsonl-v1",
+        "--path",
+        source.to_str().unwrap(),
+        "--json",
+        "--progress",
+        "none",
+    ]));
+    let red = json_output(ctx(&temp).args(["doctor", "--json", "--progress", "none"]));
+    assert_eq!(red["import_health"]["source_level_anomalies"], 1);
+    assert!(!red.to_string().contains("never-print-this-source"));
+
+    fs::copy(custom_history_fixture("basic.jsonl"), &source).unwrap();
+    json_output(ctx(&temp).args([
+        "import",
+        "--format",
+        "ctx-history-jsonl-v1",
+        "--path",
+        source.to_str().unwrap(),
+        "--json",
+        "--progress",
+        "none",
+    ]));
+    let green = json_output(ctx(&temp).args(["doctor", "--json", "--progress", "none"]));
+    assert_eq!(green["ok"], true);
+    assert_eq!(green["import_health"]["source_level_anomalies"], 0);
+
+    fs::write(
+        &source,
+        r#"{"record_type":"manifest","schema_version":"ctx-history-jsonl-v1","metadata":{}}"#,
+    )
+    .unwrap();
+    json_output(ctx(&temp).args([
+        "import",
+        "--format",
+        "ctx-history-jsonl-v1",
+        "--path",
+        source.to_str().unwrap(),
+        "--json",
+        "--progress",
+        "none",
+    ]));
+
+    let before: (i64, i64, i64, i64) = Connection::open(temp.path().join("work.sqlite")).unwrap().query_row(
+        "SELECT (SELECT COUNT(*) FROM sessions), (SELECT COUNT(*) FROM events), (SELECT COUNT(*) FROM ctx_history_search), (SELECT COUNT(*) FROM event_search)", [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).unwrap();
+    let acknowledged = json_output(ctx(&temp).args([
+        "doctor",
+        "--acknowledge-source-health",
+        "--json",
+        "--progress",
+        "none",
+    ]));
+    assert_eq!(acknowledged["import_health"]["acknowledged"], 1);
+    assert_eq!(acknowledged["import_health"]["source_level_anomalies"], 0);
+    let after: (i64, i64, i64, i64) = Connection::open(temp.path().join("work.sqlite")).unwrap().query_row(
+        "SELECT (SELECT COUNT(*) FROM sessions), (SELECT COUNT(*) FROM events), (SELECT COUNT(*) FROM ctx_history_search), (SELECT COUNT(*) FROM event_search)", [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).unwrap();
+    assert_eq!(before, after);
+}
+
+#[test]
 fn codex_zero_byte_explicit_file_is_empty_not_anomaly() {
     let temp = tempdir();
     let path = temp.path().join("zero-yield.jsonl");
@@ -1430,6 +1504,77 @@ fn codex_zero_byte_explicit_file_is_empty_not_anomaly() {
     ]));
     assert_eq!(report["totals"]["zero_yield_anomaly_sources"], 0);
     assert_eq!(report["sources"][0]["health"]["classification"], "empty");
+}
+
+#[test]
+fn full_rescan_source_health_heals_on_later_healthy_manifested_run() {
+    let temp = tempdir();
+    let path = temp.path().join("full-rescan-source.jsonl");
+    fs::write(&path, "{}\n").unwrap();
+    json_output(ctx(&temp).args([
+        "import",
+        "--provider",
+        "codex",
+        "--path",
+        path.to_str().unwrap(),
+        "--resume",
+        "--json",
+        "--progress",
+        "none",
+    ]));
+    let red = json_output(ctx(&temp).args(["doctor", "--json", "--progress", "none"]));
+    assert_eq!(red["import_health"]["source_level_anomalies"], 1);
+    assert_eq!(
+        red["import_health"]["ledger_backed_zero_yield_anomalies"],
+        0
+    );
+
+    fs::write(&path, concat!(
+        "{\"timestamp\":\"2026-06-24T12:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"full-rescan-heal\",\"timestamp\":\"2026-06-24T12:00:00.000Z\",\"cwd\":\"/workspace\"}}\n",
+        "{\"timestamp\":\"2026-06-24T12:00:01.000Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"healthy\"}]}}\n"
+    )).unwrap();
+    json_output(ctx(&temp).args([
+        "import",
+        "--provider",
+        "codex",
+        "--path",
+        path.to_str().unwrap(),
+        "--json",
+        "--progress",
+        "none",
+    ]));
+    let green = json_output(ctx(&temp).args(["doctor", "--json", "--progress", "none"]));
+    assert_eq!(green["ok"], true);
+    assert_eq!(green["import_health"]["source_level_anomalies"], 0);
+}
+
+#[test]
+fn strict_import_reports_health_persistence_failure_before_nonzero_exit() {
+    let temp = tempdir();
+    json_output(ctx(&temp).args(["setup", "--json"]));
+    Connection::open(temp.path().join("work.sqlite")).unwrap().execute_batch(
+        "CREATE TRIGGER reject_source_health BEFORE INSERT ON source_health BEGIN SELECT RAISE(FAIL, 'injected health failure'); END;"
+    ).unwrap();
+    let source = temp.path().join("custom.jsonl");
+    fs::copy(custom_history_fixture("basic.jsonl"), &source).unwrap();
+    let output = ctx(&temp)
+        .args([
+            "import",
+            "--format",
+            "ctx-history-jsonl-v1",
+            "--path",
+            source.to_str().unwrap(),
+            "--strict",
+            "--json",
+            "--progress",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["health_persistence_failed"], 1);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("health_persistence_failed"));
 }
 
 #[test]
@@ -2979,6 +3124,55 @@ fn import_history_source_plugin_is_searchable_and_receives_cursor() {
 }
 
 #[test]
+fn plugin_zero_yield_health_round_trip_is_exact_and_path_free() {
+    let temp = tempdir();
+    let heal = temp.path().join("plugin-heal-marker");
+    let script = format!(
+        r#"import json, os, pathlib
+source={{"record_type":"source","source_id":os.environ["CTX_HISTORY_SOURCE_ID"],"provider_key":os.environ["CTX_HISTORY_PROVIDER_KEY"],"source_format":os.environ["CTX_HISTORY_SOURCE_FORMAT"],"observed_at":"2026-07-01T12:00:00Z"}}
+print(json.dumps({{"record_type":"manifest","schema_version":"ctx-history-jsonl-v1"}}))
+print(json.dumps(source))
+if pathlib.Path({:?}).exists():
+ print(json.dumps({{"record_type":"session","source_id":source["source_id"],"session_id":"healed","started_at":"2026-07-01T12:00:00Z","agent_type":"primary","is_primary":True,"status":"completed"}}))
+ print(json.dumps({{"record_type":"event","source_id":source["source_id"],"session_id":"healed","event_index":0,"event_type":"message","role":"user","occurred_at":"2026-07-01T12:00:00Z","payload":{{"text":"healed"}}}}))
+"#,
+        heal.display().to_string()
+    );
+    let plugin = write_raw_history_source_plugin(&temp, "private-plugin-name", &script);
+    json_output(
+        ctx(&temp)
+            .env("CTX_HISTORY_PLUGIN_PATH", &plugin.manifest_dir)
+            .args([
+                "import",
+                "--history-source",
+                "private-plugin-name/default",
+                "--json",
+                "--progress",
+                "none",
+            ]),
+    );
+    let red = json_output(ctx(&temp).args(["doctor", "--json", "--progress", "none"]));
+    assert_eq!(red["import_health"]["source_level_anomalies"], 1);
+    assert!(!red.to_string().contains("private-plugin-name"));
+    fs::write(&heal, "heal").unwrap();
+    json_output(
+        ctx(&temp)
+            .env("CTX_HISTORY_PLUGIN_PATH", &plugin.manifest_dir)
+            .args([
+                "import",
+                "--history-source",
+                "private-plugin-name/default",
+                "--json",
+                "--progress",
+                "none",
+            ]),
+    );
+    let green = json_output(ctx(&temp).args(["doctor", "--json", "--progress", "none"]));
+    assert_eq!(green["ok"], true);
+    assert_eq!(green["import_health"]["source_level_anomalies"], 0);
+}
+
+#[test]
 fn source_only_history_source_plugin_import_is_unchanged_not_anomaly() {
     let temp = tempdir();
     let script = r#"
@@ -3640,10 +3834,10 @@ fn read_only_commands_direct_old_schemas_to_a_writable_migration() {
 
 #[test]
 fn read_only_commands_reject_foreign_schemas_without_impossible_migration_advice() {
-    // 16 sits in the unreviewed upstream gap; 1002 is newer than this
+    // 16 sits in the unreviewed upstream gap; 1003 is newer than this
     // binary. Neither can be migrated by it, so the guidance must say
     // upgrade/restore rather than suggesting a migration command.
-    for version in [16i64, 1002] {
+    for version in [16i64, 1003] {
         let temp = tempdir();
         let db_path = write_bare_store_with_user_version(&temp, version);
         let before = fs::read(&db_path).unwrap();
@@ -3677,7 +3871,7 @@ fn read_only_commands_reject_foreign_schemas_without_impossible_migration_advice
 #[test]
 fn mcp_status_reports_version_guidance_for_foreign_schema() {
     let temp = tempdir();
-    write_bare_store_with_user_version(&temp, 1002);
+    write_bare_store_with_user_version(&temp, 1003);
     let responses = mcp_roundtrip(
         &temp,
         &[
@@ -3709,7 +3903,7 @@ fn mcp_status_reports_version_guidance_for_foreign_schema() {
     assert_eq!(result["isError"], true);
     let error = result["structuredContent"]["error"].as_str().unwrap();
     assert!(
-        error.contains("schema version 1002 is newer than or incompatible with this ctx binary"),
+        error.contains("schema version 1003 is newer than or incompatible with this ctx binary"),
         "{error}"
     );
     assert!(error.contains("upgrade ctx"), "{error}");
@@ -3718,7 +3912,7 @@ fn mcp_status_reports_version_guidance_for_foreign_schema() {
 
 #[test]
 fn mcp_non_status_tools_report_version_guidance_without_mutating() {
-    for version in [15i64, 16, 1002] {
+    for version in [15i64, 16, 1003] {
         let temp = tempdir();
         let db_path = write_bare_store_with_user_version(&temp, version);
         let bytes_before = fs::read(&db_path).unwrap();
@@ -6883,6 +7077,38 @@ fn search_refresh_auto_combines_native_sources_and_auto_history_source_plugins()
         "combined refresh did not make plugin history searchable: {search:#}"
     );
     assert!(plugin.run_marker.exists());
+}
+
+#[test]
+fn search_refresh_health_persistence_failure_is_reported_but_does_not_fail_search() {
+    let temp = tempdir();
+    json_output(ctx(&temp).args(["setup", "--json"]));
+    let plugin =
+        write_history_source_plugin_with_refresh(&temp, "hermes", true, Some("auto"), None);
+    Connection::open(temp.path().join("work.sqlite")).unwrap().execute_batch(
+        "CREATE TRIGGER reject_source_health BEFORE INSERT ON source_health BEGIN SELECT RAISE(FAIL, 'injected health failure'); END;"
+    ).unwrap();
+
+    let output = ctx(&temp)
+        .env("CTX_HISTORY_PLUGIN_PATH", &plugin.manifest_dir)
+        .args(["search", "hermes plugin initial marker", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(body["freshness"]["status"], "degraded_health_persistence");
+    assert_eq!(body["freshness"]["totals"]["health_persistence_failed"], 1);
+    assert!(!body["results"].as_array().unwrap().is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("health_persistence_failed"), "{stderr}");
+    assert!(
+        !stderr.contains(plugin.manifest_dir.to_str().unwrap()),
+        "{stderr}"
+    );
 }
 
 #[test]

@@ -21,6 +21,7 @@ use uuid::Uuid;
 thread_local! {
     static DISABLE_FILE_SCOPE_PUSHDOWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static RESIDUAL_COUNTS: std::cell::Cell<[u64; 3]> = const { std::cell::Cell::new([0; 3]) };
+    static USE_PAGED_RANKED_REFERENCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -30,6 +31,24 @@ fn increment_residual_count(index: usize) {
         next[index] += 1;
         counts.set(next);
     });
+}
+
+#[cfg(test)]
+fn use_paged_ranked_reference() -> bool {
+    USE_PAGED_RANKED_REFERENCE.get()
+}
+
+#[cfg(test)]
+fn with_paged_ranked_reference<T>(enabled: bool, run: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            USE_PAGED_RANKED_REFERENCE.set(self.0);
+        }
+    }
+    let previous = USE_PAGED_RANKED_REFERENCE.replace(enabled);
+    let _reset = Reset(previous);
+    run()
 }
 
 pub const SEARCH_PACKET_SCHEMA_VERSION: u32 = 1;
@@ -732,99 +751,105 @@ fn fast_event_search_packet(
     let mut results = Vec::new();
     let mut clustered_results = Vec::<SearchPacketResult>::new();
     let mut clustered_index = BTreeMap::<Uuid, usize>::new();
-    let mut offset = 0_usize;
     let mut pages_scanned = 0_usize;
     let mut scan_budget_exhausted = false;
 
-    loop {
-        pages_scanned = pages_scanned.saturating_add(1);
-        let hits =
-            store.search_event_hits_plan_page_filtered(plan, page_size, offset, &sql_filters)?;
-        let page_len = hits.len();
+    scan_event_hit_batches(
+        store,
+        plan,
+        page_size,
+        FILTERED_SEARCH_MAX_PAGES,
+        &sql_filters,
+        clustered || residual_filtered,
+        |hits| {
+            pages_scanned = pages_scanned.saturating_add(1);
+            let page_len = hits.len();
 
-        for hit in hits {
-            #[cfg(test)]
-            increment_residual_count(0);
-            // Hits come from an FTS MATCH over exactly `hit.preview`; the
-            // ASCII-exact case needs no Rust re-verification (see
-            // `fts_match_is_exact_for`), and the reference differential in
-            // tests always re-verifies, pinning this skip to full semantics.
-            if !plan.fts_match_is_exact_for(&hit.preview) && !plan.matches_text(&hit.preview) {
-                continue;
-            }
-            if !event_hit_matches_filters(&hit, &options.filters, file_scope) {
+            for hit in hits {
                 #[cfg(test)]
-                increment_residual_count(1);
-                continue;
-            }
-            #[cfg(test)]
-            increment_residual_count(2);
-            if clustered {
-                let cluster_id = hit.session_id.unwrap_or(hit.event_id);
-                if let Some(index) = clustered_index.get(&cluster_id).copied() {
-                    let existing = &mut clustered_results[index];
-                    // Decide best-representative replacement from the raw hit
-                    // keys (`compare_search_results` order for event results:
-                    // rank desc, timestamp desc, record_id asc) before paying
-                    // for snippet/citation construction, which includes a
-                    // filesystem existence probe per result.
-                    let candidate_rank = event_hit_rank(&hit, plan);
-                    let replaces = existing
-                        .rank
-                        .partial_cmp(&candidate_rank)
-                        .unwrap_or(Ordering::Equal)
-                        .then_with(|| existing.timestamp.cmp(&Some(hit.occurred_at)))
-                        .then_with(|| hit.event_id.cmp(&existing.record_id))
-                        .is_lt();
-                    let more = existing.more_matches_in_session.saturating_add(1);
-                    if replaces {
-                        let mut candidate =
-                            event_search_result(&hit, display_query, plan, options.snippet_chars);
-                        candidate.result_scope = if candidate.session_id.is_some() {
+                increment_residual_count(0);
+                // Hits come from an FTS MATCH over exactly `hit.preview`; the
+                // ASCII-exact case needs no Rust re-verification (see
+                // `fts_match_is_exact_for`), and the reference differential in
+                // tests always re-verifies, pinning this skip to full semantics.
+                if !plan.fts_match_is_exact_for(&hit.preview) && !plan.matches_text(&hit.preview) {
+                    continue;
+                }
+                if !event_hit_matches_filters(hit, &options.filters, file_scope) {
+                    #[cfg(test)]
+                    increment_residual_count(1);
+                    continue;
+                }
+                #[cfg(test)]
+                increment_residual_count(2);
+                if clustered {
+                    let cluster_id = hit.session_id.unwrap_or(hit.event_id);
+                    if let Some(index) = clustered_index.get(&cluster_id).copied() {
+                        let existing = &mut clustered_results[index];
+                        // Decide best-representative replacement from the raw hit
+                        // keys (`compare_search_results` order for event results:
+                        // rank desc, timestamp desc, record_id asc) before paying
+                        // for snippet/citation construction, which includes a
+                        // filesystem existence probe per result.
+                        let candidate_rank = event_hit_rank(hit, plan);
+                        let replaces = existing
+                            .rank
+                            .partial_cmp(&candidate_rank)
+                            .unwrap_or(Ordering::Equal)
+                            .then_with(|| existing.timestamp.cmp(&Some(hit.occurred_at)))
+                            .then_with(|| hit.event_id.cmp(&existing.record_id))
+                            .is_lt();
+                        let more = existing.more_matches_in_session.saturating_add(1);
+                        if replaces {
+                            let mut candidate = event_search_result(
+                                hit,
+                                display_query,
+                                plan,
+                                options.snippet_chars,
+                            );
+                            candidate.result_scope = if candidate.session_id.is_some() {
+                                SearchResultScope::Session
+                            } else {
+                                SearchResultScope::Event
+                            };
+                            *existing = candidate;
+                        }
+                        existing.more_matches_in_session = more;
+                        existing.session_importance = session_importance(existing.rank, more);
+                    } else {
+                        let mut result =
+                            event_search_result(hit, display_query, plan, options.snippet_chars);
+                        result.result_scope = if result.session_id.is_some() {
                             SearchResultScope::Session
                         } else {
                             SearchResultScope::Event
                         };
-                        *existing = candidate;
+                        result.session_importance = session_importance(result.rank, 0);
+                        clustered_index.insert(cluster_id, clustered_results.len());
+                        clustered_results.push(result);
                     }
-                    existing.more_matches_in_session = more;
-                    existing.session_importance = session_importance(existing.rank, more);
                 } else {
-                    let mut result =
-                        event_search_result(&hit, display_query, plan, options.snippet_chars);
-                    result.result_scope = if result.session_id.is_some() {
-                        SearchResultScope::Session
-                    } else {
-                        SearchResultScope::Event
-                    };
-                    result.session_importance = session_importance(result.rank, 0);
-                    clustered_index.insert(cluster_id, clustered_results.len());
-                    clustered_results.push(result);
+                    let result =
+                        event_search_result(hit, display_query, plan, options.snippet_chars);
+                    results.push(result);
                 }
-            } else {
-                let result = event_search_result(&hit, display_query, plan, options.snippet_chars);
-                results.push(result);
             }
-        }
 
-        let enough_results = if clustered {
-            clustered_results.len() >= collection_target
-        } else {
-            results.len() >= collection_target
-        };
-        if enough_results || page_len < page_size {
-            break;
-        }
-        if pages_scanned >= FILTERED_SEARCH_MAX_PAGES {
-            scan_budget_exhausted = true;
-            break;
-        }
-        let next_offset = offset.saturating_add(page_size);
-        if next_offset == offset {
-            break;
-        }
-        offset = next_offset;
-    }
+            let enough_results = if clustered {
+                clustered_results.len() >= collection_target
+            } else {
+                results.len() >= collection_target
+            };
+            if enough_results || page_len < page_size {
+                return false;
+            }
+            if pages_scanned >= FILTERED_SEARCH_MAX_PAGES {
+                scan_budget_exhausted = true;
+                return false;
+            }
+            true
+        },
+    )?;
 
     if clustered {
         results = clustered_results;
@@ -868,6 +893,45 @@ fn fast_event_search_packet(
         pagination: pagination(Some(cursor_offset), has_more),
         truncation,
     }))
+}
+
+/// Residual-filtered and clustered searches consume one bounded SQLite
+/// cursor. Plain searches retain LIMIT/OFFSET paging: their common one-page
+/// case is measurably cheaper, while later pages remain necessary when FTS
+/// unicode61 folding yields candidates rejected by literal re-verification.
+/// Tests can force paging through an invocation-local thread-local switch.
+fn scan_event_hit_batches<F>(
+    store: &Store,
+    plan: &SearchQueryPlan,
+    page_size: usize,
+    max_pages: usize,
+    filters: &EventSearchSqlFilters,
+    stream_one_statement: bool,
+    consume: F,
+) -> ctx_history_store::Result<()>
+where
+    F: FnMut(&[EventSearchHit]) -> bool,
+{
+    #[cfg(test)]
+    let use_paged = use_paged_ranked_reference() || !stream_one_statement;
+    #[cfg(not(test))]
+    let use_paged = !stream_one_statement;
+    if use_paged {
+        let mut consume = consume;
+        let page_size = page_size.max(1);
+        let mut offset = 0_usize;
+        for _ in 0..max_pages.max(1) {
+            let hits =
+                store.search_event_hits_plan_page_filtered(plan, page_size, offset, filters)?;
+            let page_len = hits.len();
+            if !consume(&hits) || page_len < page_size {
+                break;
+            }
+            offset = offset.saturating_add(page_size);
+        }
+        return Ok(());
+    }
+    store.scan_event_hits_plan_filtered(plan, page_size, max_pages, filters, consume)
 }
 
 fn empty_search_packet(
@@ -1467,53 +1531,145 @@ fn ranked_candidates(
     let filtered = has_filters(&options.filters);
     if filtered {
         let page_size = FILTERED_SEARCH_PAGE_SIZE.max(target_candidates);
-        let mut offset = 0_usize;
-        let mut pages_scanned = 0_usize;
-        loop {
-            pages_scanned = pages_scanned.saturating_add(1);
-            let records = match plan {
-                Some(plan) if !plan.is_empty() => {
-                    store.search_records_plan_page(plan, page_size, offset)?
+        #[cfg(test)]
+        let used_paged_reference = if use_paged_ranked_reference() {
+            let mut offset = 0_usize;
+            let mut pages_scanned = 0_usize;
+            loop {
+                pages_scanned = pages_scanned.saturating_add(1);
+                let records = match plan {
+                    Some(plan) if !plan.is_empty() => {
+                        store.search_records_plan_page(plan, page_size, offset)?
+                    }
+                    _ => Vec::new(),
+                };
+                let page_len = records.len();
+                let page_records = records
+                    .into_iter()
+                    .filter(|record| {
+                        seen.insert(record.id)
+                            && file_scope.map_or(true, |scope| {
+                                scope.history_record_ids.is_empty()
+                                    || scope.history_record_ids.contains(&record.id)
+                            })
+                    })
+                    .collect();
+                candidates.extend(candidates_for_records(
+                    store,
+                    page_records,
+                    plan,
+                    &terms,
+                    &options.filters,
+                    file_scope,
+                )?);
+                if candidates.len() >= target_candidates || page_len < page_size {
+                    break;
                 }
-                _ => Vec::new(),
+                if pages_scanned >= FILTERED_SEARCH_MAX_PAGES {
+                    scan_budget_exhausted = true;
+                    break;
+                }
+                offset = offset.saturating_add(page_size);
+            }
+            true
+        } else {
+            false
+        };
+        #[cfg(not(test))]
+        let used_paged_reference = false;
+        if !used_paged_reference {
+            let ranked_hits = match plan {
+                Some(plan) if !plan.is_empty() => store.search_record_hits_fts_plan(
+                    plan,
+                    page_size.saturating_mul(FILTERED_SEARCH_MAX_PAGES),
+                    0,
+                )?,
+                _ => Some(Vec::new()),
             };
-            let page_len = records.len();
-
-            let mut page_records = Vec::new();
-            for record in records {
-                if !seen.insert(record.id) {
-                    continue;
-                }
-                if let Some(scope) = file_scope {
-                    if !scope.history_record_ids.is_empty()
-                        && !scope.history_record_ids.contains(&record.id)
-                    {
-                        continue;
+            if let Some(ranked_hits) = ranked_hits {
+                for (page_index, hits) in ranked_hits.chunks(page_size).enumerate() {
+                    let records = hits
+                        .iter()
+                        .map(|hit| store.get_record(hit.record_id))
+                        .collect::<ctx_history_store::Result<Vec<_>>>()?;
+                    let page_len = records.len();
+                    let mut page_records = Vec::new();
+                    for record in records {
+                        if seen.insert(record.id)
+                            && file_scope.map_or(true, |scope| {
+                                scope.history_record_ids.is_empty()
+                                    || scope.history_record_ids.contains(&record.id)
+                            })
+                        {
+                            page_records.push(record);
+                        }
+                    }
+                    candidates.extend(candidates_for_records(
+                        store,
+                        page_records,
+                        plan,
+                        &terms,
+                        &options.filters,
+                        file_scope,
+                    )?);
+                    if candidates.len() >= target_candidates || page_len < page_size {
+                        break;
+                    }
+                    if page_index + 1 >= FILTERED_SEARCH_MAX_PAGES {
+                        scan_budget_exhausted = true;
+                        break;
                     }
                 }
-                page_records.push(record);
-            }
-            candidates.extend(candidates_for_records(
-                store,
-                page_records,
-                plan,
-                &terms,
-                &options.filters,
-                file_scope,
-            )?);
+            } else {
+                let mut offset = 0_usize;
+                let mut pages_scanned = 0_usize;
+                loop {
+                    pages_scanned = pages_scanned.saturating_add(1);
+                    let records = match plan {
+                        Some(plan) if !plan.is_empty() => {
+                            store.search_records_plan_page(plan, page_size, offset)?
+                        }
+                        _ => Vec::new(),
+                    };
+                    let page_len = records.len();
 
-            if candidates.len() >= target_candidates || page_len < page_size {
-                break;
+                    let mut page_records = Vec::new();
+                    for record in records {
+                        if !seen.insert(record.id) {
+                            continue;
+                        }
+                        if let Some(scope) = file_scope {
+                            if !scope.history_record_ids.is_empty()
+                                && !scope.history_record_ids.contains(&record.id)
+                            {
+                                continue;
+                            }
+                        }
+                        page_records.push(record);
+                    }
+                    candidates.extend(candidates_for_records(
+                        store,
+                        page_records,
+                        plan,
+                        &terms,
+                        &options.filters,
+                        file_scope,
+                    )?);
+
+                    if candidates.len() >= target_candidates || page_len < page_size {
+                        break;
+                    }
+                    if pages_scanned >= FILTERED_SEARCH_MAX_PAGES {
+                        scan_budget_exhausted = true;
+                        break;
+                    }
+                    let next_offset = offset.saturating_add(page_size);
+                    if next_offset == offset {
+                        break;
+                    }
+                    offset = next_offset;
+                }
             }
-            if pages_scanned >= FILTERED_SEARCH_MAX_PAGES {
-                scan_budget_exhausted = true;
-                break;
-            }
-            let next_offset = offset.saturating_add(page_size);
-            if next_offset == offset {
-                break;
-            }
-            offset = next_offset;
         }
     } else {
         let fetch_limit = options
@@ -9767,13 +9923,19 @@ mod tests {
                 match_mode: SearchMatchMode::All,
             };
             let before_pages = store.event_search_page_executions();
-            let residual = packet(&store, &options, true);
-            let residual_pages = store.event_search_page_executions() - before_pages;
+            let old = with_paged_ranked_reference(true, || packet(&store, &options, true));
+            let old_pages = store.event_search_page_executions() - before_pages;
+            let before_pages = store.event_search_page_executions();
+            let residual = with_paged_ranked_reference(false, || packet(&store, &options, true));
+            let new_pages = store.event_search_page_executions() - before_pages;
             let pushed = packet(&store, &options, false);
 
-            assert!(
-                residual_pages > 1,
-                "{ownership:?} must cross the first 500 rows"
+            assert!(old_pages >= 3, "{ownership:?}: old={old_pages}");
+            assert_eq!(new_pages, 1, "{ownership:?}: new ranked statement count");
+            assert_eq!(
+                packet_without_generated_at(&old),
+                packet_without_generated_at(&residual),
+                "{ownership:?}: paged/streamed packet equivalence"
             );
             assert!(
                 pushed
@@ -10662,5 +10824,466 @@ mod tests {
                 "{name}: clustered representative must be the promoted user hit"
             );
         }
+    }
+
+    fn ranked_record_stream_corpus() -> (tempfile::TempDir, Store, PacketOptions) {
+        let (temp, mut store) = test_store();
+        let mut archive = SessionHistoryArchive::default();
+        let selected = [
+            499_usize, 500, 999, 1_000, 1_499, 1_500, 1_999, 2_000, 4_000,
+        ];
+        for index in 0..4_201_usize {
+            let mut record = HistoryRecord::new(
+                format!("ranked record {index:04}"),
+                "recordstreamneedle equal score payload",
+                Vec::new(),
+                "task",
+                Some("/workspace/ranked-stream".into()),
+            );
+            record.id = perf_uuid(0x1a00, index as u64);
+            record.created_at = fixed_time();
+            record.updated_at = fixed_time();
+            archive.records.push(record.clone());
+            if selected.contains(&index) {
+                archive.files_touched.push(FileTouched {
+                    id: perf_uuid(0x1b00, index as u64),
+                    history_record_id: Some(record.id),
+                    run_id: None,
+                    event_id: None,
+                    vcs_workspace_id: None,
+                    path: "src/ranked-selected.rs".into(),
+                    change_kind: Some(FileChangeKind::Modified),
+                    old_path: None,
+                    line_count_delta: Some(1),
+                    confidence: Confidence::Explicit,
+                    timestamps: timestamps(),
+                    source_id: None,
+                    sync: sync_metadata(),
+                });
+            }
+            if index < 5 {
+                archive.files_touched.push(FileTouched {
+                    id: perf_uuid(0x1c00, index as u64),
+                    history_record_id: Some(record.id),
+                    run_id: None,
+                    event_id: None,
+                    vcs_workspace_id: None,
+                    path: "src/ranked-control.rs".into(),
+                    change_kind: Some(FileChangeKind::Modified),
+                    old_path: None,
+                    line_count_delta: Some(1),
+                    confidence: Confidence::Explicit,
+                    timestamps: timestamps(),
+                    source_id: None,
+                    sync: sync_metadata(),
+                });
+            }
+        }
+        store.import_archive(&archive, false).unwrap();
+        let options = PacketOptions {
+            limit: 8,
+            snippet_chars: 160,
+            filters: SearchFilters {
+                file: Some("ranked-selected.rs".into()),
+                ..SearchFilters::default()
+            },
+            result_mode: SearchResultMode::Sessions,
+            match_mode: SearchMatchMode::All,
+        };
+        (temp, store, options)
+    }
+
+    fn ranked_record_control_corpus() -> (tempfile::TempDir, Store, PacketOptions) {
+        let (temp, mut store) = test_store();
+        let mut archive = SessionHistoryArchive::default();
+        for index in 0..100_usize {
+            let mut record = HistoryRecord::new(
+                format!("control record {index:04}"),
+                "recordstreamneedle equal score payload",
+                Vec::new(),
+                "task",
+                Some("/workspace/ranked-stream".into()),
+            );
+            record.id = perf_uuid(0x1d00, index as u64);
+            record.created_at = fixed_time();
+            record.updated_at = fixed_time();
+            archive.records.push(record.clone());
+            if index < 5 {
+                archive.files_touched.push(FileTouched {
+                    id: perf_uuid(0x1e00, index as u64),
+                    history_record_id: Some(record.id),
+                    run_id: None,
+                    event_id: None,
+                    vcs_workspace_id: None,
+                    path: "src/ranked-control.rs".into(),
+                    change_kind: Some(FileChangeKind::Modified),
+                    old_path: None,
+                    line_count_delta: Some(1),
+                    confidence: Confidence::Explicit,
+                    timestamps: timestamps(),
+                    source_id: None,
+                    sync: sync_metadata(),
+                });
+            }
+        }
+        store.import_archive(&archive, false).unwrap();
+        (
+            temp,
+            store,
+            PacketOptions {
+                limit: 3,
+                filters: SearchFilters {
+                    file: Some("ranked-control.rs".into()),
+                    ..SearchFilters::default()
+                },
+                ..PacketOptions::default()
+            },
+        )
+    }
+
+    #[test]
+    fn fallback_ranked_stream_matches_three_page_reference_at_tie_boundaries() {
+        let (_temp, store, options) = ranked_record_stream_corpus();
+        let before = store.record_search_page_executions();
+        let old = with_paged_ranked_reference(true, || {
+            search_packet(&store, "recordstreamneedle", &options).unwrap()
+        });
+        let old_statements = store.record_search_page_executions() - before;
+        let before = store.record_search_page_executions();
+        let new = with_paged_ranked_reference(false, || {
+            search_packet(&store, "recordstreamneedle", &options).unwrap()
+        });
+        let new_statements = store.record_search_page_executions() - before;
+
+        assert_eq!(old_statements, 9);
+        assert_eq!(new_statements, 1);
+        assert_eq!(
+            packet_without_generated_at(&old),
+            packet_without_generated_at(&new),
+            "complete packet equivalence includes ordering, normalized ranks, clustering, pagination, and truncation"
+        );
+        assert_eq!(
+            new.results
+                .iter()
+                .map(|result| result.record_id)
+                .collect::<Vec<_>>(),
+            [499_u64, 500, 999, 1_000, 1_499, 1_500, 1_999, 2_000]
+                .map(|index| perf_uuid(0x1a00, index))
+                .to_vec(),
+            "equal-score rows straddling 500-row boundaries must not skip or duplicate"
+        );
+        assert_eq!(new.truncation.reason.as_deref(), Some("limit"));
+    }
+
+    #[test]
+    fn event_ranked_stream_preserves_scan_budget_exhaustion() {
+        let archive = synthetic_perf_archive(10_001, 50);
+        let (_temp, mut store) = test_store();
+        store.import_archive(&archive, false).unwrap();
+        let options = PacketOptions {
+            limit: 5,
+            filters: SearchFilters {
+                repo: Some("definitely-not-this-workspace".into()),
+                ..SearchFilters::default()
+            },
+            result_mode: SearchResultMode::Events,
+            ..PacketOptions::default()
+        };
+        let before = store.event_search_page_executions();
+        let old = with_paged_ranked_reference(true, || {
+            search_packet(&store, "perfneedle", &options).unwrap()
+        });
+        assert_eq!(store.event_search_page_executions() - before, 20);
+        let before = store.event_search_page_executions();
+        let new = with_paged_ranked_reference(false, || {
+            search_packet(&store, "perfneedle", &options).unwrap()
+        });
+        assert_eq!(store.event_search_page_executions() - before, 1);
+        assert_eq!(
+            packet_without_generated_at(&old),
+            packet_without_generated_at(&new)
+        );
+        assert!(new.results.is_empty());
+        assert_eq!(new.truncation.reason.as_deref(), Some("scan_budget"));
+    }
+
+    #[test]
+    fn ascii_query_pages_past_unicode61_folded_false_positives() {
+        let (_temp, store) = test_store();
+        let mut record = HistoryRecord::new(
+            "unicode fold stream",
+            "no search term in record fallback",
+            Vec::new(),
+            "agent_history",
+            Some("/workspace/unicode-fold".into()),
+        );
+        record.id = perf_uuid(0x1f00, 0);
+        store.insert_record(&record).unwrap();
+        let session = Session {
+            id: perf_uuid(0x1f10, 0),
+            history_record_id: Some(record.id),
+            parent_session_id: None,
+            root_session_id: None,
+            capture_source_id: None,
+            provider: CaptureProvider::Codex,
+            external_session_id: Some("unicode-fold-stream".into()),
+            external_agent_id: None,
+            agent_type: AgentType::Primary,
+            role_hint: None,
+            is_primary: true,
+            status: SessionStatus::Imported,
+            transcript_blob_id: None,
+            started_at: fixed_time(),
+            ended_at: None,
+            timestamps: timestamps(),
+            sync: sync_metadata(),
+        };
+        store.upsert_session(&session).unwrap();
+        let event = |index: u64, text: &str, millis: i64| Event {
+            id: perf_uuid(0x1f20, index),
+            seq: index,
+            history_record_id: Some(record.id),
+            session_id: Some(session.id),
+            run_id: None,
+            event_type: EventType::Message,
+            role: Some(EventRole::Assistant),
+            occurred_at: fixed_time() + chrono::Duration::milliseconds(millis),
+            capture_source_id: None,
+            payload: serde_json::json!({"text": text}),
+            payload_blob_id: None,
+            dedupe_key: Some(format!("unicode-fold-{index}")),
+            redaction_state: RedactionState::SafePreview,
+            sync: sync_metadata(),
+        };
+        store.begin_immediate_batch().unwrap();
+        for index in 0..550_u64 {
+            store
+                .upsert_event(&event(index, "café folded decoy", 10_000 + index as i64))
+                .unwrap();
+        }
+        let exact_ids = (0..60_u64)
+            .map(|index| {
+                let event = event(1_000 + index, "cafe exact target", index as i64);
+                let id = event.id;
+                store.upsert_event(&event).unwrap();
+                id
+            })
+            .collect::<BTreeSet<_>>();
+        for index in 0..LARGE_EVENT_CORPUS_THRESHOLD as u64 {
+            store
+                .upsert_event(&event(
+                    10_000 + index,
+                    "unrelated background",
+                    -(index as i64),
+                ))
+                .unwrap();
+        }
+        store.commit_batch().unwrap();
+
+        let options = PacketOptions {
+            limit: 5,
+            result_mode: SearchResultMode::Events,
+            ..PacketOptions::default()
+        };
+        let before = store.event_search_page_executions();
+        let old =
+            with_paged_ranked_reference(true, || search_packet(&store, "cafe", &options).unwrap());
+        let old_statements = store.event_search_page_executions() - before;
+        let before = store.event_search_page_executions();
+        let new =
+            with_paged_ranked_reference(false, || search_packet(&store, "cafe", &options).unwrap());
+        let new_statements = store.event_search_page_executions() - before;
+
+        assert!(old_statements >= 12, "old={old_statements}");
+        assert!(new_statements >= 12, "new={new_statements}");
+        assert_eq!(
+            packet_without_generated_at(&old),
+            packet_without_generated_at(&new)
+        );
+        assert_eq!(new.results.len(), 5);
+        assert!(new
+            .results
+            .iter()
+            .all(|result| exact_ids.contains(&result.event_id.unwrap())));
+    }
+
+    #[test]
+    #[ignore = "ticket #266 ranked-stream release gate evidence"]
+    fn ranked_stream_old_new_release_evidence() {
+        type Samples = (Vec<f64>, Vec<f64>, (u64, u64), (u64, u64));
+
+        fn measured(
+            store: &Store,
+            query: &str,
+            options: &PacketOptions,
+            old: bool,
+            inner_repetitions: u64,
+        ) -> (f64, u64, u64) {
+            let event_before = store.event_search_page_executions();
+            let record_before = store.record_search_page_executions();
+            let started = std::time::Instant::now();
+            for _ in 0..inner_repetitions {
+                let packet = with_paged_ranked_reference(old, || {
+                    search_packet(store, query, options).unwrap()
+                });
+                std::hint::black_box(packet);
+            }
+            let event_statements = store.event_search_page_executions() - event_before;
+            let record_statements = store.record_search_page_executions() - record_before;
+            assert_eq!(event_statements % inner_repetitions, 0);
+            assert_eq!(record_statements % inner_repetitions, 0);
+            (
+                elapsed_ms(started.elapsed()) / inner_repetitions as f64,
+                event_statements / inner_repetitions,
+                record_statements / inner_repetitions,
+            )
+        }
+
+        fn samples(
+            store: &Store,
+            query: &str,
+            options: &PacketOptions,
+            inner_repetitions: u64,
+        ) -> Samples {
+            measured(store, query, options, true, inner_repetitions);
+            measured(store, query, options, false, inner_repetitions);
+            let mut old = Vec::with_capacity(5);
+            let mut new = Vec::with_capacity(5);
+            let mut old_counts = (0, 0);
+            let mut new_counts = (0, 0);
+            for index in 0..5 {
+                let (old_sample, new_sample) = if index % 2 == 0 {
+                    (
+                        measured(store, query, options, true, inner_repetitions),
+                        measured(store, query, options, false, inner_repetitions),
+                    )
+                } else {
+                    let new = measured(store, query, options, false, inner_repetitions);
+                    let old = measured(store, query, options, true, inner_repetitions);
+                    (old, new)
+                };
+                old.push(old_sample.0);
+                new.push(new_sample.0);
+                old_counts = (old_sample.1, old_sample.2);
+                new_counts = (new_sample.1, new_sample.2);
+            }
+            (old, new, old_counts, new_counts)
+        }
+
+        fn p95(samples: &[f64]) -> f64 {
+            let mut sorted = samples.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            // Nearest-rank p95 of exactly five outer samples is necessarily
+            // their maximum. It is emitted as requested evidence, but is not
+            // used as the stability gate because it is not a robust estimate.
+            sorted[4]
+        }
+
+        fn median(samples: &[f64]) -> f64 {
+            let mut sorted = samples.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[2]
+        }
+
+        fn improvement(old: f64, new: f64) -> f64 {
+            (old - new) / old
+        }
+
+        let event_archive = synthetic_perf_archive(10_001, 50);
+        let (_event_temp, mut event_store) = test_store();
+        event_store.import_archive(&event_archive, false).unwrap();
+        let event_selective = PacketOptions {
+            limit: 5,
+            filters: SearchFilters {
+                repo: Some("definitely-not-this-workspace".into()),
+                ..SearchFilters::default()
+            },
+            result_mode: SearchResultMode::Events,
+            ..PacketOptions::default()
+        };
+        let event_control = PacketOptions {
+            limit: 5,
+            result_mode: SearchResultMode::Events,
+            ..PacketOptions::default()
+        };
+        let (event_old, event_new, event_old_counts, event_new_counts) =
+            samples(&event_store, "perfneedle", &event_selective, 3);
+        let (
+            event_control_old,
+            event_control_new,
+            event_control_old_counts,
+            event_control_new_counts,
+        ) = samples(&event_store, "perfneedle", &event_control, 25);
+
+        let (_record_temp, record_store, record_selective) = ranked_record_stream_corpus();
+        let (record_old, record_new, record_old_counts, record_new_counts) =
+            samples(&record_store, "recordstreamneedle", &record_selective, 3);
+        let (_record_control_temp, record_control_store, record_control) =
+            ranked_record_control_corpus();
+        let (
+            record_control_old,
+            record_control_new,
+            record_control_old_counts,
+            record_control_new_counts,
+        ) = samples(
+            &record_control_store,
+            "recordstreamneedle",
+            &record_control,
+            100,
+        );
+
+        let event_old_p95 = p95(&event_old);
+        let event_new_p95 = p95(&event_new);
+        let record_old_p95 = p95(&record_old);
+        let record_new_p95 = p95(&record_new);
+        let event_control_old_p95 = p95(&event_control_old);
+        let event_control_new_p95 = p95(&event_control_new);
+        let record_control_old_p95 = p95(&record_control_old);
+        let record_control_new_p95 = p95(&record_control_new);
+        let event_old_median = median(&event_old);
+        let event_new_median = median(&event_new);
+        let record_old_median = median(&record_old);
+        let record_new_median = median(&record_new);
+        let event_control_old_median = median(&event_control_old);
+        let event_control_new_median = median(&event_control_new);
+        let record_control_old_median = median(&record_control_old);
+        let record_control_new_median = median(&record_control_new);
+
+        let evidence = serde_json::json!({
+            "profile": "ranked-stream-old-new-v1",
+            "warm_measured_samples": 5,
+            "order": "alternating old/new; parity reversed each pair; values are per-iteration milliseconds",
+            "p95_definition": "nearest-rank p95 over five outer samples (the maximum), evidence only",
+            "gate_statistic": "median of five outer samples, each aggregating repeated inner iterations",
+            "event_selective": {"inner_repetitions": 3, "old_ms": event_old, "new_ms": event_new, "old_p95_ms": event_old_p95, "new_p95_ms": event_new_p95, "old_median_ms": event_old_median, "new_median_ms": event_new_median, "improvement": improvement(event_old_median, event_new_median), "old_counts": event_old_counts, "new_counts": event_new_counts},
+            "event_one_page_control": {"inner_repetitions": 25, "old_ms": event_control_old, "new_ms": event_control_new, "old_p95_ms": event_control_old_p95, "new_p95_ms": event_control_new_p95, "old_median_ms": event_control_old_median, "new_median_ms": event_control_new_median, "old_counts": event_control_old_counts, "new_counts": event_control_new_counts},
+            "record_selective": {"inner_repetitions": 3, "old_ms": record_old, "new_ms": record_new, "old_p95_ms": record_old_p95, "new_p95_ms": record_new_p95, "old_median_ms": record_old_median, "new_median_ms": record_new_median, "improvement": improvement(record_old_median, record_new_median), "old_counts": record_old_counts, "new_counts": record_new_counts},
+            "record_one_page_control": {"inner_repetitions": 100, "old_ms": record_control_old, "new_ms": record_control_new, "old_p95_ms": record_control_old_p95, "new_p95_ms": record_control_new_p95, "old_median_ms": record_control_old_median, "new_median_ms": record_control_new_median, "old_counts": record_control_old_counts, "new_counts": record_control_new_counts},
+            "gates": {"statistic": "median", "selective_improvement_min": 0.20, "one_page_regression_max": 0.05}
+        });
+        println!("ranked stream evidence: {evidence}");
+
+        assert!(event_old_counts.0 >= 3 && event_new_counts.0 == 1);
+        assert!(record_old_counts.1 >= 3 && record_new_counts.1 == 1);
+        assert_eq!(event_control_old_counts.0, 1);
+        assert_eq!(event_control_new_counts.0, 1);
+        assert_eq!(record_control_old_counts.1, 1);
+        assert_eq!(record_control_new_counts.1, 1);
+        assert!(
+            improvement(event_old_median, event_new_median) >= 0.20,
+            "{evidence}"
+        );
+        assert!(
+            improvement(record_old_median, record_new_median) >= 0.20,
+            "{evidence}"
+        );
+        assert!(
+            event_control_new_median <= event_control_old_median * 1.05,
+            "{evidence}"
+        );
+        assert!(
+            record_control_new_median <= record_control_old_median * 1.05,
+            "{evidence}"
+        );
     }
 }

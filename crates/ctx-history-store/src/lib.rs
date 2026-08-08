@@ -1168,6 +1168,15 @@ pub struct EventSearchHit {
     pub tool_names: Vec<String>,
 }
 
+/// One row of the bounded ranked record stream. The score is retained with
+/// the ID so the materialized ordering remains explicit and inspectable even
+/// though record hydration is deferred to logical pages.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordSearchHit {
+    pub record_id: Uuid,
+    pub score: f64,
+}
+
 /// Agent-scope predicate that can be enforced inside the ranked event-search
 /// SQL page. For schema-valid rows produced by supported store write paths,
 /// both variants mirror `event_hit_matches_agent_scope` in
@@ -2069,6 +2078,8 @@ pub struct Store {
     busy_timeout: Duration,
     event_search_page_executions: std::cell::Cell<u64>,
     event_search_rows_hydrated: std::cell::Cell<u64>,
+    #[cfg(feature = "test-utils")]
+    record_search_page_executions: std::cell::Cell<u64>,
     record_list_page_executions: std::cell::Cell<u64>,
     #[cfg(feature = "test-utils")]
     relation_batch_executions: std::cell::Cell<u64>,
@@ -2109,6 +2120,8 @@ impl Store {
             busy_timeout: BUSY_TIMEOUT,
             event_search_page_executions: std::cell::Cell::new(0),
             event_search_rows_hydrated: std::cell::Cell::new(0),
+            #[cfg(feature = "test-utils")]
+            record_search_page_executions: std::cell::Cell::new(0),
             record_list_page_executions: std::cell::Cell::new(0),
             #[cfg(feature = "test-utils")]
             relation_batch_executions: std::cell::Cell::new(0),
@@ -2205,6 +2218,8 @@ impl Store {
             busy_timeout,
             event_search_page_executions: std::cell::Cell::new(0),
             event_search_rows_hydrated: std::cell::Cell::new(0),
+            #[cfg(feature = "test-utils")]
+            record_search_page_executions: std::cell::Cell::new(0),
             record_list_page_executions: std::cell::Cell::new(0),
             #[cfg(feature = "test-utils")]
             relation_batch_executions: std::cell::Cell::new(0),
@@ -5179,6 +5194,13 @@ impl Store {
         self.record_list_page_executions.get()
     }
 
+    /// Store-handle-local test instrumentation for ranked record FTS statements.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn record_search_page_executions(&self) -> u64 {
+        self.record_search_page_executions.get()
+    }
+
     pub fn search_records(&self, query: &str, limit: usize) -> Result<Vec<HistoryRecord>> {
         self.search_records_page(query, limit, 0)
     }
@@ -5284,6 +5306,25 @@ impl Store {
         limit: usize,
         offset: usize,
     ) -> Result<Option<Vec<HistoryRecord>>> {
+        let Some(hits) = self.search_record_hits_fts_plan(plan, limit, offset)? else {
+            return Ok(None);
+        };
+        let mut records = Vec::with_capacity(hits.len());
+        for hit in hits {
+            records.push(self.get_record(hit.record_id)?);
+        }
+        Ok(Some(records))
+    }
+
+    /// Executes one ranked record FTS statement and returns its bounded ID
+    /// materialization without hydrating records. `None` denotes a degraded
+    /// store without the record FTS projection.
+    pub fn search_record_hits_fts_plan(
+        &self,
+        plan: &SearchQueryPlan,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Option<Vec<RecordSearchHit>>> {
         if !table_exists(&self.conn, "ctx_history_search")? {
             return Ok(None);
         }
@@ -5307,31 +5348,38 @@ impl Store {
                 FROM artifact_search
                 WHERE artifact_search MATCH ?1 AND history_record_id IS NOT NULL
             )
-            SELECT record_id
+            SELECT record_id, MIN(score) AS score
             FROM matches
             WHERE record_id IS NOT NULL
             GROUP BY record_id
-            ORDER BY MIN(score), record_id
+            ORDER BY score, record_id
             LIMIT ?2 OFFSET ?3
             "#
         } else {
             r#"
-            SELECT record_id
+            SELECT record_id, bm25(ctx_history_search) AS score
             FROM ctx_history_search
             WHERE ctx_history_search MATCH ?1
-            ORDER BY bm25(ctx_history_search), record_id
+            ORDER BY score, record_id
             LIMIT ?2 OFFSET ?3
             "#
         };
         let mut stmt = self.conn.prepare(sql)?;
+        #[cfg(feature = "test-utils")]
+        self.record_search_page_executions
+            .set(self.record_search_page_executions.get().saturating_add(1));
         let rows = stmt.query_map(params![match_query, limit as i64, offset as i64], |row| {
-            row.get::<_, String>(0)
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
         })?;
-        let mut records = Vec::new();
+        let mut hits = Vec::new();
         for row in rows {
-            records.push(self.get_record(parse_uuid(row?)?)?);
+            let (record_id, score) = row?;
+            hits.push(RecordSearchHit {
+                record_id: parse_uuid(record_id)?,
+                score,
+            });
         }
-        Ok(Some(records))
+        Ok(Some(hits))
     }
 
     pub fn max_events_per_history_record(&self) -> Result<i64> {
@@ -5544,6 +5592,89 @@ impl Store {
                 .saturating_add(rows.len() as u64),
         );
         Ok(rows)
+    }
+
+    /// Scans one bounded ranked event statement in logical batches. The
+    /// callback returns `false` to stop row hydration early; statement state
+    /// is connection/invocation scoped and is dropped before this returns.
+    /// The callback must not re-enter this `Store`: the live SQLite cursor
+    /// retains the connection until callback processing completes.
+    pub fn scan_event_hits_plan_filtered<F>(
+        &self,
+        plan: &SearchQueryPlan,
+        page_size: usize,
+        max_pages: usize,
+        filters: &EventSearchSqlFilters,
+        mut consume: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[EventSearchHit]) -> bool,
+    {
+        if !table_exists(&self.conn, "event_search")? {
+            return Ok(());
+        }
+        let Some(match_query) = plan.fts_match_query() else {
+            return Ok(());
+        };
+        let page_size = page_size.max(1);
+        let limit = page_size.saturating_mul(max_pages.max(1));
+        let mut stmt;
+        let mut rows = if filters.is_empty() {
+            stmt = self.conn.prepare(SEARCH_EVENT_HITS_PAGE_SQL)?;
+            stmt.query(params![match_query, limit as i64, 0_i64])?
+        } else {
+            let sql = if filters.provider.is_some() {
+                SEARCH_EVENT_HITS_PAGE_PROVIDER_FILTERED_SQL
+            } else {
+                SEARCH_EVENT_HITS_PAGE_SCOPED_FILTERED_SQL
+            };
+            let scope_mode = match filters.agent_scope {
+                None => 0_i64,
+                Some(EventSearchAgentScope::PrimaryOrSessionless) => 1,
+                Some(EventSearchAgentScope::PrimaryOnly) => 2,
+            };
+            stmt = self.conn.prepare(sql)?;
+            stmt.query(params![
+                match_query,
+                limit as i64,
+                0_i64,
+                filters.session_id.map(|id| id.to_string()),
+                filters.provider.map(CaptureProvider::as_str),
+                filters.since.map(event_search_since_threshold_ms),
+                filters.event_type.map(EventType::as_str),
+                scope_mode,
+                event_role_mask(&filters.roles),
+                event_role_mask(&filters.exclude_roles),
+                i64::from(filters.exclude_tool_noise),
+                filters.file_scope.as_ref().map(file_scope_json),
+            ])?
+        };
+        self.event_search_page_executions
+            .set(self.event_search_page_executions.get().saturating_add(1));
+        let mut batch = Vec::with_capacity(page_size);
+        while let Some(row) = rows.next()? {
+            batch.push(event_search_hit_from_row(row)?);
+            if batch.len() == page_size {
+                self.event_search_rows_hydrated.set(
+                    self.event_search_rows_hydrated
+                        .get()
+                        .saturating_add(batch.len() as u64),
+                );
+                if !consume(&batch) {
+                    return Ok(());
+                }
+                batch.clear();
+            }
+        }
+        if !batch.is_empty() {
+            self.event_search_rows_hydrated.set(
+                self.event_search_rows_hydrated
+                    .get()
+                    .saturating_add(batch.len() as u64),
+            );
+            consume(&batch);
+        }
+        Ok(())
     }
 
     pub fn export_archive(&self) -> Result<SessionHistoryArchive> {

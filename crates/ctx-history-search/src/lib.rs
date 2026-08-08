@@ -7776,6 +7776,240 @@ mod tests {
         );
     }
 
+    const SQLITE_SEARCH_BASELINE_COMMAND: &str = "cargo test -q -p ctx-history-search --release tests::synthetic_search_sqlite_baseline_evidence -- --ignored --exact --nocapture";
+
+    #[test]
+    #[ignore = "evidence-only SQLite search baseline; intentionally has no performance gates"]
+    fn synthetic_search_sqlite_baseline_evidence() {
+        let provenance = local_jj_provenance().unwrap_or_else(|error| {
+            panic!("SQLite baseline requires jj commit/change provenance: {error}")
+        });
+        let evidence = sqlite_search_baseline_evidence(200_000, 50, 5, &provenance);
+        println!(
+            "sqlite search baseline evidence: {}",
+            serde_json::to_string(&evidence).unwrap()
+        );
+    }
+
+    fn sqlite_search_baseline_evidence(
+        event_count: usize,
+        events_per_record: usize,
+        sample_count: usize,
+        provenance: &BaselineProvenance,
+    ) -> serde_json::Value {
+        let archive = synthetic_perf_archive(event_count, events_per_record);
+        let corpus = PerfCorpus {
+            records: archive.records.len(),
+            capture_sources: archive.capture_sources.len(),
+            sessions: archive.sessions.len(),
+            runs: archive.runs.len(),
+            events: archive.events.len(),
+            summaries: archive.summaries.len(),
+            files_touched: archive.files_touched.len(),
+        };
+        let (_temp, mut store) = test_store();
+        store.import_archive(&archive, false).unwrap();
+
+        let unfiltered_options = PacketOptions {
+            limit: 24,
+            snippet_chars: 320,
+            filters: SearchFilters::default(),
+            result_mode: SearchResultMode::Sessions,
+            match_mode: SearchMatchMode::All,
+        };
+        let filtered_options = PacketOptions {
+            filters: SearchFilters {
+                provider: Some(CaptureProvider::Codex),
+                repo: Some("ctx".into()),
+                event_type: Some(EventType::ToolCall),
+                file: Some("perf_profile.rs".into()),
+                ..SearchFilters::default()
+            },
+            ..unfiltered_options.clone()
+        };
+
+        // Warm both query shapes before collecting exactly `sample_count` paired samples.
+        assert_perf_results(
+            "unfiltered baseline warmup",
+            search_packet(&store, "perfneedle", &unfiltered_options)
+                .unwrap()
+                .results
+                .len(),
+        );
+        assert_perf_results(
+            "filtered baseline warmup",
+            search_packet(&store, "perfneedle", &filtered_options)
+                .unwrap()
+                .results
+                .len(),
+        );
+
+        let mut unfiltered_samples = Vec::with_capacity(sample_count);
+        let mut filtered_samples = Vec::with_capacity(sample_count);
+        let mut total_samples = Vec::with_capacity(sample_count);
+        let mut unfiltered_ids = Vec::new();
+        let mut filtered_ids = Vec::new();
+        for _ in 0..sample_count {
+            // This wall-clock sample is the elapsed time for the complete ordered
+            // unfiltered-then-filtered query pair, including the tiny call boundary.
+            let pair_started = std::time::Instant::now();
+            let started = std::time::Instant::now();
+            let unfiltered = search_packet(&store, "perfneedle", &unfiltered_options).unwrap();
+            let unfiltered_ms = elapsed_ms(started.elapsed());
+            assert_perf_results("unfiltered baseline sample", unfiltered.results.len());
+
+            let started = std::time::Instant::now();
+            let filtered = search_packet(&store, "perfneedle", &filtered_options).unwrap();
+            let filtered_ms = elapsed_ms(started.elapsed());
+            assert_perf_results("filtered baseline sample", filtered.results.len());
+
+            let current_unfiltered_ids = result_ids(&unfiltered);
+            let current_filtered_ids = result_ids(&filtered);
+            if unfiltered_ids.is_empty() {
+                unfiltered_ids = current_unfiltered_ids;
+                filtered_ids = current_filtered_ids;
+            } else {
+                assert_eq!(unfiltered_ids, current_unfiltered_ids);
+                assert_eq!(filtered_ids, current_filtered_ids);
+            }
+            unfiltered_samples.push(unfiltered_ms);
+            filtered_samples.push(filtered_ms);
+            total_samples.push(elapsed_ms(pair_started.elapsed()));
+        }
+
+        let db_path = store.path().to_path_buf();
+        drop(store);
+        serde_json::json!({
+            "profile": "sqlite-search-baseline-v1",
+            "corpus_count": corpus.events,
+            "corpus": {
+                "records": corpus.records,
+                "capture_sources": corpus.capture_sources,
+                "sessions": corpus.sessions,
+                "runs": corpus.runs,
+                "events": corpus.events,
+                "summaries": corpus.summaries,
+                "files_touched": corpus.files_touched,
+                "events_per_record": events_per_record,
+            },
+            "db_size_bytes": sqlite_footprint_bytes(&db_path),
+            "canonical_reproduction_command": SQLITE_SEARCH_BASELINE_COMMAND,
+            "executed_test_invocation": current_test_invocation(),
+            "jj_commit_id": provenance.commit_id,
+            "jj_change_id": provenance.change_id,
+            "warm_samples": sample_count,
+            "unfiltered": {
+                "timings": timing_stats(&unfiltered_samples).to_json(),
+                "ordered_result_ids": unfiltered_ids,
+            },
+            "filtered": {
+                "timings": timing_stats(&filtered_samples).to_json(),
+                "ordered_result_ids": filtered_ids,
+            },
+            "paired_queries_wall_clock": {
+                "meaning": "elapsed wall-clock time enclosing each ordered unfiltered-then-filtered query pair",
+                "timings": timing_stats(&total_samples).to_json(),
+            },
+        })
+    }
+
+    struct BaselineProvenance {
+        commit_id: String,
+        change_id: String,
+    }
+
+    impl BaselineProvenance {
+        fn new(
+            commit_id: impl Into<String>,
+            change_id: impl Into<String>,
+        ) -> std::result::Result<Self, String> {
+            let provenance = Self {
+                commit_id: commit_id.into(),
+                change_id: change_id.into(),
+            };
+            if provenance.commit_id.trim().is_empty() {
+                return Err("commit ID must not be empty".into());
+            }
+            if provenance.change_id.trim().is_empty() {
+                return Err("change ID must not be empty".into());
+            }
+            Ok(provenance)
+        }
+    }
+
+    fn current_test_invocation() -> serde_json::Value {
+        serde_json::json!({
+            "executable": std::env::current_exe().ok().map(|path| path.display().to_string()),
+            "args": std::env::args_os()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    #[test]
+    fn sqlite_search_baseline_has_complete_repeatable_ungated_evidence() {
+        let provenance = BaselineProvenance::new("fixture-commit-id", "fixture-change-id").unwrap();
+        let first = sqlite_search_baseline_evidence(40, 10, 5, &provenance);
+        let second = sqlite_search_baseline_evidence(40, 10, 5, &provenance);
+
+        for evidence in [&first, &second] {
+            assert_eq!(evidence["profile"], "sqlite-search-baseline-v1");
+            assert_eq!(evidence["corpus_count"], 40);
+            assert_eq!(evidence["corpus"]["events"], 40);
+            assert_eq!(evidence["corpus"]["records"], 4);
+            assert_eq!(evidence["corpus"]["events_per_record"], 10);
+            assert!(evidence["db_size_bytes"].as_u64().unwrap() > 0);
+            assert_eq!(
+                evidence["canonical_reproduction_command"],
+                SQLITE_SEARCH_BASELINE_COMMAND
+            );
+            assert!(evidence["executed_test_invocation"]["args"].is_array());
+            assert_eq!(evidence["jj_commit_id"], "fixture-commit-id");
+            assert_eq!(evidence["jj_change_id"], "fixture-change-id");
+            assert!(!evidence["jj_commit_id"].as_str().unwrap().is_empty());
+            assert!(!evidence["jj_change_id"].as_str().unwrap().is_empty());
+            assert_eq!(evidence["warm_samples"], 5);
+            for profile in ["unfiltered", "filtered"] {
+                assert_eq!(evidence[profile]["timings"]["sample_count"], 5);
+                assert_eq!(
+                    evidence[profile]["timings"]["samples_ms"]
+                        .as_array()
+                        .unwrap()
+                        .len(),
+                    5
+                );
+                assert!(evidence[profile]["timings"]["p50_ms"].is_number());
+                assert!(evidence[profile]["timings"]["p95_ms"].is_number());
+                assert!(!evidence[profile]["ordered_result_ids"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty());
+            }
+            let paired = &evidence["paired_queries_wall_clock"];
+            assert!(paired["meaning"].as_str().unwrap().contains("wall-clock"));
+            assert_eq!(paired["timings"]["sample_count"], 5);
+            assert_eq!(paired["timings"]["samples_ms"].as_array().unwrap().len(), 5);
+            assert!(paired["timings"]["p50_ms"].is_number());
+            assert!(paired["timings"]["p95_ms"].is_number());
+            assert!(evidence.get("thresholds").is_none());
+            assert!(evidence.get("checks").is_none());
+        }
+        assert_eq!(
+            first["unfiltered"]["ordered_result_ids"],
+            second["unfiltered"]["ordered_result_ids"]
+        );
+        assert_eq!(
+            first["filtered"]["ordered_result_ids"],
+            second["filtered"]["ordered_result_ids"]
+        );
+    }
+
+    #[test]
+    fn sqlite_search_baseline_rejects_incomplete_provenance() {
+        assert!(BaselineProvenance::new("", "change-id").is_err());
+        assert!(BaselineProvenance::new("commit-id", "  ").is_err());
+    }
+
     struct PerfCorpus {
         records: usize,
         capture_sources: usize,
@@ -8197,6 +8431,43 @@ mod tests {
         let (bytes, semantics) = (usage.ru_maxrss as u64, "getrusage ru_maxrss platform units");
         serde_json::json!({"peak_bytes": bytes, "source": "getrusage(RUSAGE_SELF).ru_maxrss", "semantics": semantics})
     }
+    fn local_jj_provenance() -> std::result::Result<BaselineProvenance, String> {
+        let output = std::process::Command::new("jj")
+            .args([
+                "log",
+                "-r",
+                "@",
+                "--no-graph",
+                "-T",
+                "commit_id ++ \"\\n\" ++ change_id ++ \"\\n\"",
+            ])
+            .output()
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    "jj executable is unavailable".to_owned()
+                } else {
+                    format!("failed to execute jj: {error}")
+                }
+            })?;
+        if !output.status.success() {
+            return Err(format!(
+                "jj command failed with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let stdout = String::from_utf8(output.stdout)
+            .map_err(|error| format!("jj returned non-UTF-8 provenance: {error}"))?;
+        let mut ids = stdout.lines().map(str::trim).filter(|id| !id.is_empty());
+        let commit_id = ids
+            .next()
+            .ok_or_else(|| "jj returned an empty commit ID".to_owned())?;
+        let change_id = ids
+            .next()
+            .ok_or_else(|| "jj returned an empty change ID".to_owned())?;
+        BaselineProvenance::new(commit_id, change_id)
+    }
+
     fn local_jj_id(kind: &str) -> Option<String> {
         let template = if kind == "commit" {
             "commit_id"
@@ -8207,9 +8478,10 @@ mod tests {
             .args(["log", "-r", "@", "--no-graph", "-T", template])
             .output()
             .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_owned())
-            .filter(|s| !s.is_empty())
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .map(|id| id.trim().to_owned())
+            .filter(|id| !id.is_empty())
     }
 
     fn perf_uuid(namespace: u16, index: u64) -> Uuid {

@@ -316,7 +316,8 @@ Returns:
 - `filters`;
 - `broadened_search`, optional; when present it is `{ "executed": false, "from_match": "phrase|all", "to_match": "all|any", "command": "ctx search ...", "argv": ["ctx", "search", ...] }` for a no-result CLI query that can be broadened one step; compact JSON omits it when no broader mode is useful;
 - `freshness`;
-- `generated_at`;
+- `generated_at`, the response-generation time for this request (not the time a
+  reusable internal candidate pool was created);
 - `results[]`;
 - `pagination`;
 - `truncation`.
@@ -361,9 +362,12 @@ external publication.
 Search pagination is additive in v1. `pagination.cursor` is an opaque
 continuation token and is `null` when `has_more` is false. CLI continuation use
 requires `--refresh off` so the query executes against a stable read-only
-snapshot. Search pages are stable replay/slices of a fixed candidate pool: every
-page reruns the same request with the internal candidate limit fixed at 200, then
-slices by offset. The source scan itself can truncate earlier; `pool_total` is
+snapshot. Search pages are stable replay/slices of a fixed candidate pool. A
+live query service may reuse matching candidate work from a private,
+process-local four-entry cache for up to five minutes; misses regenerate with
+the internal candidate limit fixed at 200, then slice by offset. The TTL is
+enforced lazily on lookup/insertion, and separate CLI processes share nothing.
+The source scan itself can truncate earlier; `pool_total` is
 the exact returned candidate pool size, while `source_truncation.omitted_results`
 is only exact when `omitted_results_exact: true` and otherwise is a lower bound.
 

@@ -1,5 +1,7 @@
 use std::{
+    fs,
     io::{self, BufRead, Write},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -63,7 +65,7 @@ fn serve_stdio(data_root: PathBuf) -> Result<()> {
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
-    let mut initialized = false;
+    let mut state = McpState::default();
 
     for line in stdin.lock().lines() {
         let line = line?;
@@ -71,7 +73,7 @@ fn serve_stdio(data_root: PathBuf) -> Result<()> {
         if line.is_empty() {
             continue;
         }
-        if let Some(response) = handle_line(line, &data_root, &mut initialized) {
+        if let Some(response) = handle_line(line, &data_root, &mut state) {
             writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
             stdout.flush()?;
         }
@@ -79,7 +81,114 @@ fn serve_stdio(data_root: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn handle_line(line: &str, data_root: &Path, initialized: &mut bool) -> Option<Value> {
+#[derive(Default)]
+struct McpState {
+    initialized: bool,
+    query: Option<QueryService<'static>>,
+    database_identity: Option<DatabaseIdentity>,
+    schema_generation: Option<(i64, i64)>,
+    #[cfg(test)]
+    after_query_hook: Option<Box<dyn FnOnce()>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DatabaseIdentity {
+    device: u64,
+    inode: u64,
+}
+
+fn database_identity(path: &Path) -> Result<DatabaseIdentity> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("inspect ctx database identity at {}", path.display()))?;
+    Ok(DatabaseIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+impl McpState {
+    fn query(&mut self, data_root: &Path) -> Result<&QueryService<'static>> {
+        let path = database_path(data_root.to_path_buf());
+        let current_identity = database_identity(&path)?;
+        let schema_changed = self
+            .query
+            .as_ref()
+            .map(|query| query.store().schema_generation())
+            .transpose()?
+            .is_some_and(|generation| Some(generation) != self.schema_generation);
+        if self.database_identity != Some(current_identity) || schema_changed {
+            self.query = None;
+            self.database_identity = None;
+            self.schema_generation = None;
+        }
+        if self.query.is_none() {
+            // Bound the metadata/open race: if an atomic restore lands while
+            // opening, discard that connection and retry once. A later
+            // replacement is detected before the next search request.
+            for attempt in 0..2 {
+                let before = database_identity(&path)?;
+                let query = QueryService::from_store(open_existing_store(data_root)?);
+                let after = database_identity(&path)?;
+                if before == after {
+                    let schema_generation = query.store().schema_generation()?;
+                    self.query = Some(query);
+                    self.database_identity = Some(after);
+                    self.schema_generation = Some(schema_generation);
+                    break;
+                }
+                if attempt == 1 {
+                    return Err(anyhow!(
+                        "ctx database was replaced repeatedly while opening {}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        Ok(self.query.as_ref().expect("query service initialized"))
+    }
+
+    fn with_stable_query<T>(
+        &mut self,
+        data_root: &Path,
+        mut run: impl FnMut(&QueryService<'static>) -> Result<T>,
+    ) -> Result<T> {
+        let path = database_path(data_root.to_path_buf());
+        for attempt in 0..2 {
+            let result = {
+                let query = self.query(data_root)?;
+                run(query)?
+            };
+            #[cfg(test)]
+            if let Some(hook) = self.after_query_hook.take() {
+                hook();
+            }
+            let identity = database_identity(&path)?;
+            let generation = self
+                .query
+                .as_ref()
+                .expect("query service remains present")
+                .store()
+                .schema_generation()?;
+            if self.database_identity == Some(identity)
+                && self.schema_generation == Some(generation)
+            {
+                return Ok(result);
+            }
+
+            self.query = None;
+            self.database_identity = None;
+            self.schema_generation = None;
+            if attempt == 1 {
+                return Err(anyhow!(
+                    "ctx database changed repeatedly while executing search; retry the request"
+                ));
+            }
+        }
+        unreachable!("bounded search attempts return or fail")
+    }
+}
+
+fn handle_line(line: &str, data_root: &Path, state: &mut McpState) -> Option<Value> {
     let message = match serde_json::from_str::<Value>(line) {
         Ok(message) => message,
         Err(err) => {
@@ -91,10 +200,10 @@ fn handle_line(line: &str, data_root: &Path, initialized: &mut bool) -> Option<V
             ));
         }
     };
-    handle_message(message, data_root, initialized)
+    handle_message(message, data_root, state)
 }
 
-fn handle_message(message: Value, data_root: &Path, initialized: &mut bool) -> Option<Value> {
+fn handle_message(message: Value, data_root: &Path, state: &mut McpState) -> Option<Value> {
     let Some(object) = message.as_object() else {
         return Some(error_response(Value::Null, -32600, "Invalid Request", None));
     };
@@ -114,7 +223,7 @@ fn handle_message(message: Value, data_root: &Path, initialized: &mut bool) -> O
     }
     if id.is_none() {
         if method == "notifications/initialized" {
-            *initialized = true;
+            state.initialized = true;
         }
         return None;
     }
@@ -128,7 +237,7 @@ fn handle_message(message: Value, data_root: &Path, initialized: &mut bool) -> O
             Some(json!({ "error": "params must be an object" })),
         ));
     }
-    if method != "initialize" && !*initialized {
+    if method != "initialize" && !state.initialized {
         return Some(error_response(
             id,
             -32002,
@@ -138,12 +247,12 @@ fn handle_message(message: Value, data_root: &Path, initialized: &mut bool) -> O
     }
     let result = match method {
         "initialize" => {
-            *initialized = true;
+            state.initialized = true;
             Ok(initialize_result())
         }
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": tool_definitions() })),
-        "tools/call" => handle_tools_call(params, data_root),
+        "tools/call" => handle_tools_call(params, data_root, state),
         _ => Err(json_rpc_error(-32601, "Method not found", None)),
     };
     Some(match result {
@@ -180,7 +289,11 @@ fn initialize_result() -> Value {
     })
 }
 
-fn handle_tools_call(params: Value, data_root: &Path) -> Result<Value, Value> {
+fn handle_tools_call(
+    params: Value,
+    data_root: &Path,
+    state: &mut McpState,
+) -> Result<Value, Value> {
     let name = params.get("name").and_then(Value::as_str).ok_or_else(|| {
         json_rpc_error(
             -32602,
@@ -241,7 +354,7 @@ fn handle_tools_call(params: Value, data_root: &Path) -> Result<Value, Value> {
                     "max_page_bytes",
                 ],
             )?;
-            tool_search(&arguments, data_root)
+            tool_search(&arguments, data_root, state)
         }
         "sql" => {
             validate_argument_keys(
@@ -319,7 +432,7 @@ fn tool_sources(data_root: &Path) -> Result<Value> {
     ))
 }
 
-fn tool_search(arguments: &Value, data_root: &Path) -> Result<Value> {
+fn tool_search(arguments: &Value, data_root: &Path, state: &mut McpState) -> Result<Value> {
     let query_input = optional_string(arguments, "query")?;
     let query = query_input.clone().unwrap_or_default();
     let terms = optional_string_array(arguments, "terms")?;
@@ -358,7 +471,8 @@ fn tool_search(arguments: &Value, data_root: &Path) -> Result<Value> {
     }) {
         return Err(anyhow!("search needs a query or file"));
     }
-    let store = open_existing_store(data_root)?;
+    let query_service = state.query(data_root)?;
+    let store = query_service.store();
     let events = optional_bool(arguments, "events")?.unwrap_or(false) || session.is_some();
     let include_current_session =
         optional_bool(arguments, "include_current_session")?.unwrap_or(false);
@@ -406,7 +520,7 @@ fn tool_search(arguments: &Value, data_root: &Path) -> Result<Value> {
                 file: file.clone(),
                 include_current_session,
             },
-            Some(&store),
+            Some(store),
         )?,
         result_mode: if events {
             ctx_history_search::SearchResultMode::Events
@@ -417,14 +531,16 @@ fn tool_search(arguments: &Value, data_root: &Path) -> Result<Value> {
         ..ctx_history_search::PacketOptions::default()
     };
     let canonical_since = options.filters.since.map(|value| value.to_rfc3339());
-    let page = QueryService::new(&store).search(
-        &query,
-        &terms,
-        options,
-        continuation.as_deref(),
-        fields,
-        byte_policy,
-    )?;
+    let page = state.with_stable_query(data_root, |query_service| {
+        Ok(query_service.search(
+            &query,
+            &terms,
+            options.clone(),
+            continuation.as_deref(),
+            fields,
+            byte_policy,
+        )?)
+    })?;
     let cli_args = SearchArgs {
         query: query_input,
         term: terms,
@@ -465,7 +581,7 @@ fn tool_search(arguments: &Value, data_root: &Path) -> Result<Value> {
     let next_command = next_argv.as_ref().map(|argv| command_from_argv(argv));
     let mut refresh = SearchRefreshReport::skipped(RefreshArg::Off, "skipped");
     refresh.reason = "refresh_off";
-    let refresh = refresh.with_index_age(Some(&store));
+    let refresh = refresh.with_index_age(Some(state.query(data_root)?.store()));
     let next_arguments = page
         .pagination
         .continuation
@@ -1026,4 +1142,106 @@ fn json_rpc_error(code: i64, message: &str, data: Option<Value>) -> Value {
         "message": message,
         "data": data,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{database_identity, McpState};
+    use ctx_history_store::Store;
+    use rusqlite::Connection;
+    use std::{cell::Cell, fs, io::Write};
+
+    #[test]
+    fn database_identity_tracks_replacement_not_same_file_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("work.sqlite");
+        fs::write(&path, b"original").unwrap();
+        let opened = database_identity(&path).unwrap();
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b" write")
+            .unwrap();
+        assert_eq!(database_identity(&path).unwrap(), opened);
+
+        let replacement = temp.path().join("replacement.sqlite");
+        fs::write(&replacement, b"replacement").unwrap();
+        fs::rename(replacement, &path).unwrap();
+        assert_ne!(database_identity(&path).unwrap(), opened);
+    }
+
+    #[test]
+    fn mcp_query_reopens_after_atomic_database_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("work.sqlite");
+        drop(Store::open(&path).unwrap());
+        let replacement = temp.path().join("replacement.sqlite");
+        drop(Store::open(&replacement).unwrap());
+
+        let mut state = McpState::default();
+        state.query(temp.path()).unwrap();
+        let first = state.database_identity.unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        state.query(temp.path()).unwrap();
+        assert_ne!(state.database_identity.unwrap(), first);
+        assert_eq!(
+            state.database_identity,
+            Some(database_identity(&path).unwrap())
+        );
+    }
+
+    #[test]
+    fn mcp_query_reopens_after_same_file_schema_generation_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("work.sqlite");
+        drop(Store::open(&path).unwrap());
+        let mut state = McpState::default();
+        state.query(temp.path()).unwrap();
+        let first = state.schema_generation.unwrap();
+
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("CREATE TABLE mcp_schema_guard_test (id INTEGER);")
+            .unwrap();
+        state.query(temp.path()).unwrap();
+        assert_ne!(state.schema_generation.unwrap(), first);
+    }
+
+    #[test]
+    fn mcp_search_bracket_retries_atomic_replacement_without_old_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("work.sqlite");
+        drop(Store::open(&path).unwrap());
+        let replacement = temp.path().join("replacement.sqlite");
+        drop(Store::open(&replacement).unwrap());
+        Connection::open(&replacement)
+            .unwrap()
+            .execute_batch("CREATE TABLE replacement_marker (id INTEGER);")
+            .unwrap();
+        let replacement_generation = Store::open_read_only(&replacement)
+            .unwrap()
+            .schema_generation()
+            .unwrap();
+
+        let mut state = McpState::default();
+        state.query(temp.path()).unwrap();
+        state.after_query_hook = Some(Box::new({
+            let path = path.clone();
+            let replacement = replacement.clone();
+            move || fs::rename(replacement, path).unwrap()
+        }));
+        let attempts = Cell::new(0);
+        let returned_generation = state
+            .with_stable_query(temp.path(), |query| {
+                attempts.set(attempts.get() + 1);
+                Ok(query.store().schema_generation().unwrap())
+            })
+            .unwrap();
+
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(returned_generation, replacement_generation);
+        assert_eq!(state.schema_generation, Some(replacement_generation));
+    }
 }

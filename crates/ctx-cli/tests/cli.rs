@@ -665,7 +665,7 @@ fn mcp_search_two_pages_same_process(temp: &TempDir) -> (Value, Value) {
 
     send(
         &mut stdin,
-        json!({"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ctx-267-evidence","version":"0"}}}),
+        json!({"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ctx-pagination-test","version":"0"}}}),
     );
     let initialize = receive(&mut stdout);
     assert!(initialize["result"].is_object(), "{initialize:#}");
@@ -4703,8 +4703,7 @@ fn mcp_search_and_show_pagination_match_cli_query_pages() {
 }
 
 #[test]
-#[ignore = "issue #267 MCP lifetime evidence; run explicitly"]
-fn issue_267_mcp_process_serves_both_pages_before_exit() {
+fn mcp_process_serves_live_continuation_pages_before_exit() {
     let temp = tempdir();
     import_distinct_search_fixtures(&temp, 4);
     let (page1, page2) = mcp_search_two_pages_same_process(&temp);

@@ -49,6 +49,18 @@ fail closed when malformed, wrong-kind, mismatched, or stale. `show_session`
 tokens do carry an opaque event ordering key inside the hex token for keyset
 resumption. Read-only MCP opens reject old schemas and never migrate or write.
 
+One live MCP server retains its read-only store and may reuse up to four private
+candidate pools for matching continuations for five minutes. Cache misses safely
+regenerate the pool; tokens remain opaque and snapshot-bound. Expiry is enforced
+lazily on cache lookup/insertion, and all in-memory history is discarded when
+the server exits. Before each search MCP checks that `work.sqlite` still names
+the opened database and that SQLite's schema generation is unchanged; an atomic
+restore/replacement or schema-generation change discards the service and cache
+and performs a fresh read-only, schema-gated open. Normal writes to the same
+SQLite file remain visible. Restart long-lived MCP servers after database
+restore/replacement and after ctx binary or schema upgrades; automatic reopen is
+a safety guard, not a substitute for that operational restart.
+
 Repeated search input is limited at schema and runtime to 32 `terms`, 4096
 UTF-8 bytes per query clause, and 65536 aggregate query bytes. Raw duplicate and
 blank repeated clauses count toward the request-level clause limit.

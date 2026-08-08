@@ -2357,6 +2357,16 @@ impl Store {
         &self.path
     }
 
+    /// SQLite schema identity for bounded long-lived read-only guards.
+    pub fn schema_generation(&self) -> Result<(i64, i64)> {
+        Ok((
+            self.conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))?,
+            self.conn
+                .query_row("PRAGMA schema_version", [], |row| row.get(0))?,
+        ))
+    }
+
     pub fn sqlite_profile_metadata(&self) -> Result<SqliteProfileMetadata> {
         Ok(SqliteProfileMetadata {
             version: self

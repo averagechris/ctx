@@ -162,9 +162,15 @@ filters are also available to MCP hosts as optional `search` tool arguments
 Pagination is query-owned v1 and is the #195 paged slice of the broader #187
 work. Status, sources, locate, and raw SQL now share the same read-only query
 projection layer for transport-neutral DTO construction. A
-search page is a stable replay/slice of a fixed candidate pool. For every page,
-ctx reruns the same request with the candidate pool limit fixed at 200, then
-slices by the continuation offset. `pool_total` is exact for that returned pool.
+search page is a stable replay/slice of a fixed candidate pool. A live
+`QueryService` (including one MCP server process) may reuse that immutable pool
+for a matching continuation; a miss regenerates it with the pool limit fixed at
+200 before slicing by offset. Separate CLI invocations do not share this state.
+The four-entry, five-minute process-local cache can contain private snippets and
+metadata needed for projection, is dropped with the service, and is never
+persisted. Its TTL bounds reuse and lazy retention: expired entries are pruned
+on cache access or insertion, not by a background timer. `pool_total` is exact
+for that returned pool.
 Provider/source scanning can truncate before all possible results are considered;
 `source_truncation.omitted_results` is exact only when
 `omitted_results_exact: true`, otherwise it is a lower bound.

@@ -7,23 +7,25 @@
 use chrono::{DateTime, Utc};
 use ctx_history_capture::{ProviderImportSupport, ProviderSource, ProviderSourceStatus};
 use ctx_history_core::{
-    database_path, AgentType, CaptureProvider, CaptureSource, CaptureSourceKind,
+    database_path, utc_now, AgentType, CaptureProvider, CaptureSource, CaptureSourceKind,
     ContextCitationType, ContextLinks, Event, EventRole, EventType, Fidelity, ProviderRawRetention,
     RedactionState, SearchMatchMode, SearchQueryPlan, Session, SessionStatus, Visibility,
 };
 use ctx_history_search::{
     search_packet_terms_with_hydration, search_packet_with_hydration, validate_query_request,
-    HydrationIntent, PacketOptions, SearchFilters, SearchPacketResult, SearchResultMode,
-    SearchResultScope, SEARCH_PACKET_SCHEMA_VERSION,
+    HydrationIntent, PacketOptions, SearchFilters, SearchPacket, SearchPacketResult,
+    SearchResultMode, SearchResultScope, SEARCH_PACKET_SCHEMA_VERSION,
 };
 use ctx_history_store::{RawSqlOptions, RawSqlResult, RawSqlValue, SelectedEventMode, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
+    time::{Duration, Instant},
 };
 use uuid::Uuid;
 
@@ -38,6 +40,8 @@ pub const MAX_PAGE_BYTES: usize = 16 * 1024 * 1024;
 /// Compatibility name retained for callers that used the scaffold constant.
 pub const MAX_SNIPPET_BYTES: usize = MAX_ITEM_BYTES;
 const MAX_TOKEN_BYTES: usize = 4096;
+const SEARCH_CONTINUATION_CACHE_CAPACITY: usize = 4;
+const SEARCH_CONTINUATION_CACHE_LIFETIME: Duration = Duration::from_secs(5 * 60);
 pub const LOW_SPACE_WARNING_BYTES: u64 = 512 * 1024 * 1024;
 pub const LOW_SPACE_CRITICAL_BYTES: u64 = 128 * 1024 * 1024;
 
@@ -728,24 +732,109 @@ struct Token {
     id: Option<Uuid>,
 }
 
+enum QueryStore<'a> {
+    Borrowed(&'a Store),
+    Owned(Box<Store>),
+}
+
+struct SearchContinuationEntry {
+    request: String,
+    snapshot: String,
+    inserted_at: Instant,
+    packet: Arc<SearchPacket>,
+}
+
 pub struct QueryService<'a> {
-    store: &'a Store,
+    store: QueryStore<'a>,
+    search_continuations: std::cell::RefCell<VecDeque<SearchContinuationEntry>>,
 }
 
 impl<'a> QueryService<'a> {
     pub fn new(store: &'a Store) -> Self {
-        Self { store }
+        Self {
+            store: QueryStore::Borrowed(store),
+            search_continuations: std::cell::RefCell::new(VecDeque::new()),
+        }
+    }
+
+    pub fn from_store(store: Store) -> QueryService<'static> {
+        QueryService {
+            store: QueryStore::Owned(Box::new(store)),
+            search_continuations: std::cell::RefCell::new(VecDeque::new()),
+        }
+    }
+
+    pub fn store(&self) -> &Store {
+        match &self.store {
+            QueryStore::Borrowed(store) => store,
+            QueryStore::Owned(store) => store,
+        }
+    }
+
+    fn cached_search_packet(&self, request: &str, snapshot: &str) -> Option<Arc<SearchPacket>> {
+        self.cached_search_packet_at(request, snapshot, Instant::now())
+    }
+
+    fn cached_search_packet_at(
+        &self,
+        request: &str,
+        snapshot: &str,
+        now: Instant,
+    ) -> Option<Arc<SearchPacket>> {
+        let mut entries = self.search_continuations.borrow_mut();
+        entries.retain(|entry| {
+            now.duration_since(entry.inserted_at) < SEARCH_CONTINUATION_CACHE_LIFETIME
+        });
+        let position = entries
+            .iter()
+            .position(|entry| entry.request == request && entry.snapshot == snapshot)?;
+        let entry = entries.remove(position).expect("cache position exists");
+        let packet = Arc::clone(&entry.packet);
+        entries.push_back(entry);
+        Some(packet)
+    }
+
+    fn cache_search_packet(&self, request: String, snapshot: String, packet: Arc<SearchPacket>) {
+        self.cache_search_packet_at(request, snapshot, packet, Instant::now());
+    }
+
+    fn cache_search_packet_at(
+        &self,
+        request: String,
+        snapshot: String,
+        packet: Arc<SearchPacket>,
+        now: Instant,
+    ) {
+        let mut entries = self.search_continuations.borrow_mut();
+        entries.retain(|entry| {
+            now.duration_since(entry.inserted_at) < SEARCH_CONTINUATION_CACHE_LIFETIME
+        });
+        entries.retain(|entry| entry.request != request || entry.snapshot != snapshot);
+        while entries.len() >= SEARCH_CONTINUATION_CACHE_CAPACITY {
+            entries.pop_front();
+        }
+        entries.push_back(SearchContinuationEntry {
+            request,
+            snapshot,
+            inserted_at: now,
+            packet,
+        });
+    }
+
+    #[cfg(test)]
+    fn search_continuation_cache_len(&self) -> usize {
+        self.search_continuations.borrow().len()
     }
 
     pub fn raw_sql(&self, sql: &str, options: RawSqlOptions) -> Result<RawSqlResult> {
-        Ok(self.store.raw_sql_query(sql, options)?)
+        Ok(self.store().raw_sql_query(sql, options)?)
     }
 
     pub fn locate_session(&self, session: &Session) -> Result<LocateSessionV1> {
         let source = session
             .capture_source_id
             .map(|id| {
-                self.store
+                self.store()
                     .get_capture_source(id)
                     .map(|source| source_location_json(&source))
             })
@@ -772,12 +861,12 @@ impl<'a> QueryService<'a> {
     pub fn locate_event(&self, event: &Event) -> Result<LocateEventV1> {
         let session = event
             .session_id
-            .map(|id| self.store.get_session(id))
+            .map(|id| self.store().get_session(id))
             .transpose()?;
         let source = event
             .capture_source_id
             .map(|id| {
-                self.store
+                self.store()
                     .get_capture_source(id)
                     .map(|source| source_location_json(&source))
             })
@@ -820,14 +909,14 @@ impl<'a> QueryService<'a> {
         }
         let page_size = limit.min(MAX_SHOW_LIMIT);
         let request = show_request_hash(session.id, mode, page_size, fields, byte_policy)?;
-        let snapshot = self.store.snapshot_fingerprint()?;
+        let snapshot = self.store().snapshot_fingerprint()?;
         let token = continuation
             .map(|raw| decode_token(raw, "show_session", &request, &snapshot))
             .transpose()?;
         let offset = token_offset(token.as_ref())?;
         let after = token.as_ref().and_then(|value| value.seq.zip(value.id));
         let selected_total = self
-            .store
+            .store()
             .selected_event_count_for_session(session.id, mode.store_mode())?;
         if let (Some(token), Some(key)) = (token.as_ref(), after) {
             if offset == 0 || offset >= selected_total {
@@ -836,7 +925,7 @@ impl<'a> QueryService<'a> {
                 ));
             }
             let position = self
-                .store
+                .store()
                 .selected_event_cursor_position(session.id, mode.store_mode(), key)?
                 .ok_or_else(|| {
                     QueryError::InvalidContinuation(
@@ -854,7 +943,7 @@ impl<'a> QueryService<'a> {
         let fetch_limit = page_size
             .checked_add(1)
             .ok_or(QueryError::ArithmeticOverflow)?;
-        let raw_events = self.store.selected_events_for_session_after(
+        let raw_events = self.store().selected_events_for_session_after(
             session.id,
             mode.store_mode(),
             after,
@@ -863,7 +952,7 @@ impl<'a> QueryService<'a> {
         let source = if fields == FieldSet::Full {
             session
                 .capture_source_id
-                .map(|id| self.store.get_capture_source(id).map(project_source))
+                .map(|id| self.store().get_capture_source(id).map(project_source))
                 .transpose()?
         } else {
             None
@@ -885,7 +974,7 @@ impl<'a> QueryService<'a> {
                         source_cache.entry(source_id)
                     {
                         let projected = self
-                            .store
+                            .store()
                             .get_capture_source(source_id)
                             .map(project_source)?;
                         entry.insert(Some(projected));
@@ -937,7 +1026,7 @@ impl<'a> QueryService<'a> {
         // A zero-item page is terminal by invariant; never mint a looping
         // continuation from a cursor that made no progress.
         let has_more = returned > 0 && next_offset < selected_total;
-        let after_snapshot = self.store.snapshot_fingerprint()?;
+        let after_snapshot = self.store().snapshot_fingerprint()?;
         if after_snapshot != snapshot {
             return Err(QueryError::SnapshotChanged);
         }
@@ -1004,14 +1093,14 @@ impl<'a> QueryService<'a> {
         }
         let page_size = options.limit.min(ctx_history_search::MAX_RESULT_LIMIT);
         let request = search_request_hash(query, terms, &options, page_size, fields, byte_policy)?;
-        let snapshot = self.store.snapshot_fingerprint()?;
+        let snapshot = self.store().snapshot_fingerprint()?;
         let token = continuation
             .map(|raw| decode_token(raw, "search", &request, &snapshot))
             .transpose()?;
         let offset = token_offset(token.as_ref())?;
 
-        // Every page replays and slices this same fixed candidate pool. Neither
-        // page offset nor requested page size changes candidate generation.
+        // Every page slices the same fixed candidate pool. A live service can
+        // reuse it; a cache miss deterministically regenerates it.
         let mut pool_options = options.clone();
         pool_options.limit = ctx_history_search::MAX_RESULT_LIMIT;
         let hydration = match fields {
@@ -1024,12 +1113,30 @@ impl<'a> QueryService<'a> {
         } else {
             hydration
         };
-        let packet = if terms.is_empty() {
-            search_packet_with_hydration(self.store, query, &pool_options, hydration)?
+        let packet = if token.is_some() {
+            self.cached_search_packet(&request, &snapshot)
+        } else {
+            None
+        };
+        let packet = if let Some(packet) = packet {
+            packet
+        } else if terms.is_empty() {
+            Arc::new(search_packet_with_hydration(
+                self.store(),
+                query,
+                &pool_options,
+                hydration,
+            )?)
         } else {
             // Do not pre-deduplicate: the canonical request preserves the exact
             // repeated term vector even though search-core may normalize it.
-            search_packet_terms_with_hydration(self.store, query, terms, &pool_options, hydration)?
+            Arc::new(search_packet_terms_with_hydration(
+                self.store(),
+                query,
+                terms,
+                &pool_options,
+                hydration,
+            )?)
         };
         let pool_total = packet.results.len();
         if token.is_some() && (offset == 0 || offset >= pool_total) {
@@ -1044,7 +1151,7 @@ impl<'a> QueryService<'a> {
         let mut page_budget_exhausted = false;
         for result in packet.results.iter().skip(offset).take(page_size) {
             let projection = project_search_result(
-                self.store,
+                self.store(),
                 result,
                 byte_policy.per_item_bytes,
                 query,
@@ -1078,9 +1185,12 @@ impl<'a> QueryService<'a> {
             .checked_add(returned)
             .ok_or(QueryError::ArithmeticOverflow)?;
         let has_more = returned > 0 && next_offset < pool_total;
-        let after_snapshot = self.store.snapshot_fingerprint()?;
+        let after_snapshot = self.store().snapshot_fingerprint()?;
         if after_snapshot != snapshot {
             return Err(QueryError::SnapshotChanged);
+        }
+        if has_more {
+            self.cache_search_packet(request.clone(), snapshot.clone(), Arc::clone(&packet));
         }
         let next_continuation = if has_more {
             Some(encode_token(&Token {
@@ -1106,10 +1216,12 @@ impl<'a> QueryService<'a> {
         };
         Ok(SearchPageV1 {
             schema_version: QUERY_DTO_SCHEMA_VERSION,
-            legacy_query: packet.query,
+            legacy_query: packet.query.clone(),
             context: project_search_context(query, terms, &options, fields),
-            query_plan: packet.query_plan,
-            generated_at: packet.generated_at,
+            query_plan: packet.query_plan.clone(),
+            // This is response metadata, not candidate-pool identity. Emitting
+            // it per request keeps cache hits indistinguishable from misses.
+            generated_at: utc_now(),
             results,
             pool_total,
             omitted: OmittedCountsV1 {
@@ -4098,8 +4210,234 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "issue #267 evidence spike; run in release mode with --ignored --nocapture"]
-    fn issue_267_same_process_query_replays_fixed_candidate_pool() {
+    fn live_search_reuses_one_bounded_candidate_pool_and_evicts_lru() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("work.sqlite");
+        let writable = Store::open(&path).unwrap();
+        for index in 0..10_u128 {
+            writable
+                .insert_record(&HistoryRecord {
+                    id: Uuid::from_u128(index + 1),
+                    title: format!("candidate-{index}"),
+                    body: "alpha beta gamma delta epsilon".to_owned(),
+                    tags: vec![],
+                    kind: "cache-test".to_owned(),
+                    workspace: None,
+                    created_at: fixed_time(),
+                    updated_at: fixed_time(),
+                })
+                .unwrap();
+        }
+        drop(writable);
+
+        let store = Store::open_read_only(&path).unwrap();
+        let service = QueryService::new(&store);
+        let options = PacketOptions {
+            limit: 1,
+            ..PacketOptions::default()
+        };
+        let terms = ["alpha", "beta", "gamma", "delta", "epsilon"];
+        let mut tokens = Vec::new();
+        for term in terms {
+            let page = service
+                .search(term, &[], options.clone(), None, FieldSet::Compact, bytes())
+                .unwrap();
+            tokens.push((term, page.pagination.continuation.unwrap()));
+        }
+        assert_eq!(
+            service.search_continuation_cache_len(),
+            SEARCH_CONTINUATION_CACHE_CAPACITY
+        );
+
+        let before = store.record_search_page_executions();
+        assert!(matches!(
+            service.search(
+                tokens[4].0,
+                &[],
+                options.clone(),
+                Some("not-hex"),
+                FieldSet::Compact,
+                bytes(),
+            ),
+            Err(QueryError::InvalidContinuation(_))
+        ));
+        assert!(matches!(
+            service.search(
+                tokens[4].0,
+                &[],
+                options.clone(),
+                Some(&tokens[4].1),
+                FieldSet::Full,
+                bytes(),
+            ),
+            Err(QueryError::ContinuationRequestMismatch)
+        ));
+        let mut filtered = options.clone();
+        filtered.filters.history_source = Some("other-source".to_owned());
+        assert!(matches!(
+            service.search(
+                tokens[4].0,
+                &[],
+                filtered,
+                Some(&tokens[4].1),
+                FieldSet::Compact,
+                bytes(),
+            ),
+            Err(QueryError::ContinuationRequestMismatch)
+        ));
+        assert_eq!(store.record_search_page_executions(), before);
+
+        Arc::make_mut(
+            &mut service
+                .search_continuations
+                .borrow_mut()
+                .back_mut()
+                .unwrap()
+                .packet,
+        )
+        .generated_at = DateTime::<Utc>::UNIX_EPOCH;
+        let cached = service
+            .search(
+                tokens[4].0,
+                &[],
+                options.clone(),
+                Some(&tokens[4].1),
+                FieldSet::Compact,
+                bytes(),
+            )
+            .unwrap();
+        assert_ne!(cached.generated_at, DateTime::<Utc>::UNIX_EPOCH);
+        assert_eq!(store.record_search_page_executions(), before);
+
+        let mut reference = QueryService::new(&store)
+            .search(
+                tokens[4].0,
+                &[],
+                options.clone(),
+                Some(&tokens[4].1),
+                FieldSet::Compact,
+                bytes(),
+            )
+            .unwrap();
+        // Candidate generation timestamps are intentionally observational;
+        // normalize that instant to compare the complete public page packet.
+        reference.generated_at = cached.generated_at;
+        assert_eq!(cached, reference);
+
+        let after_reference = store.record_search_page_executions();
+        service
+            .search(
+                tokens[0].0,
+                &[],
+                options,
+                Some(&tokens[0].1),
+                FieldSet::Compact,
+                bytes(),
+            )
+            .unwrap();
+        assert_eq!(store.record_search_page_executions(), after_reference + 1);
+        assert_eq!(
+            service.search_continuation_cache_len(),
+            SEARCH_CONTINUATION_CACHE_CAPACITY
+        );
+
+        let now = Instant::now();
+        let packet = Arc::clone(&service.search_continuations.borrow()[0].packet);
+        for entry in service.search_continuations.borrow_mut().iter_mut() {
+            entry.inserted_at = now - SEARCH_CONTINUATION_CACHE_LIFETIME;
+        }
+        assert!(service
+            .cached_search_packet_at(tokens[4].0, "unused", now)
+            .is_none());
+        assert_eq!(service.search_continuation_cache_len(), 0);
+        for index in 0..SEARCH_CONTINUATION_CACHE_CAPACITY {
+            service.cache_search_packet_at(
+                format!("expired-{index}"),
+                "expired-snapshot".to_owned(),
+                Arc::clone(&packet),
+                now - SEARCH_CONTINUATION_CACHE_LIFETIME,
+            );
+        }
+        service.cache_search_packet_at(
+            "fresh-request".to_owned(),
+            "fresh-snapshot".to_owned(),
+            packet,
+            now,
+        );
+        assert_eq!(service.search_continuation_cache_len(), 1);
+    }
+
+    #[test]
+    fn live_search_rejects_cached_continuation_after_store_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("work.sqlite");
+        let writable = Store::open(&path).unwrap();
+        for index in 0..3_u128 {
+            writable
+                .insert_record(&HistoryRecord {
+                    id: Uuid::from_u128(index + 1),
+                    title: format!("mutation-{index}"),
+                    body: "snapshot needle".to_owned(),
+                    tags: vec![],
+                    kind: "cache-test".to_owned(),
+                    workspace: None,
+                    created_at: fixed_time(),
+                    updated_at: fixed_time(),
+                })
+                .unwrap();
+        }
+        drop(writable);
+        let store = Store::open_read_only(&path).unwrap();
+        let service = QueryService::new(&store);
+        let options = PacketOptions {
+            limit: 1,
+            ..PacketOptions::default()
+        };
+        let first = service
+            .search(
+                "needle",
+                &[],
+                options.clone(),
+                None,
+                FieldSet::Compact,
+                bytes(),
+            )
+            .unwrap();
+        let token = first.pagination.continuation.unwrap();
+
+        let writer = Store::open(&path).unwrap();
+        writer
+            .insert_record(&HistoryRecord {
+                id: Uuid::from_u128(99),
+                title: "new mutation".to_owned(),
+                body: "snapshot needle".to_owned(),
+                tags: vec![],
+                kind: "cache-test".to_owned(),
+                workspace: None,
+                created_at: fixed_time(),
+                updated_at: fixed_time(),
+            })
+            .unwrap();
+        drop(writer);
+
+        let before = store.record_search_page_executions();
+        assert!(matches!(
+            service.search(
+                "needle",
+                &[],
+                options,
+                Some(&token),
+                FieldSet::Compact,
+                bytes(),
+            ),
+            Err(QueryError::StaleContinuation)
+        ));
+        assert_eq!(store.record_search_page_executions(), before);
+    }
+
+    #[test]
+    #[ignore = "issue #270 release benchmark; run in release mode with --ignored --nocapture"]
+    fn issue_270_same_process_query_reuses_fixed_candidate_pool() {
         const RECORD_COUNT: usize = 200_000;
         const PAGE_SIZE: usize = 100;
         const WARMUP_PAIRS: usize = 1;
@@ -4113,10 +4451,10 @@ mod tests {
             let records = (start..(start + 5_000).min(RECORD_COUNT))
                 .map(|index| HistoryRecord {
                     id: Uuid::from_u128(index as u128 + 1),
-                    title: "issue-267 continuation fixture".to_owned(),
+                    title: "issue-270 continuation fixture".to_owned(),
                     body: "needle continuation replay fixture".to_owned(),
                     tags: vec![],
-                    kind: "issue-267".to_owned(),
+                    kind: "issue-270".to_owned(),
                     workspace: None,
                     created_at,
                     updated_at: created_at,
@@ -4133,7 +4471,7 @@ mod tests {
             ..PacketOptions::default()
         };
 
-        let run_pair = |query: &QueryService<'_>, options: &PacketOptions| {
+        let run_pair = |query: &QueryService<'_>, options: &PacketOptions, forced_miss: bool| {
             let started = Instant::now();
             let page1 = query
                 .search(
@@ -4148,7 +4486,14 @@ mod tests {
             let page1_elapsed = started.elapsed();
             let token = page1.pagination.continuation.clone().unwrap();
             let page2_started = Instant::now();
-            let page2 = query
+            let control;
+            let page2_query = if forced_miss {
+                control = QueryService::new(&store);
+                &control
+            } else {
+                query
+            };
+            let page2 = page2_query
                 .search(
                     "needle",
                     &[],
@@ -4159,23 +4504,29 @@ mod tests {
                 )
                 .unwrap();
             let page2_elapsed = page2_started.elapsed();
-            (
-                page1,
-                page2,
-                page1_elapsed,
-                page2_elapsed,
-                started.elapsed(),
-            )
+            (page1, page2, page1_elapsed, page2_elapsed)
         };
 
         for _ in 0..WARMUP_PAIRS {
-            let _ = run_pair(&query, &options);
+            let _ = run_pair(&query, &options, false);
+            let _ = run_pair(&query, &options, true);
         }
         let baseline_searches = store.record_search_page_executions();
         let mut samples = Vec::with_capacity(SAMPLES);
         for sample in 1..=SAMPLES {
-            let (page1, page2, page1_elapsed, page2_elapsed, total_elapsed) =
-                run_pair(&query, &options);
+            let (cached, control) = if sample % 2 == 0 {
+                (
+                    run_pair(&query, &options, false),
+                    run_pair(&query, &options, true),
+                )
+            } else {
+                let control = run_pair(&query, &options, true);
+                let cached = run_pair(&query, &options, false);
+                (cached, control)
+            };
+            let (page1, page2, cached_page1, cached_page2) = cached;
+            let (control_page1_result, control_page2_result, control_page1, control_page2) =
+                control;
             let page1_ids = page1
                 .results
                 .iter()
@@ -4194,6 +4545,8 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(page1_ids, expected_page1, "page 1 ordering changed");
             assert_eq!(page2_ids, expected_page2, "page 2 ordering changed");
+            assert_eq!(page1.results, control_page1_result.results);
+            assert_eq!(page2.results, control_page2_result.results);
             assert_eq!(page1.pagination.offset, 0);
             assert_eq!(page2.pagination.offset, PAGE_SIZE);
             assert_eq!(page1.pool_total, 200);
@@ -4201,24 +4554,95 @@ mod tests {
 
             let after_searches = store.record_search_page_executions();
             let reruns = after_searches.saturating_sub(baseline_searches);
-            assert_eq!(reruns, (sample * 2) as u64);
-            samples.push((page1_elapsed, page2_elapsed, total_elapsed, reruns));
+            assert_eq!(reruns, (sample * 3) as u64);
+            samples.push((
+                cached_page1,
+                cached_page2,
+                control_page1,
+                control_page2,
+                reruns,
+            ));
         }
 
+        let cached_page1_mean = samples
+            .iter()
+            .map(|sample| sample.0.as_nanos())
+            .sum::<u128>()
+            / SAMPLES as u128;
+        let cached_page2_mean = samples
+            .iter()
+            .map(|sample| sample.1.as_nanos())
+            .sum::<u128>()
+            / SAMPLES as u128;
+        let control_page1_mean = samples
+            .iter()
+            .map(|sample| sample.2.as_nanos())
+            .sum::<u128>()
+            / SAMPLES as u128;
+        let control_page2_mean = samples
+            .iter()
+            .map(|sample| sample.3.as_nanos())
+            .sum::<u128>()
+            / SAMPLES as u128;
+        let median = |field: usize| {
+            let mut values = samples
+                .iter()
+                .map(|sample| match field {
+                    0 => sample.0.as_nanos(),
+                    1 => sample.1.as_nanos(),
+                    2 => sample.2.as_nanos(),
+                    _ => sample.3.as_nanos(),
+                })
+                .collect::<Vec<_>>();
+            values.sort_unstable();
+            values[SAMPLES / 2]
+        };
+        let cached_page1_median = median(0);
+        let cached_page2_median = median(1);
+        let control_page1_median = median(2);
+        let control_page2_median = median(3);
+        assert!(
+            cached_page2_median * 100 < control_page2_median * 80,
+            "cached page 2 did not improve by more than 20%"
+        );
+        assert!(
+            cached_page1_median * 100 <= control_page1_median * 105,
+            "cached-path page 1 regressed by more than 5%"
+        );
+
         println!(
-            "issue #267 fixture records={RECORD_COUNT} page_size={PAGE_SIZE} \
+            "issue #270 fixture records={RECORD_COUNT} page_size={PAGE_SIZE} \
              same_store_handle=true same_query_service=true"
         );
-        for (index, (page1, page2, total, reruns)) in samples.into_iter().enumerate() {
+        for (index, (cached_page1, cached_page2, control_page1, control_page2, reruns)) in
+            samples.into_iter().enumerate()
+        {
             println!(
-                "sample={} page1_us={} page2_us={} total_us={} \
-                 record_search_statements_since_warmup={reruns}",
+                "sample={} cached_page1_us={} cached_page2_us={} \
+                 forced_miss_page1_us={} forced_miss_page2_us={} \
+                  record_search_statements_since_warmup={reruns}",
                 index + 1,
-                page1.as_micros(),
-                page2.as_micros(),
-                total.as_micros(),
+                cached_page1.as_micros(),
+                cached_page2.as_micros(),
+                control_page1.as_micros(),
+                control_page2.as_micros(),
             );
         }
+        println!(
+            "means cached_page1_us={} cached_page2_us={} forced_miss_page1_us={} \
+             forced_miss_page2_us={} medians_us={}/{}/{}/{} page2_improvement_percent={:.2} \
+             page1_regression_percent={:.2}",
+            cached_page1_mean / 1_000,
+            cached_page2_mean / 1_000,
+            control_page1_mean / 1_000,
+            control_page2_mean / 1_000,
+            cached_page1_median / 1_000,
+            cached_page2_median / 1_000,
+            control_page1_median / 1_000,
+            control_page2_median / 1_000,
+            100.0 * (1.0 - cached_page2_median as f64 / control_page2_median as f64),
+            100.0 * (cached_page1_median as f64 / control_page1_median as f64 - 1.0),
+        );
     }
 
     fn search_projection_id(result: &SearchResultProjectionV1) -> Uuid {

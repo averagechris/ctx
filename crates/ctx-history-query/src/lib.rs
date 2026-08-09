@@ -31,6 +31,8 @@ use uuid::Uuid;
 
 mod evidence;
 pub use evidence::*;
+mod evidence_render;
+pub use evidence_render::*;
 
 pub const QUERY_DTO_SCHEMA_VERSION: u32 = 1;
 pub const QUERY_REVISION: u32 = 1;
@@ -556,6 +558,190 @@ pub struct EvidenceSelectorRequest {
     pub continuation: Option<String>,
 }
 
+/// Closed, payload-free representation of the effective evidence selector.
+/// This is the only request shape permitted to cross into the normalized
+/// evidence/rendering boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "domain", rename_all = "snake_case")]
+pub enum EvidenceSelectorBindingV1 {
+    SessionPage {
+        session_id_sha256: String,
+        mode: TranscriptMode,
+    },
+    SearchPage {
+        query_present: bool,
+        query_sha256: String,
+        terms_count: usize,
+        terms_sha256: String,
+        options: Box<EvidenceSearchOptionsBindingV1>,
+    },
+    EventIds {
+        event_ids_count: usize,
+        event_ids_sha256: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EvidenceSearchOptionsBindingV1 {
+    pub limit: usize,
+    pub snippet_chars: usize,
+    pub filters: EvidenceSearchFiltersBindingV1,
+    pub result_mode: SearchResultMode,
+    pub match_mode: SearchMatchMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EvidenceSearchFiltersBindingV1 {
+    pub session_present: bool,
+    pub session_sha256: String,
+    pub source_identity_values: usize,
+    pub source_identity_sha256: String,
+    pub workspace_present: bool,
+    pub workspace_sha256: String,
+    pub since_present: bool,
+    pub since_sha256: String,
+    pub primary_only: bool,
+    pub include_subagents: bool,
+    pub event_type: Option<EventType>,
+    pub roles: Vec<EventRole>,
+    pub exclude_roles: Vec<EventRole>,
+    pub exclude_tool_noise: bool,
+    pub exclude_tool_names_count: usize,
+    pub exclude_tool_names_sha256: String,
+    pub file_present: bool,
+    pub file_sha256: String,
+    pub exclude_provider_session_present: bool,
+    pub exclude_provider_session_sha256: String,
+}
+
+/// Complete canonical request binding, including every effective option that
+/// can affect selection, continuation, or rendering.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EvidenceRequestBindingV1 {
+    pub kind: &'static str,
+    pub query_revision: u32,
+    pub schema_version: u32,
+    pub evidence_schema_version: u32,
+    pub search_packet_schema_version: u32,
+    pub selector: EvidenceSelectorBindingV1,
+    pub limit: usize,
+    pub fields: FieldSet,
+    pub byte_policy: BytePolicy,
+    pub artifact_bytes: usize,
+    pub format: EvidenceFormat,
+    pub refresh: EvidenceRefresh,
+    pub include_current_session: bool,
+    pub work: EvidenceWorkBoundsV1,
+}
+
+impl EvidenceRequestBindingV1 {
+    pub fn from_request(request: &EvidenceSelectorRequest) -> Self {
+        let selector = match &request.selector {
+            EvidenceSelector::SessionPage {
+                ctx_session_id,
+                mode,
+            } => EvidenceSelectorBindingV1::SessionPage {
+                session_id_sha256: sensitive_digest("session_id", ctx_session_id),
+                mode: *mode,
+            },
+            EvidenceSelector::SearchPage {
+                query,
+                terms,
+                options,
+            } => {
+                let filters = &options.filters;
+                EvidenceSelectorBindingV1::SearchPage {
+                    query_present: !query.is_empty(),
+                    query_sha256: sensitive_digest("query", query),
+                    terms_count: terms.len(),
+                    terms_sha256: sensitive_digest("terms", terms),
+                    options: Box::new(EvidenceSearchOptionsBindingV1 {
+                        limit: options.limit,
+                        snippet_chars: options.snippet_chars,
+                        filters: EvidenceSearchFiltersBindingV1 {
+                            session_present: filters.session.is_some(),
+                            session_sha256: sensitive_digest("filter_session", &filters.session),
+                            source_identity_values: usize::from(filters.provider.is_some())
+                                + usize::from(filters.history_source.is_some())
+                                + usize::from(filters.provider_key.is_some())
+                                + usize::from(filters.source_id.is_some())
+                                + usize::from(filters.source_format.is_some()),
+                            source_identity_sha256: sensitive_digest(
+                                "source_identity",
+                                &(
+                                    filters.provider,
+                                    &filters.history_source,
+                                    &filters.provider_key,
+                                    &filters.source_id,
+                                    &filters.source_format,
+                                ),
+                            ),
+                            workspace_present: filters.repo.is_some(),
+                            workspace_sha256: sensitive_digest("workspace", &filters.repo),
+                            since_present: filters.since.is_some(),
+                            since_sha256: sensitive_digest("since", &filters.since),
+                            primary_only: filters.primary_only,
+                            include_subagents: filters.include_subagents,
+                            event_type: filters.event_type,
+                            roles: filters.roles.clone(),
+                            exclude_roles: filters.exclude_roles.clone(),
+                            exclude_tool_noise: filters.exclude_tool_noise,
+                            exclude_tool_names_count: filters.exclude_tool_names.len(),
+                            exclude_tool_names_sha256: sensitive_digest(
+                                "exclude_tool_names",
+                                &filters.exclude_tool_names,
+                            ),
+                            file_present: filters.file.is_some(),
+                            file_sha256: sensitive_digest("file", &filters.file),
+                            exclude_provider_session_present: filters
+                                .exclude_provider_session
+                                .is_some(),
+                            exclude_provider_session_sha256: sensitive_digest(
+                                "exclude_provider_session",
+                                &filters.exclude_provider_session,
+                            ),
+                        },
+                        result_mode: options.result_mode,
+                        match_mode: options.match_mode,
+                    }),
+                }
+            }
+            EvidenceSelector::EventIds { event_ids } => EvidenceSelectorBindingV1::EventIds {
+                event_ids_count: event_ids.len(),
+                event_ids_sha256: sensitive_digest("event_ids", event_ids),
+            },
+        };
+        Self {
+            kind: "evidence_selector",
+            query_revision: QUERY_REVISION,
+            schema_version: QUERY_DTO_SCHEMA_VERSION,
+            evidence_schema_version: EVIDENCE_SELECTOR_SCHEMA_VERSION,
+            search_packet_schema_version: SEARCH_PACKET_SCHEMA_VERSION,
+            selector,
+            limit: request.limit,
+            fields: request.fields,
+            byte_policy: request.byte_policy,
+            artifact_bytes: request.artifact_bytes,
+            format: request.format,
+            refresh: request.refresh,
+            include_current_session: request.include_current_session,
+            work: evidence_work_bounds(request),
+        }
+    }
+}
+
+fn sensitive_digest<T: Serialize + ?Sized>(group: &str, value: &T) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"ctx-evidence-request-binding-v1\0");
+    hasher.update(group.as_bytes());
+    hasher.update([0]);
+    // All request DTO members used here are infallibly serializable.
+    hasher.update(serde_json::to_vec(value).expect("request binding value serializes"));
+    format!("sha256:{:x}", hasher.finalize())
+}
+
 fn default_include_current_session() -> bool {
     true
 }
@@ -762,6 +948,12 @@ pub struct EvidenceSelectionPageV1 {
     pub search_truncation: Option<EvidenceSearchTruncationV1>,
     pub continuation: Option<EvidenceContinuationV1>,
     pub format: EvidenceFormat,
+    #[serde(skip)]
+    pub request_binding: EvidenceRequestBindingV1,
+    #[serde(skip)]
+    pub request_hash: String,
+    #[serde(skip)]
+    pub snapshot_fingerprint: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -942,6 +1134,8 @@ pub struct EventPageV1 {
     pub pagination: PaginationV1,
     pub bytes: PageBytesV1,
     pub fields: FieldSet,
+    #[serde(skip)]
+    pub snapshot_fingerprint: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1142,6 +1336,8 @@ pub struct SearchPageV1 {
     pub pagination: PaginationV1,
     pub bytes: PageBytesV1,
     pub fields: FieldSet,
+    #[serde(skip)]
+    pub snapshot_fingerprint: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1516,6 +1712,7 @@ impl<'a> QueryService<'a> {
                 item_text_truncated,
             },
             fields,
+            snapshot_fingerprint: snapshot,
         })
     }
 
@@ -1667,7 +1864,7 @@ impl<'a> QueryService<'a> {
                 v: QUERY_DTO_SCHEMA_VERSION,
                 kind: token_kind.to_owned(),
                 request,
-                snapshot,
+                snapshot: snapshot.clone(),
                 offset: u64::try_from(next_offset).map_err(|_| QueryError::ArithmeticOverflow)?,
                 seq: None,
                 id: None,
@@ -1715,6 +1912,7 @@ impl<'a> QueryService<'a> {
                 item_text_truncated,
             },
             fields,
+            snapshot_fingerprint: snapshot.clone(),
         })
     }
 
@@ -1728,7 +1926,7 @@ impl<'a> QueryService<'a> {
         let request = request.canonicalized()?;
         let request_hash = evidence_request_hash(&request.without_continuation())?;
         let continuation = request.continuation.as_deref();
-        match &request.selector {
+        let mut page = match &request.selector {
             EvidenceSelector::SessionPage {
                 ctx_session_id,
                 mode,
@@ -1737,7 +1935,7 @@ impl<'a> QueryService<'a> {
                 *ctx_session_id,
                 *mode,
                 continuation,
-                request_hash,
+                request_hash.clone(),
             ),
             EvidenceSelector::SearchPage {
                 query,
@@ -1749,12 +1947,15 @@ impl<'a> QueryService<'a> {
                 terms,
                 options,
                 continuation,
-                request_hash,
+                request_hash.clone(),
             ),
             EvidenceSelector::EventIds { event_ids } => {
-                self.select_evidence_events(&request, event_ids, continuation, request_hash)
+                self.select_evidence_events(&request, event_ids, continuation, request_hash.clone())
             }
-        }
+        }?;
+        page.request_binding = EvidenceRequestBindingV1::from_request(&request);
+        page.request_hash = request_hash;
+        Ok(page)
     }
 
     /// Select and normalize through the only public evidence output boundary.
@@ -1788,7 +1989,7 @@ impl<'a> QueryService<'a> {
             continuation,
             request.fields,
             request.byte_policy,
-            request_hash,
+            request_hash.clone(),
             "evidence_session_page",
         )?;
         let admitted_event_ids = page
@@ -1831,6 +2032,9 @@ impl<'a> QueryService<'a> {
             search_truncation: None,
             continuation,
             format: request.format,
+            request_binding: EvidenceRequestBindingV1::from_request(request),
+            request_hash: String::new(),
+            snapshot_fingerprint: page.snapshot_fingerprint,
         })
     }
 
@@ -1851,7 +2055,7 @@ impl<'a> QueryService<'a> {
             continuation,
             request.fields,
             request.byte_policy,
-            request_hash,
+            request_hash.clone(),
             "evidence_search_page",
         )?;
         let search_truncation = EvidenceSearchTruncationV1 {
@@ -1952,6 +2156,9 @@ impl<'a> QueryService<'a> {
             search_truncation: Some(search_truncation),
             continuation,
             format: request.format,
+            request_binding: EvidenceRequestBindingV1::from_request(request),
+            request_hash: String::new(),
+            snapshot_fingerprint: page.snapshot_fingerprint,
         })
     }
 
@@ -2105,7 +2312,7 @@ impl<'a> QueryService<'a> {
                 v: QUERY_DTO_SCHEMA_VERSION,
                 kind: "evidence_event_ids".to_owned(),
                 request: request_hash,
-                snapshot,
+                snapshot: snapshot.clone(),
                 offset: u64::try_from(next_offset).map_err(|_| QueryError::ArithmeticOverflow)?,
                 seq: None,
                 id: None,
@@ -2153,6 +2360,9 @@ impl<'a> QueryService<'a> {
             search_truncation: None,
             continuation,
             format: request.format,
+            request_binding: EvidenceRequestBindingV1::from_request(request),
+            request_hash: String::new(),
+            snapshot_fingerprint: snapshot,
         })
     }
 
@@ -5767,6 +5977,86 @@ mod tests {
     }
 
     #[test]
+    fn evidence_session_pages_render_with_event_only_selected_totals() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("work.sqlite");
+        let (session, _) = transcript_fixture(&path);
+        let store = Store::open_read_only(&path).unwrap();
+
+        for format in [EvidenceFormat::Jsonl, EvidenceFormat::Markdown] {
+            let request = EvidenceSelectorRequest {
+                selector: EvidenceSelector::SessionPage {
+                    ctx_session_id: session.id,
+                    mode: TranscriptMode::Log,
+                },
+                limit: 8,
+                fields: FieldSet::Compact,
+                format,
+                ..EvidenceSelectorRequest::default()
+            };
+            let first = QueryService::new(&store).evidence(request).unwrap();
+            assert_eq!(first.selected_total, Some(9));
+            assert_eq!(first.pagination.returned_items, 8);
+            assert_eq!(first.records.len(), 9, "session envelope is additional");
+            assert_eq!(first.omitted.before + 8 + first.omitted.after, 9);
+            assert!(first.continuation.is_some());
+            let rendered = render_evidence(&first).unwrap();
+            assert!(!rendered.is_empty());
+            if format == EvidenceFormat::Jsonl {
+                let lines: Vec<serde_json::Value> = rendered
+                    .split(|byte| *byte == b'\n')
+                    .filter(|line| !line.is_empty())
+                    .map(|line| serde_json::from_slice(line).unwrap())
+                    .collect();
+                let event_count = lines
+                    .iter()
+                    .filter(|line| line["record_type"] == "event")
+                    .count();
+                assert_eq!(lines[0]["counts"]["returned"], event_count);
+                assert_eq!(lines.last().unwrap()["counts"]["returned"], event_count);
+                assert_eq!(
+                    lines
+                        .iter()
+                        .filter(|line| line["record_type"] == "session")
+                        .count(),
+                    1
+                );
+            }
+
+            let terminal = QueryService::new(&store)
+                .evidence(first.continuation.unwrap().next_arguments)
+                .unwrap();
+            assert_eq!(terminal.selected_total, Some(9));
+            assert_eq!(terminal.pagination.returned_items, 1);
+            assert_eq!(terminal.records.len(), 2);
+            assert_eq!(terminal.omitted.before + 1 + terminal.omitted.after, 9);
+            assert!(terminal.continuation.is_none());
+            let rendered = render_evidence(&terminal).unwrap();
+            assert!(!rendered.is_empty());
+            if format == EvidenceFormat::Jsonl {
+                let lines: Vec<serde_json::Value> = rendered
+                    .split(|byte| *byte == b'\n')
+                    .filter(|line| !line.is_empty())
+                    .map(|line| serde_json::from_slice(line).unwrap())
+                    .collect();
+                let event_count = lines
+                    .iter()
+                    .filter(|line| line["record_type"] == "event")
+                    .count();
+                assert_eq!(lines[0]["counts"]["returned"], event_count);
+                assert_eq!(lines.last().unwrap()["counts"]["returned"], event_count);
+                assert_eq!(
+                    lines
+                        .iter()
+                        .filter(|line| line["record_type"] == "session")
+                        .count(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
     fn evidence_event_ids_are_sorted_bounded_and_fail_closed() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("work.sqlite");
@@ -6738,6 +7028,138 @@ mod tests {
             let variant_hash = hash(&variant);
             assert_ne!(variant_hash, base_hash);
             assert!(hashes.insert(variant_hash));
+        }
+    }
+
+    #[test]
+    fn rendered_request_binding_hides_sensitive_selectors_and_binds_each_group() {
+        const SENTINEL: &str = "HOSTILE_PRIVATE_SELECTOR_SENTINEL";
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("work.sqlite");
+        drop(Store::open(&path).unwrap());
+        let store = Store::open_read_only(&path).unwrap();
+
+        let hostile_session = Uuid::from_u128(0xfeed_face);
+        let hostile_event = Uuid::from_u128(0xdead_beef);
+        let hostile_options = PacketOptions {
+            filters: SearchFilters {
+                session: Some(hostile_session),
+                provider: Some(CaptureProvider::Codex),
+                history_source: Some(format!("{SENTINEL}-history")),
+                provider_key: Some(format!("{SENTINEL}-provider-key")),
+                source_id: Some(format!("{SENTINEL}-source-id")),
+                source_format: Some(format!("{SENTINEL}-source-format")),
+                repo: Some(format!("/private/{SENTINEL}/workspace")),
+                since: Some(fixed_time()),
+                exclude_tool_names: vec![format!("{SENTINEL}-tool")],
+                file: Some(format!("/private/{SENTINEL}/file.rs")),
+                exclude_provider_session: Some(ProviderSessionFilter {
+                    provider: CaptureProvider::Codex,
+                    provider_session_id: format!("{SENTINEL}-provider-session"),
+                    session_id: Some(hostile_session),
+                }),
+                ..SearchFilters::default()
+            },
+            ..PacketOptions::default()
+        };
+        for format in [EvidenceFormat::Jsonl, EvidenceFormat::Markdown] {
+            let page = QueryService::new(&store)
+                .evidence(EvidenceSelectorRequest {
+                    selector: EvidenceSelector::SearchPage {
+                        query: format!("{SENTINEL}-query"),
+                        terms: vec![format!("{SENTINEL}-term")],
+                        options: Box::new(hostile_options.clone()),
+                    },
+                    limit: 1,
+                    format,
+                    ..EvidenceSelectorRequest::default()
+                })
+                .unwrap();
+            let output = render_evidence(&page).unwrap();
+            let text = String::from_utf8(output).unwrap();
+            assert!(!text.contains(SENTINEL));
+            assert!(!text.contains(&hostile_session.to_string()));
+            assert!(text.contains("sha256:"));
+        }
+
+        let base = EvidenceSelectorRequest {
+            selector: EvidenceSelector::SearchPage {
+                query: "base-no-match".into(),
+                terms: vec![],
+                options: Box::new(PacketOptions::default()),
+            },
+            limit: 1,
+            ..EvidenceSelectorRequest::default()
+        };
+        let mut variants = Vec::new();
+        let mut query = base.clone();
+        if let EvidenceSelector::SearchPage { query, .. } = &mut query.selector {
+            *query = "changed-query".into();
+        }
+        variants.push(query);
+        let mut terms = base.clone();
+        if let EvidenceSelector::SearchPage { terms, .. } = &mut terms.selector {
+            terms.push("changed-term".into());
+        }
+        variants.push(terms);
+        type Mutation = Box<dyn Fn(&mut SearchFilters)>;
+        for mutate in <Vec<Mutation>>::from([
+            Box::new(|f: &mut SearchFilters| f.session = Some(Uuid::from_u128(11))) as Mutation,
+            Box::new(|f| f.history_source = Some("changed-source".into())),
+            Box::new(|f| f.repo = Some("/changed/workspace".into())),
+            Box::new(|f| f.since = Some(fixed_time())),
+            Box::new(|f| f.exclude_tool_names = vec!["changed-tool".into()]),
+            Box::new(|f| f.file = Some("/changed/file".into())),
+            Box::new(|f| {
+                f.exclude_provider_session = Some(ProviderSessionFilter {
+                    provider: CaptureProvider::Codex,
+                    provider_session_id: "changed-provider-session".into(),
+                    session_id: None,
+                })
+            }),
+        ]) {
+            let mut request = base.clone();
+            if let EvidenceSelector::SearchPage { options, .. } = &mut request.selector {
+                mutate(&mut options.filters);
+            }
+            variants.push(request);
+        }
+        let bundle = |request| {
+            let page = QueryService::new(&store).evidence(request).unwrap();
+            let rendered = render_jsonl(&page).unwrap();
+            let manifest: serde_json::Value =
+                serde_json::from_slice(rendered.split(|byte| *byte == b'\n').next().unwrap())
+                    .unwrap();
+            manifest["bundle_id"].as_str().unwrap().to_owned()
+        };
+        let base_bundle = bundle(base);
+        let mut ids = std::collections::HashSet::from([base_bundle.clone()]);
+        for variant in variants {
+            let id = bundle(variant);
+            assert_ne!(id, base_bundle);
+            assert!(ids.insert(id));
+        }
+
+        // Explicit-ID and session selectors are also represented only by digests.
+        for selector in [
+            EvidenceSelector::EventIds {
+                event_ids: vec![hostile_event],
+            },
+            EvidenceSelector::SessionPage {
+                ctx_session_id: hostile_session,
+                mode: TranscriptMode::Log,
+            },
+        ] {
+            let binding = serde_json::to_string(&EvidenceRequestBindingV1::from_request(
+                &EvidenceSelectorRequest {
+                    selector,
+                    ..EvidenceSelectorRequest::default()
+                },
+            ))
+            .unwrap();
+            assert!(!binding.contains(&hostile_event.to_string()));
+            assert!(!binding.contains(&hostile_session.to_string()));
+            assert!(binding.contains("sha256:"));
         }
     }
 

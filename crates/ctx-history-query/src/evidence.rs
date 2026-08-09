@@ -32,9 +32,19 @@ pub struct NormalizedEvidencePageV1 {
     pub records: Vec<EvidenceRecordV1>,
     pub omitted: OmittedCountsV1,
     pub pagination: PaginationV1,
+    pub selected_total: Option<usize>,
+    pub retained_pool_total: Option<usize>,
+    pub corpus_count: Option<EvidenceCountV1>,
+    pub search_truncation: Option<EvidenceSearchTruncationV1>,
+    pub work: EvidenceWorkBoundsV1,
+    pub page_budget_exhausted: bool,
     pub selector_item_json_bytes: usize,
     pub normalized_item_json_bytes: usize,
     pub continuation: Option<EvidenceContinuationV1>,
+    pub format: EvidenceFormat,
+    pub request_binding: EvidenceRequestBindingV1,
+    pub request_hash: String,
+    pub snapshot_fingerprint: String,
 }
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "record_type", rename_all = "snake_case")]
@@ -267,6 +277,22 @@ pub(crate) fn normalize_evidence(
             return Err(EvidenceError::NextArgumentsLimit);
         }
     }
+    for value in [&page.request_hash, &page.snapshot_fingerprint] {
+        if value.is_empty() || value.len() > MAX_METADATA_BYTES {
+            return Err(EvidenceError::StringLimit);
+        }
+    }
+    let recomputed_item_json_bytes = records.iter().try_fold(0usize, |total, record| {
+        let value = serde_json::to_vec(record)
+            .map_err(|_| EvidenceError::Serialization)?
+            .len();
+        total
+            .checked_add(value)
+            .ok_or(EvidenceError::ArithmeticOverflow)
+    })?;
+    if recomputed_item_json_bytes != bytes {
+        return Err(EvidenceError::ArithmeticOverflow);
+    }
     Ok(NormalizedEvidencePageV1 {
         schema_version: 1,
         domain: page.domain,
@@ -274,9 +300,19 @@ pub(crate) fn normalize_evidence(
         records,
         omitted: page.omitted,
         pagination: page.pagination,
+        selected_total: page.selected_total,
+        retained_pool_total: page.retained_pool_total,
+        corpus_count: page.corpus_count,
+        search_truncation: page.search_truncation,
+        work: page.work,
+        page_budget_exhausted: page.bytes.page_budget_exhausted,
         selector_item_json_bytes: page.bytes.item_json_bytes,
-        normalized_item_json_bytes: bytes,
+        normalized_item_json_bytes: recomputed_item_json_bytes,
         continuation: page.continuation,
+        format: page.format,
+        request_binding: page.request_binding,
+        request_hash: page.request_hash,
+        snapshot_fingerprint: page.snapshot_fingerprint,
     })
 }
 fn stamp(v: DateTime<Utc>) -> String {
@@ -747,6 +783,15 @@ mod tests {
         search_source_identity: Vec<EvidenceSearchSourceIdentityV1>,
         continuation: Option<EvidenceContinuationV1>,
     ) -> EvidenceSelectionPageV1 {
+        let request = EvidenceSelectorRequest {
+            selector: EvidenceSelector::EventIds { event_ids: vec![] },
+            byte_policy: BytePolicy {
+                per_item_bytes: 4096,
+                page_bytes: 4096,
+            },
+            artifact_bytes: 4096,
+            ..EvidenceSelectorRequest::default()
+        };
         EvidenceSelectionPageV1 {
             schema_version: 1,
             domain: "test",
@@ -780,8 +825,8 @@ mod tests {
             },
             work: EvidenceWorkBoundsV1 {
                 selector_limit: 1,
-                explicit_event_id_limit: 1,
-                search_candidate_limit: 1,
+                explicit_event_id_limit: MAX_EVIDENCE_EVENT_IDS,
+                search_candidate_limit: ctx_history_search::MAX_RESULT_LIMIT,
                 per_item_bytes: 4096,
                 page_bytes: 4096,
                 artifact_bytes: 4096,
@@ -789,6 +834,9 @@ mod tests {
             search_truncation: None,
             continuation,
             format: EvidenceFormat::Jsonl,
+            request_binding: EvidenceRequestBindingV1::from_request(&request),
+            request_hash: "request-hash".into(),
+            snapshot_fingerprint: "snapshot-fingerprint".into(),
         }
     }
 

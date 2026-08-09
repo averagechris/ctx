@@ -272,6 +272,14 @@ validates every field and byte cap, and either returns a complete normalized
 record or a fail-closed error. A renderer has no database handle and no access
 to the unsanitized input.
 
+The normalized page also carries a closed `EvidenceRequestBindingV1`, the
+actual #277 request hash, and the actual opaque snapshot fingerprint captured
+while selecting the page. The binding contains the canonical selector,
+effective filters and repeated terms, fields, byte policy, format, refresh, and
+all work bounds; it contains no raw payload, source object, path, cursor, or
+open metadata. These values are part of the manifest and bundle identity even
+for a first page that has no continuation token.
+
 The evidence types have no `flatten`, open metadata map, cursor field, raw
 payload field, filesystem probe result, or provider-specific extension point in
 v1. Additive future fields require a new evidence schema version or an
@@ -500,9 +508,11 @@ The first successful record is `manifest`:
   "private": true,
   "share_safe": false,
   "bundle_id": "sha256:<64 lowercase hex>",
+  "request_binding": { "kind": "evidence_selector", "selector": { "domain": "...", "...": "structural policy and opaque digests" },
+  "request_hash": "<opaque #277 request hash>",
   "selector": { "domain": "session_page|search_page|event_ids", "...": "canonical request" },
   "ordering": "session_seq_id_asc|search_ranked_v1|event_occurred_at_id_asc",
-  "snapshot": { "schema_version": 1002, "query_revision": 1 },
+  "snapshot": { "schema_version": 1002, "query_revision": 1, "fingerprint": "<opaque #277 snapshot fingerprint>" },
   "counts": {
     "selected_total": 0,
     "retained_pool_total": null,
@@ -519,10 +529,21 @@ The first successful record is `manifest`:
 }
 ```
 
-`bundle_id` is derived from the contract version, canonical request, and
-opaque snapshot fingerprint; it is stable when the same page is replayed and
-does not expose request text or paths. The snapshot object is deliberately
-descriptive and path-free; the opaque token carries the actual fingerprint.
+`request_binding` is a closed normalized value, not a query DTO. It includes
+the selector domain; modes, roles, event/tool policies, counts and presence;
+fields; per-item/page/artifact byte policy; limit; output format; refresh mode;
+and the effective current-session rule. Sensitive selector groups are bound by
+domain-separated deterministic SHA-256 digests. Raw query/term text, stable
+selector IDs, provider/history/source/provider-session identity, tool-name
+values, timestamps, workspace/repository/file paths, cursors, payloads, source
+objects, and arbitrary metadata are never serialized in the binding.
+`request_hash` and `snapshot.fingerprint` are the actual opaque values captured
+by the selector/query layer; they are not renderer-generated stand-ins.
+`bundle_id` binds the canonical original request through that trusted request
+hash plus the structural/digested binding, snapshot fingerprint, normalized
+records, and continuation data. It is stable when the same page is replayed,
+distinguishes changes to sensitive request groups, and does not expose their
+values.
 There is intentionally no generation-time field: source/session/event times
 are the only timestamps in the artifact, and are normalized to stored
 millisecond precision.
@@ -533,7 +554,10 @@ search-only `retained_pool_total`/`corpus_count` fields are null. For
 and `corpus_count` uses the exact/lower-bound form defined above.
 
 `session_page` writes one `session` record followed by event records. The
-session record uses the evidence-safe normalized session projection.
+session envelope is additional: `selected_total`, `returned`, and omitted
+accounting count events only, so `omitted_before + returned + omitted_after ==
+selected_total`. The session record uses the evidence-safe normalized session
+projection.
 `search_page` writes one `result` record per admitted normalized search
 projection. `event_ids` writes one normalized event record per admitted event.
 The projections retain stable ID names (`ctx_session_id`, `ctx_event_id`,
@@ -717,6 +741,19 @@ manifest/completion records, and next arguments. It must not emit a prefix and
 then discover `artifact_limit`. Staging is capped at 16 MiB plus a fixed
 constant for the write syscall; an over-limit artifact fails before output and
 before creating an output target.
+
+The renderer validates normalized-page invariants before either format is
+rendered: `pagination.returned_items` equals the selected item-record count;
+for `session_page`, the one session envelope is additional and excluded,
+`has_more` is equivalent to continuation presence, pagination and replay
+tokens agree, normalized record JSON bytes recompute to the carried accounting,
+domain count fields are mutually exclusive and consistent, selector/page/work
+limits match the closed request binding, and session/search/event record kinds
+match the selector domain. Completion counts and byte summaries are derived
+from the validated records rather than contradictory carried values. Markdown
+uses a counting pass followed by a cap-enforced writing pass; neither pass can
+allocate beyond the artifact cap apart from bounded scalar formatting
+temporaries.
 
 ## Atomic private output
 

@@ -7221,7 +7221,7 @@ mod tests {
             first_typed.stable_projection(),
             second_typed.stable_projection()
         );
-        assert_eq!(first["schema_version"], 1);
+        assert_eq!(first["schema_version"], 2);
         assert_eq!(first["profile"], "ctx-large-index-profile");
         assert_eq!(first["config"], second["config"]);
         assert_eq!(first["achieved"], second["achieved"]);
@@ -7316,16 +7316,51 @@ mod tests {
                 .as_array()
                 .unwrap()
             {
-                let accounted = sample["filter_source_preparation_ms"].as_f64().unwrap()
-                    + sample["execution_candidate_paging_and_base_context_hydration_ms"]
-                        .as_f64()
-                        .unwrap()
-                    + sample["result_assembly_clustering_sorting_projection_ms"]
-                        .as_f64()
-                        .unwrap()
-                    + sample["unattributed_overhead_ms"].as_f64().unwrap();
-                assert!((accounted - sample["end_to_end_ms"].as_f64().unwrap()).abs() < 0.002);
+                let sample: SearchPhaseEvidence = serde_json::from_value(sample.clone()).unwrap();
+                assert!(sample.reconciles());
             }
+        }
+        let ranked = &artifact["measurements"]["ranked_fts_hydration"];
+        assert_eq!(
+            artifact["measurements"]["ranked_fts_attribution_revision"],
+            1
+        );
+        assert_eq!(ranked["attribution_route"], "fallback_ranked_fts");
+        assert_eq!(
+            ranked["production_reference"],
+            "production_ranked_fts_fallback"
+        );
+        assert_eq!(ranked["default_filtered_route"], "fallback_ranked_fts");
+        assert_eq!(ranked["ticket_qualified"], false);
+        assert_eq!(ranked["samples"].as_array().unwrap().len(), 5);
+        assert_eq!(ranked["candidate_ids_preserved"], true);
+        assert_eq!(ranked["candidate_order_preserved"], true);
+        assert_eq!(ranked["candidate_digests_preserved"], true);
+        for sample in ranked["samples"].as_array().unwrap() {
+            assert!(sample["selected_candidate_count"].as_u64().unwrap() > 0);
+            assert_eq!(
+                sample["candidate_record_digest"],
+                digest_strings(
+                    sample["candidate_record_ids"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|id| id.as_str().unwrap().to_owned())
+                        .collect::<Vec<_>>()
+                        .as_slice()
+                )
+            );
+            assert_eq!(
+                sample["result_digest"],
+                digest_strings(
+                    &sample["result_ids"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|id| id.as_str().unwrap().to_owned())
+                        .collect::<Vec<_>>()
+                )
+            );
         }
     }
 
@@ -7420,7 +7455,7 @@ mod tests {
             .remove("result_digest");
         assert!(parse_artifact_v1(missing).is_err());
         let mut wrong_version = valid.clone();
-        wrong_version["schema_version"] = serde_json::json!(2);
+        wrong_version["schema_version"] = serde_json::json!(3);
         assert!(parse_artifact_v1(wrong_version)
             .unwrap_err()
             .contains("schema_version"));
@@ -7434,6 +7469,51 @@ mod tests {
         assert!(parse_artifact_v1(inconsistent)
             .unwrap_err()
             .contains("counts"));
+
+        let mut missing_ranked = valid.clone();
+        missing_ranked["measurements"]
+            .as_object_mut()
+            .unwrap()
+            .remove("ranked_fts_hydration");
+        assert!(parse_artifact_v1(missing_ranked)
+            .unwrap_err()
+            .contains("missing ranked FTS attribution"));
+
+        let mut unsupported_revision = valid.clone();
+        unsupported_revision["measurements"]["ranked_fts_attribution_revision"] =
+            serde_json::json!(2);
+        assert!(parse_artifact_v1(unsupported_revision)
+            .unwrap_err()
+            .contains("unsupported ranked FTS attribution revision"));
+
+        let mut missing_revision = valid.clone();
+        missing_revision["measurements"]
+            .as_object_mut()
+            .unwrap()
+            .remove("ranked_fts_attribution_revision");
+        assert!(parse_artifact_v1(missing_revision)
+            .unwrap_err()
+            .contains("missing ranked FTS attribution revision"));
+
+        let mut wrong_route = valid.clone();
+        wrong_route["measurements"]["ranked_fts_hydration"]["attribution_route"] =
+            serde_json::json!("fast_event");
+        assert!(parse_artifact_v1(wrong_route)
+            .unwrap_err()
+            .contains("route attribution mismatch"));
+
+        let mut mismatched_phase_route = valid.clone();
+        mismatched_phase_route["measurements"]["filtered_search_phases"]["samples"][0]["path"] =
+            serde_json::json!("fast_event");
+        assert!(parse_artifact_v1(mismatched_phase_route)
+            .unwrap_err()
+            .contains("route attribution mismatch"));
+
+        let mut manual_without_five = valid.clone();
+        manual_without_five["mode"] = serde_json::json!("manual");
+        assert!(parse_artifact_v1(manual_without_five)
+            .unwrap_err()
+            .contains("exactly five warm samples"));
 
         for malformed in [serde_json::json!(-0.001), serde_json::json!(f64::MAX)] {
             let mut malformed_timing = valid.clone();
@@ -7450,6 +7530,27 @@ mod tests {
             .unwrap()
             .remove("filtered_search_phases");
         assert!(parse_artifact_v1(incomplete_current)
+            .unwrap_err()
+            .contains("incomplete current search phase evidence"));
+
+        let mut stripped_current = run_streaming_large_profile(&LargeProfileConfig::smoke(
+            temp.path().join("stripped-current"),
+        ))
+        .unwrap();
+        stripped_current["environment"]
+            .as_object_mut()
+            .unwrap()
+            .remove("command");
+        let measurements = stripped_current["measurements"].as_object_mut().unwrap();
+        for field in [
+            "ordinary_search_phases",
+            "filtered_search_phases",
+            "ranked_fts_attribution_revision",
+            "ranked_fts_hydration",
+        ] {
+            measurements.remove(field);
+        }
+        assert!(parse_artifact_v1(stripped_current)
             .unwrap_err()
             .contains("incomplete current search phase evidence"));
     }
@@ -7595,6 +7696,17 @@ mod tests {
     fn streaming_large_profile_enforces_manual_target_and_release() {
         let temp = tempdir();
         let mut cfg = LargeProfileConfig::manual(temp.path().join("manual"));
+        assert_eq!(cfg.measurement_repeats, 5);
+        assert_eq!(
+            LargeProfileConfig::smoke(temp.path().join("smoke")).measurement_repeats,
+            1
+        );
+        let mut invalid_repeats = cfg.clone();
+        invalid_repeats.release_build = true;
+        invalid_repeats.measurement_repeats = 4;
+        assert!(run_streaming_large_profile(&invalid_repeats)
+            .unwrap_err()
+            .contains("exactly five warm samples"));
         cfg.release_build = false;
         assert!(run_streaming_large_profile(&cfg)
             .unwrap_err()
@@ -7671,7 +7783,7 @@ mod tests {
                 min_footprint_bytes: env_u64("CTX_LARGE_PROFILE_MIN_FOOTPRINT_BYTES")
                     .unwrap_or(10 * 1024 * 1024 * 1024),
                 measurement_repeats: env_usize("CTX_LARGE_PROFILE_MEASUREMENT_REPEATS")
-                    .unwrap_or(1)
+                    .unwrap_or(5)
                     .clamp(1, 20),
             }
         }
@@ -7723,6 +7835,9 @@ mod tests {
             .ok_or("batch bound overflow")?;
         if cfg.manual && !cfg.release_build {
             return Err("manual large profile requires --release".into());
+        }
+        if cfg.manual && cfg.measurement_repeats != 5 {
+            return Err("manual ranked FTS evidence requires exactly five warm samples".into());
         }
         let out = prepare_profile_output(cfg)?;
         let db = out.join("synthetic-large-profile.sqlite");
@@ -7803,6 +7918,10 @@ mod tests {
         let mut filtered_samples = Vec::with_capacity(cfg.measurement_repeats);
         let mut warm_phase_samples = Vec::with_capacity(cfg.measurement_repeats);
         let mut filtered_phase_samples = Vec::with_capacity(cfg.measurement_repeats);
+        let mut ranked_fts_hydration_samples = Vec::with_capacity(cfg.measurement_repeats);
+        let mut ranked_fts_hydration_reference: Option<RankedFtsHydrationIdentity> = None;
+        let ranked_fts_production_reference =
+            ranked_fts_production_identity(&store, "perfneedle", &filtered_opts)?;
         let mut warm = None;
         let mut filt = None;
         for _ in 0..cfg.measurement_repeats {
@@ -7823,25 +7942,60 @@ mod tests {
 
             let measured = measured_profile_search(&store, "perfneedle", &filtered_opts)?;
             let current = measured.packet;
+            let current_result_ids = result_ids(&current);
             filtered_samples.push(measured.phases.end_to_end_ms);
             filtered_phase_samples.push(measured.phases);
             if current.results.is_empty() {
                 return Err("filtered search results must be nonempty".into());
             }
             if let Some(first) = &filt {
-                if result_ids(first) != result_ids(&current) {
+                if result_ids(first) != current_result_ids {
                     return Err("filtered search ordering changed between samples".into());
                 }
             } else {
                 filt = Some(current);
             }
+
+            let two_stage = measured_ranked_fts_hydration(&store, "perfneedle", &filtered_opts)?;
+            if two_stage.identity != ranked_fts_production_reference {
+                return Err(
+                    "ranked FTS two-stage IDs/order/digests differ from production fallback".into(),
+                );
+            }
+            if let Some(reference) = &ranked_fts_hydration_reference {
+                if reference != &two_stage.identity {
+                    return Err(
+                        "ranked FTS two-stage candidate IDs/order/digests changed between samples"
+                            .into(),
+                    );
+                }
+            } else {
+                ranked_fts_hydration_reference = Some(two_stage.identity.clone());
+            }
+            ranked_fts_hydration_samples.push(two_stage);
         }
         let warm = warm.unwrap();
         let filt = filt.unwrap();
         let warm_stats = timing_stats(&warm_samples);
         let filt_stats = timing_stats(&filtered_samples);
+        let default_filtered_route = filtered_phase_samples
+            .first()
+            .map(|sample| sample.path.clone())
+            .ok_or("filtered search phase samples must not be empty")?;
+        if filtered_phase_samples
+            .iter()
+            .any(|sample| sample.path != default_filtered_route)
+        {
+            return Err("default filtered search route changed between samples".into());
+        }
         let warm_phase_stats = search_phase_stats(warm_phase_samples);
         let filtered_phase_stats = search_phase_stats(filtered_phase_samples);
+        let ranked_fts_hydration_stats = ranked_fts_hydration_stats(
+            ranked_fts_hydration_samples,
+            default_filtered_route,
+            digest_strings(&result_ids(&filt)),
+            cfg.manual,
+        )?;
         let middle_id = synthetic_event_id(imported / 2, cfg.seed)?;
         let window_started = std::time::Instant::now();
         let window = bounded_event_window(&store, middle_id, 1, 1)?;
@@ -7873,7 +8027,7 @@ mod tests {
             ));
         }
         let artifact = serde_json::json!({
-            "schema_version": 1, "profile": "ctx-large-index-profile", "mode": if cfg.manual {"manual"} else {"smoke"},
+            "schema_version": 2, "profile": "ctx-large-index-profile", "mode": if cfg.manual {"manual"} else {"smoke"},
             "requested": {"baseline_events": cfg.total_events, "min_footprint_bytes": cfg.min_footprint_bytes, "min_footprint_override_env": std::env::var("CTX_LARGE_PROFILE_MIN_FOOTPRINT_BYTES").ok()},
             "achieved": {"baseline_events": imported, "baseline_records": records, "incremental_events": inc.events.len(), "incremental_records": inc.records.len()},
             "config": {"seed": cfg.seed, "events_per_record": cfg.events_per_record, "batch_records": cfg.batch_records, "batch_event_bound": batch_event_bound, "measurement_repeats": cfg.measurement_repeats},
@@ -7883,7 +8037,7 @@ mod tests {
             "storage": {"pre_checkpoint": pre_checkpoint.to_json(), "post_checkpoint": post_checkpoint.to_json()},
             "counts": counts.to_json(),
             "generation": {"max_batch_events": max_batch_events, "bounded_by_batch_size": true},
-            "measurements": {"initial_import_ms": initial_ms, "noop_import_ms": noop_stats.samples_ms[0], "incremental_import_ms": inc_ms, "warm_search_ms": warm_stats.samples_ms[0], "filtered_search_ms": filt_stats.samples_ms[0], "noop_replay": noop_stats.to_json(), "warm_search": warm_stats.to_json(), "filtered_search": filt_stats.to_json(), "ordinary_search_phases": warm_phase_stats, "filtered_search_phases": filtered_phase_stats, "noop_counts_unchanged": true},
+            "measurements": {"initial_import_ms": initial_ms, "noop_import_ms": noop_stats.samples_ms[0], "incremental_import_ms": inc_ms, "warm_search_ms": warm_stats.samples_ms[0], "filtered_search_ms": filt_stats.samples_ms[0], "noop_replay": noop_stats.to_json(), "warm_search": warm_stats.to_json(), "filtered_search": filt_stats.to_json(), "ordinary_search_phases": warm_phase_stats, "filtered_search_phases": filtered_phase_stats, "ranked_fts_attribution_revision": 1, "ranked_fts_hydration": ranked_fts_hydration_stats, "noop_counts_unchanged": true},
             "search": {"ordinary_result_count": warm.results.len(), "filtered_result_count": filt.results.len(), "ordered_result_ids": warm_ids, "result_digest": warm_digest, "filtered_ordered_result_ids": result_ids(&filt), "filtered_result_digest": digest_strings(&result_ids(&filt))},
             "event_window": {"target_event_id": middle_id.to_string(), "ids": window.iter().map(|e| e.id.to_string()).collect::<Vec<_>>(), "count": window.len(), "bound": 3, "contains_target": window.iter().any(|e| e.id == middle_id), "duration_ms": window_ms},
             "checkpoint": {"duration_ms": checkpoint_ms, "pre": pre_checkpoint.to_json(), "post": post_checkpoint.to_json()},
@@ -8084,6 +8238,10 @@ mod tests {
         ordinary_search_phases: Option<SearchPhaseStats>,
         #[serde(default)]
         filtered_search_phases: Option<SearchPhaseStats>,
+        #[serde(default)]
+        ranked_fts_hydration: Option<RankedFtsHydrationStats>,
+        #[serde(default)]
+        ranked_fts_attribution_revision: Option<u32>,
         noop_counts_unchanged: bool,
     }
 
@@ -8121,6 +8279,51 @@ mod tests {
         candidates_accepted: u64,
         relation_hydration_statements: u64,
         hydration_loader_statements: [u64; 2],
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct RankedFtsHydrationStats {
+        samples: Vec<RankedFtsHydrationSample>,
+        p50_ms: RankedFtsHydrationPercentiles,
+        p95_ms: RankedFtsHydrationPercentiles,
+        #[serde(default)]
+        attribution_route: String,
+        #[serde(default)]
+        production_reference: String,
+        #[serde(default)]
+        default_filtered_route: String,
+        #[serde(default)]
+        default_filtered_result_digest: String,
+        #[serde(default)]
+        ticket_qualified: bool,
+        candidate_ids_preserved: bool,
+        candidate_order_preserved: bool,
+        candidate_digests_preserved: bool,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct RankedFtsHydrationSample {
+        selection_ms: f64,
+        hydration_ms: f64,
+        unattributed_overhead_ms: f64,
+        end_to_end_ms: f64,
+        selected_candidate_count: usize,
+        selected_candidate_digest: String,
+        candidate_record_ids: Vec<String>,
+        candidate_record_digest: String,
+        result_ids: Vec<String>,
+        result_digest: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct RankedFtsHydrationPercentiles {
+        selection_ms: f64,
+        hydration_ms: f64,
+        unattributed_overhead_ms: f64,
+        end_to_end_ms: f64,
     }
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -8218,7 +8421,7 @@ mod tests {
         }
 
         fn validate(&self) -> std::result::Result<(), String> {
-            if self.schema_version != 1 {
+            if !matches!(self.schema_version, 1 | 2) {
                 return Err("wrong schema_version".into());
             }
             if self.profile != "ctx-large-index-profile" {
@@ -8263,12 +8466,13 @@ mod tests {
                     return Err("measurement repeat count mismatch".into());
                 }
             }
+            let current_format = self.schema_version == 2;
             let phase_sets = match (
                 self.measurements.ordinary_search_phases.as_ref(),
                 self.measurements.filtered_search_phases.as_ref(),
             ) {
-                (Some(ordinary), Some(filtered)) => Some([ordinary, filtered]),
-                (None, None) if self.environment.command.is_none() => None,
+                (Some(ordinary), Some(filtered)) if current_format => Some([ordinary, filtered]),
+                (None, None) if !current_format => None,
                 _ => return Err("incomplete current search phase evidence".into()),
             };
             for phases in phase_sets.into_iter().flatten() {
@@ -8279,6 +8483,83 @@ mod tests {
                     })
                 {
                     return Err("search phase evidence mismatch".into());
+                }
+            }
+            if let Some(revision) = self.measurements.ranked_fts_attribution_revision {
+                if revision != 1 {
+                    return Err(format!(
+                        "unsupported ranked FTS attribution revision: {revision}"
+                    ));
+                }
+                if self.measurements.ranked_fts_hydration.is_none() {
+                    return Err("current artifact is missing ranked FTS attribution".into());
+                }
+            } else if current_format {
+                return Err("current artifact is missing ranked FTS attribution revision".into());
+            }
+            if current_format
+                && (self.environment.command.is_none()
+                    || self.measurements.ordinary_search_phases.is_none()
+                    || self.measurements.filtered_search_phases.is_none()
+                    || self.measurements.ranked_fts_attribution_revision != Some(1)
+                    || self.measurements.ranked_fts_hydration.is_none())
+            {
+                return Err("schema version 2 requires current profile evidence".into());
+            }
+            if !current_format
+                && (self.environment.command.is_some()
+                    || self.measurements.ordinary_search_phases.is_some()
+                    || self.measurements.filtered_search_phases.is_some()
+                    || self.measurements.ranked_fts_attribution_revision.is_some()
+                    || self.measurements.ranked_fts_hydration.is_some())
+            {
+                return Err("schema version 1 only supports the legacy profile shape".into());
+            }
+            if let Some(ranked) = &self.measurements.ranked_fts_hydration {
+                if ranked.samples.len() != self.config.measurement_repeats
+                    || !ranked.candidate_ids_preserved
+                    || !ranked.candidate_order_preserved
+                    || !ranked.candidate_digests_preserved
+                    || ranked.samples.iter().any(|sample| {
+                        sample.candidate_record_digest
+                            != digest_strings(&sample.candidate_record_ids)
+                            || sample.result_digest != digest_strings(&sample.result_ids)
+                            || !sample.reconciles()
+                    })
+                {
+                    return Err("ranked FTS two-stage evidence mismatch".into());
+                }
+                if self.measurements.ranked_fts_attribution_revision == Some(1) {
+                    if ranked.attribution_route != "fallback_ranked_fts"
+                        || ranked.production_reference != "production_ranked_fts_fallback"
+                        || !matches!(
+                            ranked.default_filtered_route.as_str(),
+                            "fast_event" | "fallback_ranked_fts"
+                        )
+                        || ranked.default_filtered_result_digest
+                            != self.search.filtered_result_digest
+                        || self
+                            .measurements
+                            .filtered_search_phases
+                            .as_ref()
+                            .is_none_or(|phases| {
+                                phases
+                                    .samples
+                                    .iter()
+                                    .any(|sample| sample.path != ranked.default_filtered_route)
+                            })
+                    {
+                        return Err("ranked FTS route attribution mismatch".into());
+                    }
+                    if self.mode == "manual"
+                        && (self.config.measurement_repeats != 5
+                            || !ranked.ticket_qualified
+                            || ranked.samples.len() != 5)
+                    {
+                        return Err(
+                            "manual ranked FTS evidence requires exactly five warm samples".into(),
+                        );
+                    }
                 }
             }
             if self.event_window.count != self.event_window.ids.len()
@@ -10267,6 +10548,281 @@ mod tests {
             ],
         };
         Ok(MeasuredProfileSearch { packet, phases })
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RankedFtsHydrationIdentity {
+        selected_candidate_count: usize,
+        selected_candidate_digest: String,
+        candidate_record_ids: Vec<String>,
+        candidate_record_digest: String,
+        result_ids: Vec<String>,
+        result_digest: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct RankedFtsHydrationMeasurement {
+        identity: RankedFtsHydrationIdentity,
+        selection_ms: f64,
+        hydration_ms: f64,
+        unattributed_overhead_ms: f64,
+        end_to_end_ms: f64,
+    }
+
+    fn measured_ranked_fts_hydration(
+        store: &Store,
+        query: &str,
+        options: &PacketOptions,
+    ) -> std::result::Result<RankedFtsHydrationMeasurement, String> {
+        let options = normalized_options(options);
+        let file_scope = file_filter_scope(store, &options.filters).map_err(|e| e.to_string())?;
+        let plan = SearchQueryPlan::new(options.match_mode, [query]);
+        let target_candidates = options.limit.saturating_add(1);
+        let page_size = FILTERED_SEARCH_PAGE_SIZE.max(target_candidates);
+        let selection_started = std::time::Instant::now();
+        let ranked_hits = store
+            .search_record_hits_fts_plan(
+                &plan,
+                page_size.saturating_mul(FILTERED_SEARCH_MAX_PAGES),
+                0,
+            )
+            .map_err(|e| e.to_string())?
+            .ok_or("ranked FTS projection unavailable")?;
+        let selection_ms = elapsed_ms(selection_started.elapsed());
+        let selected_candidate_ids = ranked_hits
+            .iter()
+            .map(|hit| hit.record_id.to_string())
+            .collect::<Vec<_>>();
+
+        let hydration_started = std::time::Instant::now();
+        let terms = plan
+            .clauses
+            .iter()
+            .flat_map(|clause| clause.terms.clone())
+            .collect::<Vec<_>>();
+        let mut candidates = Vec::new();
+        let mut seen = BTreeSet::new();
+        for (page_index, hits) in ranked_hits.chunks(page_size).enumerate() {
+            let records = hits
+                .iter()
+                .map(|hit| store.get_record(hit.record_id))
+                .collect::<ctx_history_store::Result<Vec<_>>>()
+                .map_err(|e| e.to_string())?;
+            let page_len = records.len();
+            let page_records = records
+                .into_iter()
+                .filter(|record| {
+                    seen.insert(record.id)
+                        && file_scope.as_ref().map_or(true, |scope| {
+                            scope.history_record_ids.is_empty()
+                                || scope.history_record_ids.contains(&record.id)
+                        })
+                })
+                .collect();
+            candidates.extend(
+                candidates_for_records(
+                    store,
+                    page_records,
+                    Some(&plan),
+                    &terms,
+                    &options.filters,
+                    file_scope.as_ref(),
+                    HydrationIntent::Full,
+                )
+                .map_err(|e| e.to_string())?,
+            );
+            if candidates.len() >= target_candidates || page_len < page_size {
+                break;
+            }
+            if page_index + 1 >= FILTERED_SEARCH_MAX_PAGES {
+                break;
+            }
+        }
+        normalize_scores(&mut candidates);
+        candidates.sort_by(compare_candidates);
+        if candidates.len() > target_candidates {
+            candidates.truncate(target_candidates);
+        }
+        let hydration_ms = elapsed_ms(hydration_started.elapsed());
+        let end_to_end_ms = elapsed_ms(selection_started.elapsed());
+        let accounted_ms = selection_ms + hydration_ms;
+        let unattributed_overhead_ms = rounded((end_to_end_ms - accounted_ms).max(0.0));
+        let candidate_record_ids = candidates
+            .iter()
+            .map(|candidate| candidate.record.id.to_string())
+            .collect::<Vec<_>>();
+        let mut results = Vec::new();
+        push_candidate_results(&mut results, &candidates, query, &options);
+        let result_ids = results
+            .iter()
+            .map(|result| result.record_id.to_string())
+            .collect::<Vec<_>>();
+        Ok(RankedFtsHydrationMeasurement {
+            identity: RankedFtsHydrationIdentity {
+                selected_candidate_count: selected_candidate_ids.len(),
+                selected_candidate_digest: digest_strings(&selected_candidate_ids),
+                candidate_record_digest: digest_strings(&candidate_record_ids),
+                result_digest: digest_strings(&result_ids),
+                candidate_record_ids,
+                result_ids,
+            },
+            selection_ms,
+            hydration_ms,
+            unattributed_overhead_ms,
+            end_to_end_ms,
+        })
+    }
+
+    fn ranked_fts_production_identity(
+        store: &Store,
+        query: &str,
+        options: &PacketOptions,
+    ) -> std::result::Result<RankedFtsHydrationIdentity, String> {
+        let options = normalized_options(options);
+        let file_scope = file_filter_scope(store, &options.filters).map_err(|e| e.to_string())?;
+        let plan = SearchQueryPlan::new(options.match_mode, [query]);
+        let page_size = FILTERED_SEARCH_PAGE_SIZE.max(options.limit.saturating_add(1));
+        let selected_candidate_ids = store
+            .search_record_hits_fts_plan(
+                &plan,
+                page_size.saturating_mul(FILTERED_SEARCH_MAX_PAGES),
+                0,
+            )
+            .map_err(|e| e.to_string())?
+            .ok_or("ranked FTS projection unavailable")?
+            .into_iter()
+            .map(|hit| hit.record_id.to_string())
+            .collect::<Vec<_>>();
+        let CandidateSearch { mut candidates, .. } = ranked_candidates(
+            store,
+            Some(&plan),
+            &options,
+            file_scope.as_ref(),
+            HydrationIntent::Full,
+        )
+        .map_err(|e| e.to_string())?;
+        normalize_scores(&mut candidates);
+        candidates.sort_by(compare_candidates);
+        let target_candidates = options.limit.saturating_add(1);
+        if candidates.len() > target_candidates {
+            candidates.truncate(target_candidates);
+        }
+        let candidate_record_ids = candidates
+            .iter()
+            .map(|candidate| candidate.record.id.to_string())
+            .collect::<Vec<_>>();
+        let mut results = Vec::new();
+        push_candidate_results(&mut results, &candidates, query, &options);
+        let result_ids = results
+            .iter()
+            .map(|result| result.record_id.to_string())
+            .collect::<Vec<_>>();
+        Ok(RankedFtsHydrationIdentity {
+            selected_candidate_count: selected_candidate_ids.len(),
+            selected_candidate_digest: digest_strings(&selected_candidate_ids),
+            candidate_record_digest: digest_strings(&candidate_record_ids),
+            result_digest: digest_strings(&result_ids),
+            candidate_record_ids,
+            result_ids,
+        })
+    }
+
+    fn ranked_fts_hydration_stats(
+        samples: Vec<RankedFtsHydrationMeasurement>,
+        default_filtered_route: String,
+        default_filtered_result_digest: String,
+        manual: bool,
+    ) -> std::result::Result<RankedFtsHydrationStats, String> {
+        let Some(first) = samples.first() else {
+            return Err("ranked FTS hydration samples must not be empty".into());
+        };
+        let first_candidate_ids = first
+            .identity
+            .candidate_record_ids
+            .iter()
+            .collect::<BTreeSet<_>>();
+        let candidate_ids_preserved = samples.iter().all(|sample| {
+            sample
+                .identity
+                .candidate_record_ids
+                .iter()
+                .collect::<BTreeSet<_>>()
+                == first_candidate_ids
+        });
+        let candidate_order_preserved = samples.iter().all(|sample| {
+            sample.identity.candidate_record_ids == first.identity.candidate_record_ids
+        });
+        let candidate_digests_preserved = samples.iter().all(|sample| {
+            sample.identity.selected_candidate_digest == first.identity.selected_candidate_digest
+                && sample.identity.candidate_record_digest == first.identity.candidate_record_digest
+                && sample.identity.result_digest == first.identity.result_digest
+        });
+        let calculate = |select: fn(&RankedFtsHydrationMeasurement) -> f64, percentile: f64| {
+            let mut values = samples.iter().map(select).collect::<Vec<_>>();
+            values.sort_by(f64::total_cmp);
+            percentile_sorted(&values, percentile)
+        };
+        let percentiles = |percentile| RankedFtsHydrationPercentiles {
+            selection_ms: calculate(|sample| sample.selection_ms, percentile),
+            hydration_ms: calculate(|sample| sample.hydration_ms, percentile),
+            unattributed_overhead_ms: calculate(
+                |sample| sample.unattributed_overhead_ms,
+                percentile,
+            ),
+            end_to_end_ms: calculate(|sample| sample.end_to_end_ms, percentile),
+        };
+        let p50_ms = percentiles(50.0);
+        let p95_ms = percentiles(95.0);
+        let ticket_qualified = manual && samples.len() == 5;
+        let samples = samples
+            .into_iter()
+            .map(|sample| RankedFtsHydrationSample {
+                selection_ms: sample.selection_ms,
+                hydration_ms: sample.hydration_ms,
+                unattributed_overhead_ms: sample.unattributed_overhead_ms,
+                end_to_end_ms: sample.end_to_end_ms,
+                selected_candidate_count: sample.identity.selected_candidate_count,
+                selected_candidate_digest: sample.identity.selected_candidate_digest,
+                candidate_record_ids: sample.identity.candidate_record_ids,
+                candidate_record_digest: sample.identity.candidate_record_digest,
+                result_ids: sample.identity.result_ids,
+                result_digest: sample.identity.result_digest,
+            })
+            .collect();
+        Ok(RankedFtsHydrationStats {
+            p50_ms,
+            p95_ms,
+            samples,
+            attribution_route: "fallback_ranked_fts".into(),
+            production_reference: "production_ranked_fts_fallback".into(),
+            default_filtered_route,
+            default_filtered_result_digest,
+            ticket_qualified,
+            candidate_ids_preserved,
+            candidate_order_preserved,
+            candidate_digests_preserved,
+        })
+    }
+
+    impl RankedFtsHydrationSample {
+        fn reconciles(&self) -> bool {
+            let values = [
+                self.selection_ms,
+                self.hydration_ms,
+                self.unattributed_overhead_ms,
+                self.end_to_end_ms,
+            ];
+            if values
+                .iter()
+                .any(|value| !value.is_finite() || *value < 0.0)
+            {
+                return false;
+            }
+            (self.selection_ms + self.hydration_ms + self.unattributed_overhead_ms
+                - self.end_to_end_ms)
+                .abs()
+                < 0.002
+        }
     }
 
     fn ns_ms(ns: u64) -> f64 {

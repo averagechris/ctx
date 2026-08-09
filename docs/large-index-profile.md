@@ -49,7 +49,8 @@ rm -rf /tmp/ctx-large-profile
 ```
 
 `CTX_LARGE_PROFILE_MEASUREMENT_REPEATS` is bounded to 1–20 and defaults to 1
-for backward-compatible smoke/profile behavior. It repeats only the warm
+for smoke compatibility. Manual ticket profiles default to exactly 5 and reject
+other repeat counts. It repeats only the warm
 ordinary search, warm heavily filtered search, and replay no-op against the
 already generated corpus. Their artifact objects contain the ordered sample
 array, sample count, p50, p95, minimum, and maximum; the existing singular
@@ -57,10 +58,20 @@ array, sample count, p50, p95, minimum, and maximum; the existing singular
 
 Each ordinary and filtered sample also records non-overlapping search phases,
 their p50/p95 values, path (`fast_event` or `fallback_ranked_fts`), and available
-statement/candidate/hydration counters. The execution phase deliberately combines
-ranked FTS/candidate paging with base-row/context hydration because the fast-event
-store cursor hydrates each row while stepping the ranked statement; separating
-those costs would claim precision the current architecture does not expose.
+statement/candidate/hydration counters. The production execution phase remains a
+combined ranked-FTS/candidate-paging/base-context-hydration phase: this profile
+does not change runtime behavior. In addition, the filtered fallback profile has
+a test-only `ranked_fts_hydration` attribution that runs the same bounded ranked
+FTS ID selection first and then the existing hydration/scoring path. It records
+selection and hydration timings plus candidate/result IDs and order-sensitive
+digests, and rejects any mismatch against the production ranked-fallback path.
+This attribution is explicitly labelled `fallback_ranked_fts` and its reference
+is `production_ranked_fts_fallback`; it does not describe the default filtered
+search route. The latter is recorded independently in
+`filtered_search_phases.path` (on the 10 GiB corpus it is `fast_event`) and in
+the ordinary filtered result digest. Manual ticket evidence is qualified only
+when the ranked attribution has exactly five warm samples; smoke artifacts may
+retain their one-sample compatibility mode.
 Assembly includes snippets, citations, clustering, sorting, and projection.
 Explicit unattributed overhead makes every sample reconcile to its end-to-end
 duration. The artifact also records the reproducible command assembled from the
@@ -79,6 +90,13 @@ recursively deleted based on marker presence.
 The versioned JSON artifact contains `schema_version`, requested baseline events
 and minimum footprint, achieved baseline and incremental counts, deterministic
 seed and batch bound, OS/arch and local jj IDs when available without network,
+and current artifacts use schema version `2` and mark the ranked-attribution
+contract with `ranked_fts_attribution_revision: 1`. The checked-in pre-phase
+schema-version-`1` fixture remains readable only in its legacy shape: it must
+omit the command, phase evidence, ranked revision, and ranked evidence. Schema
+version `2` always requires all of those current fields, so deleting optional
+evidence cannot downgrade a newly generated artifact to the legacy contract.
+Unsupported schema or attribution revisions are rejected.
 actual SQLite version/PRAGMAs, canonical absolute DB/WAL/SHM/artifact paths,
 pre/post checkpoint sidecar states with absent sidecars distinguished from
 metadata errors, exact base table and FTS table cardinalities, deterministic

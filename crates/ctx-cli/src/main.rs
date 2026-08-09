@@ -4453,6 +4453,7 @@ fn query_error_kind(error: &QueryError) -> &'static str {
         QueryError::UnsupportedEvidenceCombination(_) => "unsupported_combination",
         QueryError::MissingEvidenceTarget { .. } => "missing_target",
         QueryError::DeletedEvidenceTarget { .. } => "deleted_target",
+        QueryError::Evidence(_) => "evidence_normalization",
     }
 }
 

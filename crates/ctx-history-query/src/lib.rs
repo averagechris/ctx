@@ -29,6 +29,9 @@ use std::{
 };
 use uuid::Uuid;
 
+mod evidence;
+pub use evidence::*;
+
 pub const QUERY_DTO_SCHEMA_VERSION: u32 = 1;
 pub const QUERY_REVISION: u32 = 1;
 pub const EVIDENCE_SELECTOR_SCHEMA_VERSION: u32 = 1;
@@ -114,6 +117,8 @@ pub enum QueryError {
     MissingEvidenceTarget { id: Uuid },
     #[error("explicit event target is deleted: {id}")]
     DeletedEvidenceTarget { id: Uuid },
+    #[error(transparent)]
+    Evidence(#[from] EvidenceError),
 }
 
 pub type Result<T> = std::result::Result<T, QueryError>;
@@ -698,12 +703,18 @@ pub struct EvidenceContinuationV1 {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct EvidenceSourceLookupV1 {
     pub capture_source_id: Uuid,
+    #[serde(skip)]
+    pub(crate) visibility: Option<Visibility>,
     pub source: Option<SourceFullV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EvidenceEventSourceRefsV1 {
     pub ctx_event_id: Uuid,
+    #[serde(skip)]
+    pub(crate) redaction_state: RedactionState,
+    #[serde(skip)]
+    pub(crate) visibility: Visibility,
     pub event_capture_source_id: Option<Uuid>,
     /// Only a distinct owning-session source is repeated here.  When the
     /// source IDs are equal, the event reference and lookup row are shared.
@@ -803,6 +814,8 @@ pub struct SessionCompactV1 {
     pub started_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ended_at: Option<DateTime<Utc>>,
+    #[serde(skip)]
+    pub(crate) fidelity: Fidelity,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -856,6 +869,8 @@ pub enum EventProjectionV1 {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct EventCompactV1 {
     pub ctx_event_id: Uuid,
+    #[serde(skip)]
+    pub(crate) ctx_session_id: Option<Uuid>,
     pub seq: u64,
     pub event_type: EventType,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -863,6 +878,12 @@ pub struct EventCompactV1 {
     pub occurred_at: DateTime<Utc>,
     pub text: String,
     pub text_truncation: TextTruncationV1,
+    #[serde(skip)]
+    pub(crate) redaction_state: RedactionState,
+    #[serde(skip)]
+    pub(crate) visibility: Visibility,
+    #[serde(skip)]
+    pub(crate) fidelity: Fidelity,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1700,7 +1721,7 @@ impl<'a> QueryService<'a> {
     /// Execute exactly one evidence selector domain.  This is intentionally a
     /// query-core API: it has no CLI/MCP state, reads no ambient session
     /// variables, and does not render or write an artifact.
-    pub fn select_evidence(
+    pub(crate) fn select_evidence(
         &self,
         request: EvidenceSelectorRequest,
     ) -> Result<EvidenceSelectionPageV1> {
@@ -1734,6 +1755,14 @@ impl<'a> QueryService<'a> {
                 self.select_evidence_events(&request, event_ids, continuation, request_hash)
             }
         }
+    }
+
+    /// Select and normalize through the only public evidence output boundary.
+    pub fn evidence(&self, request: EvidenceSelectorRequest) -> Result<NormalizedEvidencePageV1> {
+        let fields = request.fields;
+        let per_item_bytes = request.byte_policy.per_item_bytes;
+        let selected = self.select_evidence(request)?;
+        normalize_evidence(selected, fields, per_item_bytes).map_err(QueryError::Evidence)
     }
 
     fn select_evidence_session(
@@ -2046,6 +2075,8 @@ impl<'a> QueryService<'a> {
                     .filter(|source_id| Some(*source_id) != event.capture_source_id);
                 EvidenceEventSourceRefsV1 {
                     ctx_event_id: event.id,
+                    redaction_state: event.redaction_state,
+                    visibility: event.sync.visibility,
                     event_capture_source_id: event.capture_source_id,
                     session_capture_source_id: session_source_id,
                 }
@@ -2151,6 +2182,8 @@ impl<'a> QueryService<'a> {
                     .filter(|id| Some(*id) != event.capture_source_id);
                 EvidenceEventSourceRefsV1 {
                     ctx_event_id: event.id,
+                    redaction_state: event.redaction_state,
+                    visibility: event.sync.visibility,
                     event_capture_source_id: event.capture_source_id,
                     session_capture_source_id,
                 }
@@ -2185,6 +2218,9 @@ impl<'a> QueryService<'a> {
             .copied()
             .map(|capture_source_id| EvidenceSourceLookupV1 {
                 capture_source_id,
+                visibility: sources
+                    .get(&capture_source_id)
+                    .map(|source| source.sync.visibility),
                 source: sources
                     .get(&capture_source_id)
                     .cloned()
@@ -2432,6 +2468,7 @@ fn project_session(
             is_primary: session.is_primary,
             started_at: session.started_at,
             ended_at: session.ended_at,
+            fidelity: session.sync.fidelity,
         }),
         FieldSet::Full => SessionProjectionV1::Full(Box::new(SessionFullV1 {
             id: session.id,
@@ -2556,12 +2593,16 @@ fn project_event(
     match fields {
         FieldSet::Compact => EventProjectionV1::Compact(EventCompactV1 {
             ctx_event_id: event.id,
+            ctx_session_id: event.session_id,
             seq: event.seq,
             event_type: event.event_type,
             role: event.role,
             occurred_at: event.occurred_at,
             text,
             text_truncation,
+            redaction_state: event.redaction_state,
+            visibility: event.sync.visibility,
+            fidelity: event.sync.fidelity,
         }),
         FieldSet::Full => EventProjectionV1::Full(Box::new(EventFullV1 {
             item_id: event.id,
@@ -3761,12 +3802,16 @@ mod tests {
         let (text, text_truncation) = truncate_utf8_bytes(&preview, cap);
         let compact = EventCompactV1 {
             ctx_event_id: event.id,
+            ctx_session_id: event.session_id,
             seq: event.seq,
             event_type: event.event_type,
             role: event.role,
             occurred_at: event.occurred_at,
             text: text.clone(),
             text_truncation: text_truncation.clone(),
+            redaction_state: event.redaction_state,
+            visibility: event.sync.visibility,
+            fidelity: event.sync.fidelity,
         };
         let full = EventFullV1 {
             item_id: event.id,
@@ -5868,6 +5913,29 @@ mod tests {
         later_search_event.history_record_id = Some(search_record_id);
         later_search_event.capture_source_id = Some(later_event_source_id);
         writable.upsert_event(&later_search_event).unwrap();
+        let withheld_record_id = Uuid::from_u128(60_005);
+        writable
+            .insert_record(&HistoryRecord {
+                id: withheld_record_id,
+                title: "withheld provenance".into(),
+                body: "withheldneedle".into(),
+                tags: Vec::new(),
+                kind: "test".into(),
+                workspace: None,
+                created_at: fixed_time(),
+                updated_at: fixed_time(),
+            })
+            .unwrap();
+        let mut withheld_event = event(
+            fixture_session.id,
+            11,
+            EventType::Message,
+            Some(EventRole::Assistant),
+            "withheldneedle",
+        );
+        withheld_event.history_record_id = Some(withheld_record_id);
+        withheld_event.sync.visibility = Visibility::Withheld;
+        writable.upsert_event(&withheld_event).unwrap();
         writable.refresh_search_index().unwrap();
         drop(writable);
 
@@ -6041,6 +6109,324 @@ mod tests {
             for sensitive in ["cwd", "path", "exists", "source_cursor", "cursor"] {
                 assert!(wire.get(sensitive).is_none(), "leaked {sensitive}: {wire}");
             }
+        }
+        let normalized = QueryService::new(&store)
+            .evidence(search_request(1, MAX_PAGE_BYTES))
+            .unwrap();
+        let normalized_json = serde_json::to_string(&normalized).unwrap();
+        assert!(!normalized_json.contains("private-cursor"));
+        let normalized_results = normalized
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                EvidenceRecordV1::SearchResult(result) => Some(result),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(normalized_results.len(), 1);
+        let positive = normalized_results[0];
+        assert!(positive
+            .title
+            .as_deref()
+            .is_some_and(|title| !title.is_empty()));
+        assert!(positive
+            .content
+            .text
+            .as_deref()
+            .is_some_and(|snippet| !snippet.is_empty()));
+        assert_eq!(positive.content.content_state, ContentStateV1::Available);
+        assert!(positive.content.suppression_reason.is_none());
+        assert!(
+            !positive.citations.is_empty(),
+            "primary event citation was lost"
+        );
+        assert!(positive.citations.iter().any(|citation| {
+            citation.citation_type == EvidenceCitationTypeV1::Event
+                && citation.target_id == sourced_event.id
+        }));
+        for result in normalized.records.iter().filter_map(|record| match record {
+            EvidenceRecordV1::SearchResult(result) => Some(result),
+            _ => None,
+        }) {
+            assert!(
+                !result.citations.is_empty(),
+                "citation assertion must be non-vacuous"
+            );
+            assert!(result
+                .citations
+                .iter()
+                .all(|citation| ["event evidence", "session evidence"]
+                    .contains(&citation.label.as_str())));
+            assert!(result.citations.windows(2).all(|pair| {
+                (pair[0].citation_type, pair[0].target_id, &pair[0].time)
+                    <= (pair[1].citation_type, pair[1].target_id, &pair[1].time)
+            }));
+        }
+
+        let withheld = QueryService::new(&store)
+            .evidence(EvidenceSelectorRequest {
+                selector: EvidenceSelector::SearchPage {
+                    query: "withheldneedle".into(),
+                    terms: vec![],
+                    options: Box::default(),
+                },
+                limit: 1,
+                fields: FieldSet::Full,
+                ..EvidenceSelectorRequest::default()
+            })
+            .unwrap();
+        let EvidenceRecordV1::SearchResult(withheld_result) = &withheld.records[0] else {
+            panic!("expected withheld search result")
+        };
+        assert!(withheld_result.title.is_none());
+        assert!(withheld_result.content.text.is_none());
+        assert_eq!(
+            withheld_result.content.content_state,
+            ContentStateV1::Withheld
+        );
+        assert_eq!(
+            withheld_result.content.suppression_reason,
+            Some(SuppressionReasonV1::WithheldVisibility)
+        );
+    }
+
+    #[test]
+    fn normalized_evidence_real_domains_are_closed_deterministic_and_nonleaky() {
+        const SENTINEL: &str = "HOSTILE_LEAK_SENTINEL";
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("work.sqlite");
+        let (fixture_session, mut events) = transcript_fixture(&path);
+        let writable = Store::open(&path).unwrap();
+        let mut raw = event(
+            fixture_session.id,
+            9,
+            EventType::Message,
+            Some(EventRole::Assistant),
+            SENTINEL,
+        );
+        raw.redaction_state = RedactionState::Raw;
+        writable.upsert_event(&raw).unwrap();
+        let marker = event(
+            fixture_session.id,
+            10,
+            EventType::Message,
+            Some(EventRole::Assistant),
+            "[content withheld]",
+        );
+        writable.upsert_event(&marker).unwrap();
+        events.extend([raw.clone(), marker.clone()]);
+        drop(writable);
+
+        for fields in [FieldSet::Full, FieldSet::Compact] {
+            let store = Store::open_read_only(&path).unwrap();
+            let service = QueryService::new(&store);
+            let requests = [
+                EvidenceSelectorRequest {
+                    selector: EvidenceSelector::SessionPage {
+                        ctx_session_id: fixture_session.id,
+                        mode: TranscriptMode::Full,
+                    },
+                    limit: 20,
+                    fields,
+                    ..EvidenceSelectorRequest::default()
+                },
+                EvidenceSelectorRequest {
+                    selector: EvidenceSelector::EventIds {
+                        event_ids: vec![raw.id, marker.id],
+                    },
+                    limit: 20,
+                    fields,
+                    ..EvidenceSelectorRequest::default()
+                },
+                EvidenceSelectorRequest {
+                    selector: EvidenceSelector::SearchPage {
+                        query: "a1".into(),
+                        terms: vec![],
+                        options: Box::default(),
+                    },
+                    limit: 20,
+                    fields,
+                    ..EvidenceSelectorRequest::default()
+                },
+            ];
+            for request in requests {
+                let first = service.evidence(request.clone()).unwrap();
+                let replay = QueryService::new(&store).evidence(request).unwrap();
+                let json = serde_json::to_string(&first).unwrap();
+                assert_eq!(json, serde_json::to_string(&replay).unwrap());
+                assert!(!json.contains(SENTINEL));
+                assert!(!json.contains("generated_at"));
+                assert!(!json.contains("source_path"));
+                assert!(!json.contains("cursor"));
+                if !first.records.is_empty() {
+                    assert!(json.contains(".000Z"));
+                    assert!(first.normalized_item_json_bytes > 0);
+                }
+            }
+
+            let marker_page = service
+                .evidence(EvidenceSelectorRequest {
+                    selector: EvidenceSelector::EventIds {
+                        event_ids: vec![marker.id],
+                    },
+                    fields,
+                    ..EvidenceSelectorRequest::default()
+                })
+                .unwrap();
+            let EvidenceRecordV1::Event(marker_record) = &marker_page.records[0] else {
+                panic!("expected event")
+            };
+            assert_eq!(
+                marker_record.content.content_state,
+                ContentStateV1::Available
+            );
+            assert_eq!(
+                marker_record.content.text.as_deref(),
+                Some("[content withheld]")
+            );
+            assert!(marker_record.content.suppression_reason.is_none());
+        }
+    }
+
+    #[test]
+    fn normalized_provenance_distinguishes_live_withheld_missing_and_session_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("work.sqlite");
+        let (fixture_session, events) = transcript_fixture(&path);
+        let event_source = Uuid::from_u128(70_001);
+        let session_source = Uuid::from_u128(70_002);
+        let missing_source = Uuid::from_u128(70_003);
+        let writable = Store::open(&path).unwrap();
+        let make_source = |id, visibility| CaptureSource {
+            id,
+            descriptor: CaptureSourceDescriptor {
+                kind: CaptureSourceKind::ProviderImport,
+                provider: CaptureProvider::Codex,
+                machine_id: "HOSTILE_LEAK_SENTINEL".into(),
+                process_id: None,
+                cwd: Some("/HOSTILE_LEAK_SENTINEL".into()),
+                raw_source_path: Some("/HOSTILE_LEAK_SENTINEL/source".into()),
+                external_session_id: Some("HOSTILE_LEAK_SENTINEL".into()),
+            },
+            started_at: fixed_time(),
+            ended_at: None,
+            sync: SyncMetadata {
+                visibility,
+                metadata: json!({"source_format":"HOSTILE_LEAK_SENTINEL"}),
+                ..sync()
+            },
+        };
+        writable
+            .upsert_capture_source(&make_source(event_source, Visibility::Withheld))
+            .unwrap();
+        writable
+            .upsert_capture_source(&make_source(session_source, Visibility::LocalOnly))
+            .unwrap();
+        writable
+            .upsert_capture_source(&make_source(missing_source, Visibility::LocalOnly))
+            .unwrap();
+        let mut session = fixture_session.clone();
+        session.capture_source_id = Some(session_source);
+        writable.upsert_session(&session).unwrap();
+        let mut withheld_event = events[0].clone();
+        withheld_event.capture_source_id = Some(event_source);
+        writable.upsert_event(&withheld_event).unwrap();
+        let mut missing_event = events[1].clone();
+        missing_event.capture_source_id = Some(missing_source);
+        writable.upsert_event(&missing_event).unwrap();
+        writable
+            .orphan_capture_source_for_test(missing_source)
+            .unwrap();
+        drop(writable);
+
+        let store = Store::open_read_only(&path).unwrap();
+        let page = QueryService::new(&store)
+            .evidence(EvidenceSelectorRequest {
+                selector: EvidenceSelector::EventIds {
+                    event_ids: vec![withheld_event.id, missing_event.id],
+                },
+                limit: 2,
+                fields: FieldSet::Full,
+                ..EvidenceSelectorRequest::default()
+            })
+            .unwrap();
+        let json = serde_json::to_string(&page).unwrap();
+        assert!(!json.contains("HOSTILE_LEAK_SENTINEL"));
+        let events = page
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                EvidenceRecordV1::Event(event) => Some(event),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events[0].provenance.as_ref().unwrap().availability,
+            SourceAvailabilityV1::Withheld
+        );
+        assert_eq!(
+            events[0].session_provenance.as_ref().unwrap().availability,
+            SourceAvailabilityV1::Live
+        );
+        assert_eq!(
+            events[1].provenance.as_ref().unwrap().availability,
+            SourceAvailabilityV1::Missing
+        );
+        for provenance in [
+            events[0].provenance.as_ref().unwrap(),
+            events[1].provenance.as_ref().unwrap(),
+        ] {
+            assert!(provenance.provider.is_none());
+            assert!(provenance.kind.is_none());
+            assert!(provenance.started_at.is_none());
+        }
+    }
+
+    #[test]
+    fn normalized_search_without_primary_event_proof_suppresses_title_and_snippet() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("work.sqlite");
+        let writable = Store::open(&path).unwrap();
+        writable
+            .insert_record(&HistoryRecord {
+                id: Uuid::from_u128(80_001),
+                title: "HOSTILE_LEAK_SENTINEL title".into(),
+                body: "prooflessneedle HOSTILE_LEAK_SENTINEL body".into(),
+                tags: vec![],
+                kind: "note".into(),
+                workspace: None,
+                created_at: fixed_time(),
+                updated_at: fixed_time(),
+            })
+            .unwrap();
+        writable.refresh_search_index().unwrap();
+        drop(writable);
+        let store = Store::open_read_only(&path).unwrap();
+        for fields in [FieldSet::Full, FieldSet::Compact] {
+            let page = QueryService::new(&store)
+                .evidence(EvidenceSelectorRequest {
+                    selector: EvidenceSelector::SearchPage {
+                        query: "prooflessneedle".into(),
+                        terms: vec![],
+                        options: Box::default(),
+                    },
+                    limit: 10,
+                    fields,
+                    ..EvidenceSelectorRequest::default()
+                })
+                .unwrap();
+            let json = serde_json::to_string(&page).unwrap();
+            assert!(!json.contains("HOSTILE_LEAK_SENTINEL"));
+            let EvidenceRecordV1::SearchResult(result) = &page.records[0] else {
+                panic!("expected search result")
+            };
+            assert!(result.title.is_none());
+            assert!(result.content.text.is_none());
+            assert_eq!(result.content.content_state, ContentStateV1::Withheld);
+            assert_eq!(
+                result.content.suppression_reason,
+                Some(SuppressionReasonV1::MissingProof)
+            );
         }
     }
 

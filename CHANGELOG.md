@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Added
+
+- A closed deterministic evidence normalization boundary with fail-closed
+  content proof, bounded provenance and citations, exact normalized byte
+  accounting, and no raw payload, path, cursor, clock, filesystem, or ambient
+  environment exposure (#278).
 
 ## v1.0.3 - 2026-08-06
 

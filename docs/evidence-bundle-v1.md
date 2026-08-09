@@ -386,9 +386,10 @@ preview, but it suppresses source provenance fields as defined below.
 }
 ```
 
-`provider_session_id`, `cwd`, `stored_path`, and `source_format` are full-field
-only. `stored_path` is the path stored in SQLite and is not checked during
-rendering; v1 emits no volatile `exists`/`filesystem_exists` value. Availability
+The implemented v1 boundary omits `provider_session_id`, `cwd`, `stored_path`,
+and `source_format` even in full mode (D1); these fields are reserved rather
+than exposing path or provider-owned identity. It emits no volatile
+`exists`/`filesystem_exists` value. Availability
 means database/source-record state only: a missing source row is `missing`, an
 explicit source deletion marker is `deleted`, and withheld source visibility
 is `withheld`. The current capture-source schema has no deletion column, so it
@@ -397,6 +398,8 @@ bounded value extracted from the allowlisted metadata pointers already used by
 the query layer; all other source metadata is suppressed. `cursor`, machine
 ID, process ID, raw source payload, and arbitrary sync metadata are never
 emitted in any field set.
+Missing and withheld provenance serializes only `capture_source_id` and
+`availability`; provider, kind, timestamps, and all metadata are omitted.
 
 An event's `provenance` is its event source. `session_provenance` is included
 only when its session source is distinct. A session's `provenance` is its
@@ -452,6 +455,8 @@ Reasons contain no target text. Counts are exact within the page's bounded
 citation input. Exceeding the citation count or string cap fails closed rather
 than silently dropping an unknown tail; known ineligible citations are
 omitted and accounted for.
+Eligible citations are deduplicated and sorted by `(citation_type, target_id,
+time)`; labels are evidence-owned fixed strings rather than source labels.
 
 ### Timestamp and byte determinism
 

@@ -2325,6 +2325,19 @@ pub struct Store {
 }
 
 impl Store {
+    /// Create a deliberately inconsistent source reference for fail-closed
+    /// query tests. Never compiled into normal builds.
+    #[cfg(feature = "test-utils")]
+    pub fn orphan_capture_source_for_test(&self, source_id: Uuid) -> Result<()> {
+        self.conn.execute_batch("PRAGMA foreign_keys = OFF")?;
+        let result = self.conn.execute(
+            "DELETE FROM capture_sources WHERE id = ?1",
+            params![source_id.to_string()],
+        );
+        self.conn.execute_batch("PRAGMA foreign_keys = ON")?;
+        result?;
+        Ok(())
+    }
     /// Page budget for one bounded post-import merge pass
     /// ([`Store::merge_search_index_bounded`]). The unsigned non-zero type
     /// makes a negative budget unrepresentable: in FTS5 a negative `merge`

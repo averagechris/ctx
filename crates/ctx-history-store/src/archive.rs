@@ -129,6 +129,7 @@ impl AnchoredDir {
             Path::new(".")
         };
         let mut dir = open_read_nofollow(start, true)?;
+        #[cfg(target_os = "macos")]
         let mut normal_component = 0;
         for component in path.components() {
             match component {
@@ -143,7 +144,10 @@ impl AnchoredDir {
                     #[cfg(not(target_os = "macos"))]
                     let next = openat(&dir, name, true)?;
                     dir = next;
-                    normal_component += 1;
+                    #[cfg(target_os = "macos")]
+                    {
+                        normal_component += 1;
+                    }
                 }
                 Component::ParentDir | Component::Prefix(_) => {
                     return Err(archive_error(

@@ -7351,6 +7351,34 @@ mod tests {
     }
 
     #[test]
+    fn search_phase_reconciliation_allows_only_quantization_drift() {
+        let mut evidence = SearchPhaseEvidence {
+            path: "fallback_ranked_fts".into(),
+            filter_source_preparation_ms: 0.001,
+            execution_candidate_paging_and_base_context_hydration_ms: 0.001,
+            result_assembly_clustering_sorting_projection_ms: 0.001,
+            unattributed_overhead_ms: 0.001,
+            end_to_end_ms: 0.002,
+            event_search_statements: 0,
+            candidate_rows_hydrated: 0,
+            candidates_examined: 0,
+            candidates_rejected: 0,
+            candidates_accepted: 0,
+            relation_hydration_statements: 0,
+            hydration_loader_statements: [0; 2],
+        };
+
+        assert!(evidence.reconciles());
+        evidence.end_to_end_ms = 0.001;
+        assert!(!evidence.reconciles());
+
+        for malformed in [-1.0, f64::INFINITY, f64::NAN, f64::MAX] {
+            evidence.end_to_end_ms = malformed;
+            assert!(!evidence.reconciles());
+        }
+    }
+
+    #[test]
     fn search_phase_percentiles_use_all_samples() {
         let samples = [1.0, 5.0, 3.0, 2.0, 4.0]
             .into_iter()
@@ -7406,6 +7434,15 @@ mod tests {
         assert!(parse_artifact_v1(inconsistent)
             .unwrap_err()
             .contains("counts"));
+
+        for malformed in [serde_json::json!(-0.001), serde_json::json!(f64::MAX)] {
+            let mut malformed_timing = valid.clone();
+            malformed_timing["measurements"]["ordinary_search_phases"]["samples"][0]
+                ["end_to_end_ms"] = malformed;
+            assert!(parse_artifact_v1(malformed_timing)
+                .unwrap_err()
+                .contains("search phase evidence mismatch"));
+        }
 
         let mut incomplete_current = valid;
         incomplete_current["measurements"]
@@ -10238,11 +10275,31 @@ mod tests {
 
     impl SearchPhaseEvidence {
         fn reconciles(&self) -> bool {
-            let sum = self.filter_source_preparation_ms
-                + self.execution_candidate_paging_and_base_context_hydration_ms
-                + self.result_assembly_clustering_sorting_projection_ms
-                + self.unattributed_overhead_ms;
-            (sum - self.end_to_end_ms).abs() < 0.002
+            let thousandths = |milliseconds: f64| {
+                if !milliseconds.is_finite() || milliseconds < 0.0 {
+                    return None;
+                }
+                let value = (milliseconds * 1000.0).round();
+                if !value.is_finite() || value >= u64::MAX as f64 {
+                    return None;
+                }
+                Some(value as u64)
+            };
+            let sum = [
+                self.filter_source_preparation_ms,
+                self.execution_candidate_paging_and_base_context_hydration_ms,
+                self.result_assembly_clustering_sorting_projection_ms,
+                self.unattributed_overhead_ms,
+            ]
+            .into_iter()
+            .try_fold(0u128, |sum, milliseconds| {
+                sum.checked_add(u128::from(thousandths(milliseconds)?))
+            });
+            let Some((sum, end_to_end)) = sum.zip(thousandths(self.end_to_end_ms)) else {
+                return false;
+            };
+            // Four independently rounded phases can differ from their rounded total by 0.002 ms.
+            sum.abs_diff(u128::from(end_to_end)) <= 2
         }
     }
 

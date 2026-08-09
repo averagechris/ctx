@@ -1,18 +1,15 @@
 # ctx Archive Format v1 (`ctx-archive`, format_version 1)
 
-Status: **accepted design contract**, with the v1 writer shipped by
-`ctx archive create` and the read-only verifier shipped by `ctx archive verify`;
-restore remains a follow-up command for
-[~averagechris/projects#185](https://todo.sr.ht/~averagechris/projects/185).
-The restore implementation remains a follow-up ticket (see [Implementation
-slicing](#implementation-slicing)). The internal `SessionHistoryArchive` JSON
-structure must not be presented as this format.
+Status: **accepted and shipped contract**. The v1 writer, read-only verifier,
+and fresh-root restore are shipped as `ctx archive create`, `ctx archive verify`,
+and `ctx archive restore`. The internal `SessionHistoryArchive` JSON structure
+must not be presented as this format.
 
 This contract defines the smallest safe, portable, streaming, checksummed
 **logical content archive** of a ctx data root. It is a portable re-import
-surface, not a byte-level SQLite disaster-recovery snapshot: a logical archive
-is portable across machines and future schema versions and can be merged;
-a database file copy is neither.
+surface for a fresh data root, not a byte-level SQLite disaster-recovery
+snapshot: it is portable across machines and future schema versions, while
+merge semantics remain outside v1; a database file copy is neither.
 
 Related reading: [storage.md](storage.md) (data root layout, privacy truth),
 [fork-plan.md](fork-plan.md) (schema divergence policy), tickets #186
@@ -28,8 +25,10 @@ multi-machine merging).
    may materialize all entities or any whole blob in memory.
 3. **Fail closed.** Anything unknown, missing, duplicated, truncated, or
    out-of-vocabulary rejects the whole archive. There is no partial accept.
-4. **Atomic publication.** An incomplete archive is never visible at the
-   destination path; a failed restore never leaves a usable-looking data root.
+4. **Atomic publication.** An incomplete archive or restored data root is never
+   visible at the destination path before its exclusive rename publication
+   point. A handled pre-publication failure cleans staging; a parent-directory
+   `fsync` can still report an error after a complete target has been published.
 5. **No network.** Nothing in this format enables or requires transport,
    upload, discovery, or remote credentials. Transport is external tooling.
 6. **Independent versioning.** The archive format version is not the SQLite
@@ -476,10 +475,16 @@ where `manifest_sha256` is the SHA-256 of the exact bytes of
 5. Write `manifest.json` from the tallies; write `COMPLETE`.
 6. `fsync` every file, `fsync` directories bottom-up, `rename(2)` the staging
    directory to the final name, `fsync` the parent directory.
-7. On any failure, delete the staging directory. A crash can leave an inert
-   `*.tmp-*` directory behind; it never constitutes a published archive (the
-   rename never happened), and tools must refuse `*.tmp-*` paths for verify
-   and restore.
+7. On any pre-publication failure, delete the staging directory. A crash can
+    leave an unpublished `*.tmp-*` directory behind, potentially with a
+    complete/usable-looking bundle and `COMPLETE`; it never constitutes the
+    published archive because the exclusive rename never happened, and tools
+    must refuse `*.tmp-*` paths for verify and restore. The verifier also uses
+    a private sibling `.ctxar-verify-*/state.sqlite` scratch directory,
+    normally removed on exit; a crash can leave it partial or complete. All
+    residue is sensitive. After the exclusive rename, the target exists; a
+    parent-directory `fsync` may still fail and report an error. Inspect and
+    verify before retrying, and never overwrite that target.
 
 The exporter must self-verify (run the full verification pass below against
 the staged bundle) before publication. Export cost is two passes; safety
@@ -519,8 +524,9 @@ observed sizes, which bounds total I/O before deep reads begin.
 
 ## Verification
 
-`verify` is a read-only operation on a bundle path and must pass before any
-restore. Ordered phases:
+`verify` is read-only with respect to the published bundle and must pass before
+any restore; it writes only the private verifier scratch described below.
+Ordered phases:
 
 1. **Shape.** Path is a directory not matching `*.tmp-*`; `COMPLETE` exists,
    parses, format/version accepted, manifest digest matches; manifest
@@ -584,7 +590,10 @@ must not repurpose or weaken the ones above.
 ### `ctx archive verify` CLI contract
 
 `ctx archive verify <bundle>` performs the complete verification pass above and
-never writes to the bundle. It exits `0` only after all phases succeed. A
+never writes to the published bundle. It creates a private sibling
+`.ctxar-verify-*/state.sqlite` scratch database beside the bundle and normally
+removes it; a crash can leave that sensitive scratch residue. It exits `0` only
+after all phases succeed. A
 verification rejection exits `1`; command-line usage errors retain clap's exit
 code `2`. The human failure form includes the stable category and the
 explicitly requested bundle path, but never includes transcript fields or
@@ -623,8 +632,8 @@ policy trivial: there is nothing to conflict with.
 Protocol:
 
 1. Run full verification; refuse on any failure.
-2. Refuse if the target root exists and is non-empty. Create a staging root
-   `<target>.tmp-<restore-uuid>` (0700) beside the target.
+2. Refuse if the target root exists at all, including an empty directory. Create
+   a staging root `<target>.tmp-<restore-uuid>` (0700) beside the target.
 3. Initialize a normal store in the staging root via the standard creation
    path (current schema version 1002+, WAL, 0700/0600, `objects/`
    directory). The archive never dictates schema DDL.
@@ -648,26 +657,29 @@ Protocol:
    store's existing blob-guard ordering — database rows must never commit
    ahead of the bytes they reference.
 6. Rebuild derived state inside the same write scope using the store's
-   existing projection rebuild (`refresh_search_index` semantics): FTS
-   projections and the `record_search_rowids`/`event_search_rowids` maps are
-   cleared and repopulated in lockstep, per the store invariant that maps
-   are maintained manually in the same write transaction. This full
-   rebuild is what licenses the verbatim INSERTs of step 4 to skip
-   per-row projection maintenance: projections and maps are recreated
-   from the restored rows before the write scope ends, so the store's
-   write-path invariant still holds.
+   existing projection rebuild (`refresh_search_index` semantics): the active
+   record/event FTS projections and the `record_search_rowids`/
+   `event_search_rowids` maps are cleared and repopulated in lockstep, per the
+   store invariant that maps are maintained manually in the same write
+   transaction. `artifact_search` is cleared and intentionally remains empty
+   and unused; it is not repopulated by restore. This rebuild is what licenses
+   the verbatim INSERTs of step 4 to skip per-row projection maintenance: the
+   active projections and maps are recreated from the restored rows before the
+   write scope ends, so the store's write-path invariant still holds.
 7. Post-restore checks, all mandatory: per-table counts equal manifest
    stream counts; `PRAGMA foreign_key_check` empty; `PRAGMA quick_check`
    ok; projection row counts consistent with the rebuild's own accounting;
    blob file count equals `objects.count`.
-8. Publish: `fsync`, rename staging root to the target path, `fsync`
-   parent. On any failure at any step, delete the staging root entirely —
-   a failed restore leaves nothing that looks like a data root.
+8. Publish: `fsync`, exclusive rename staging root to the target path, then
+   `fsync` the parent. The exclusive rename is the publication point. Before
+   it, handled failure deletes staging and leaves the target absent. A parent
+   `fsync` failure can be reported after the complete target exists; operators
+   must inspect and verify before retrying and must never overwrite the target.
 
 Restored stores preserve every archived column byte-for-byte — entity IDs,
 `events.seq` ordering, citations (summary `citations_json` target IDs
-remain valid because IDs are never rewritten), counts — and search behavior
-after the projection rebuild. Consequently, re-exporting a restored store
+remain valid because IDs are never rewritten), counts — and active record/event
+search behavior after the projection rebuild. Consequently, re-exporting a restored store
 (with pinned `archive_id`/`created_at_ms`) reproduces the original streams
 byte-identically; the round-trip test relies on this.
 
@@ -684,7 +696,7 @@ The archive carries canonical content only. Excluded, deliberately:
 
 | excluded | rationale |
 | --- | --- |
-| FTS5 tables (`ctx_history_search`, `event_search`, `artifact_search`) and all their SQLite shadow tables | Derived projections; rebuilt at the destination. Copying them would freeze tokenizer/rowid details into the format. |
+| FTS5 tables (`ctx_history_search`, `event_search`, `artifact_search`) and all their SQLite shadow tables | Derived projections; active record/event projections are rebuilt at the destination, while `artifact_search` is cleared and intentionally remains empty/unused. Copying them would freeze tokenizer/rowid details into the format. |
 | `record_search_rowids`, `event_search_rowids` | Performance caches keyed by store-local FTS rowids; meaningless outside the database file that assigned them. |
 | `catalog_sessions`, `source_import_files` | Machine-local discovery/import ledgers keyed by absolute source paths. Restoring them on another machine would assert the presence of files that do not exist there; they regenerate on rescan. Retention/suppression state is #188. |
 | `sync_cursors`, `sync_batches`, `sync_outbox` | Upstream hosted-sync scaffolding; device- and team-scoped operational state, not content. |
@@ -702,16 +714,20 @@ this machine/database instance, it stays out of the archive.
 - An archive is exactly as sensitive as `work.sqlite`: verbatim prompts,
   code, commands, credentials, transcript text, plus full artifact bytes.
   Treat bundle files as secrets; the 0700/0600 modes are a floor, not a
-  sharing mechanism.
+  sharing mechanism. Unpublished staging and verifier scratch residue is also
+  sensitive, even when incomplete or only potentially complete.
 - v1 provides **integrity, not confidentiality or authenticity**: SHA-256
   digests detect corruption and truncation, not tampering by an adversary
   who can rewrite the manifest and marker. Signing/encryption are external
   by design (`age`, OS volume encryption); ctx makes no encryption claims
   and must not grow key management.
-- No component of create/verify/restore performs network I/O, reads outside
-  the store and explicit bundle paths, or writes outside the staging
-  directories described here. This preserves the fork's no-network
-  guardrail.
+- No component of create/verify/restore performs network I/O or reads outside
+  the store, explicit bundle paths, and the private staging/scratch directories
+  it creates. Create and restore write content only to private staging
+  directories and publish them by exclusive rename; verify writes only its
+  private sibling scratch database (`.ctxar-verify-*/state.sqlite`) and never
+  modifies the published bundle. These are local filesystem effects, not
+  transport or upload.
 
 ## Compatibility and evolution
 
@@ -742,22 +758,24 @@ per the repo testing guardrails; the full suite must pass on macOS.
    (incl. session parent/child + edges, shared blobs across artifact kinds,
    soft-deleted rows, unicode + embedded-JSON-heavy payloads); export,
    verify, restore to fresh root; assert byte-identical stream re-export,
-   ID/seq/count/citation parity, and representative search + show output
-   equality after FTS rebuild.
+    ID/seq/count/citation parity, and representative active record/event search
+    + show output equality after rebuild (with `artifact_search` still empty).
 2. **Determinism**: two exports of the same store with pinned
    `archive_id`/`created_at_ms` are byte-identical.
-3. **Atomic publication**: kill/fail injection mid-export leaves only a
-   `*.tmp-*` directory, never a bundle with `COMPLETE`; verify refuses
-   staging paths.
+3. **Atomic publication**: kill/fail injection before rename leaves only an
+   unpublished `*.tmp-*` directory, which may already contain `COMPLETE`; the
+   published target is absent and verify refuses staging paths. A parent-fsync
+   failure is checked separately because the target may already exist.
 4. **Adversarial corpus** (table-driven, one fixture per rejection-matrix
    row): truncated stream, flipped bit in stream/blob/manifest, duplicated
    ID, conflicting natural key, dangling reference, missing blob, extra
    blob, symlinked blob, hard-linked stream, non-contractual path in
    manifest, unknown field, explicit null, unsorted stream, unsupported
    version, oversized line, count mismatch.
-5. **Restore transactionality**: failure injected at each restore phase
-   (mid-transaction, blob copy, projection rebuild, post-checks) leaves no
-   staging root and an untouched target path.
+5. **Restore transactionality**: failure injected before publication at each
+    restore phase (mid-transaction, blob copy, projection rebuild, post-checks)
+    leaves no staging root and an untouched target path; the parent-fsync case
+    separately checks the already-published target.
 6. **Permissions**: created bundle and restored root are 0700/0600
    throughout (Unix), including after rename publication.
 7. **Bounded memory smoke**: export/verify/restore over a
@@ -767,31 +785,9 @@ per the repo testing guardrails; the full suite must pass on macOS.
    synthetic provider transcripts, run refresh, assert stable counts via
    dedupe keys.
 
-## Implementation slicing
+## Implementation history
 
-Proposed child tickets (all `Refs: ~averagechris/projects#185`; points are
-Fibonacci per tracker convention):
-
-1. **feature, points:5 — bundle writer + atomic publish (`ctx archive
-   create`).** Streaming keyset export of the 15 streams, blob copy with
-   inline re-hash, manifest/COMPLETE, staging + rename protocol, exporter
-   self-verify, determinism + atomicity + permissions tests. Depends on:
-   this contract.
-2. **feature, points:5 — verifier (`ctx archive verify --json`).** Full
-   phase 1–5 verification, machine-readable rejection reporting, the
-   adversarial fixture corpus (shared with later tickets). Depends on: (1)
-   for the shared bundle reader/encoder module.
-3. **feature, points:8 — fresh-root restore (`ctx archive restore`).**
-   Verify-first, staged root, single-transaction load with two-phase
-   session self-refs, blob installation, FTS/rowid-map rebuild, post-restore
-   integrity/search checks, failure-cleanup matrix, round-trip +
-   reimport-idempotence tests. Depends on: (1), (2).
-4. **docs, points:2 — user-facing docs wiring.** cli-reference/storage/
-   limitations updates describing the shipped commands and lifecycle,
-   embedded-docs registration, downgrade/caveat notes. Depends on: (3).
-
-#188 (compaction) builds on (1)–(3) plus its own retention ledger and
-subset-scope format revision; #189 (merging) builds on this container and
-encoding (verbatim `_json` carriage and `origin_device_id` were chosen for
-its conflict model) plus its own merge semantics. Neither may weaken the
-verification matrix.
+The writer, verifier, fresh-root restore, and user-facing documentation are
+shipped. Later work such as archive-first compaction (#188) or multi-machine
+merging (#189) requires its own format review and must not weaken this
+verification matrix or imply that v1 itself merges stores.

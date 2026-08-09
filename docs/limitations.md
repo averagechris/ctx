@@ -90,3 +90,32 @@ shipped.
 - This fork makes no network calls; there is no telemetry and no self-update.
   Update via Nix / SourceHut release tags.
 - No provider beyond the support matrix should be described as supported.
+
+## Portable Archives
+
+- `ctx archive create`, `verify`, and `restore` are local-only; they do not
+  upload, sync, or contact a remote service.
+- Archive v1 is a logical content bundle, not an exact SQLite disaster
+  snapshot. It is not a merge or overwrite operation, and restore requires a
+  strictly absent target (an empty existing directory is rejected).
+- Restore rebuilds the active record/event FTS projections and their store-local
+  rowid maps. It clears `artifact_search` and intentionally leaves it empty and
+  unused; restore does not repopulate every FTS table. It omits machine-local
+  operational tables, configuration, logs, and SQLite WAL/SHM state. See
+  [Portable archive workflows](archive.md) and the normative [format
+  contract](archive-format-v1.md).
+- Archive integrity checks do not provide encryption, signing, or authenticity
+  against an attacker able to rewrite the bundle. Compression is not
+  encryption; treat bundles as verbatim secret-bearing data.
+- Verification is bounded and fail-closed. It detects malformed layout,
+  truncation, digest/size mismatches, unsupported format versions, duplicate
+  or dangling content, and unsafe filesystem entries, but it cannot prove
+  provenance or recover data that was never archived.
+- Verification does not modify the published bundle, but it uses a private
+  sibling `.ctxar-verify-*/state.sqlite` scratch database and normally removes
+  it. A crash can leave that scratch path or unpublished create/restore staging;
+  treat all such residue as sensitive and do not open unknown roots.
+- The exclusive rename is the publication point. Before it, handled failures
+  leave the target absent and clean staging; a parent-directory `fsync` can
+  report an error after the complete target exists. Inspect and verify before
+  retrying, and never overwrite a target after such an error.

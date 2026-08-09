@@ -53,18 +53,57 @@ self-update. Update via Nix / SourceHut release tags.
 ## Archive Create
 
 ```bash
-ctx archive create /path/to/backup.ctxar
-ctx archive create /path/to/backup.ctxar --json
+work="$(mktemp -d "${TMPDIR:-/tmp}/ctx-archive.XXXXXX")"
+source_root="$work/source-root"
+bundle="$work/history.ctxar"       # absent destination
+restored_root="$work/restored-root" # absent destination
+CTX_DATA_ROOT="$source_root" ctx setup --catalog-only
+CTX_DATA_ROOT="$source_root" ctx archive create "$bundle"
+# Use `--json` instead of the preceding create command for script output.
+# ctx archive create "$bundle" --json
+ctx archive verify "$bundle"
+# ctx archive verify "$bundle" --json
+ctx archive restore "$bundle" "$restored_root"
 ```
 
-`archive create` writes the v1 private directory bundle described in
-[`archive-format-v1.md`](archive-format-v1.md). The destination must be absent;
-the writer streams all fifteen canonical entity files and referenced object
-bytes into a private sibling staging directory, self-checks the manifest and
-checksums, and atomically publishes only the completed bundle. Archive files
-contain verbatim history and artifact bytes, so treat them as secrets. The
-command is create-only in this release; verification and restore are separate
-follow-up commands.
+The complete user workflow, including fresh temporary paths, privacy, and
+failure semantics, is in [`archive.md`](archive.md). The normative bundle
+contract is [`archive-format-v1.md`](archive-format-v1.md).
+
+`archive create` writes a v1 private directory bundle. Its destination must be
+absent, even if an empty directory exists. The writer streams all fifteen
+canonical entity files and referenced object bytes into a private sibling
+staging directory, self-checks the manifest and checksums, writes `COMPLETE`
+last, and atomically publishes only the completed bundle. Archive files contain
+verbatim history and artifact bytes, so treat them as secrets. v1 has no
+internal compression or encryption and never uploads anything.
+
+`archive verify` is read-only with respect to the published bundle and performs
+the complete fail-closed verification pass. It creates a private sibling
+`.ctxar-verify-<id>/state.sqlite` scratch database beside the bundle and
+normally removes it; it does not modify bundle contents. `archive restore
+<bundle> <target>` verifies first and restores only to a strictly absent target
+data-root path; it never merges or overwrites. Restore rebuilds the active
+record/event FTS projections and explicit rowid maps; `artifact_search` is
+cleared and intentionally remains empty and unused. Machine-local operational
+tables are excluded. The archive format version is independent of the SQLite
+schema version; the current binary creates the destination schema normally.
+
+By default all three commands print a concise human result. With `--json`, a
+successful command prints one JSON object to stdout. For `verify`, and for the
+verification phase of `restore`, a typed verifier rejection is one JSON object
+on stderr, no stdout, and exit status `1`; use its stable `error.code`, not
+message text. Usage errors retain the CLI's exit status `2`. Restore destination
+or other restore failures remain ordinary runtime errors, including with
+`--json`, rather than typed verifier envelopes. A crash can leave unpublished
+create/restore staging (`<target>.tmp-*`) or verifier scratch
+(`.ctxar-verify-*/state.sqlite`); these paths are always sensitive and must not
+be opened or retried as roots. Confirm no operation is running before removing
+an expected residue, and never overwrite a target after an error near
+publication: exclusive rename is the publication point, but a parent `fsync`
+can fail after the complete target exists. Verification and restore accept
+the lowering-only bounds `--max-entities`, `--max-objects`,
+`--max-object-bytes`, and `--max-bytes`.
 
 ## Sources
 

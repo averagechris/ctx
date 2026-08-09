@@ -11,6 +11,8 @@ required_paths=(
   docs/getting-started.md
   docs/first-10-minutes.md
   docs/cli-reference.md
+  docs/archive.md
+  docs/archive-format-v1.md
   docs/contracts/json.md
   docs/storage.md
   docs/privacy-storage.md

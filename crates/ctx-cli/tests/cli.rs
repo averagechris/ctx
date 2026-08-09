@@ -4420,7 +4420,7 @@ fn docs_commands_expose_embedded_docs_and_man_pages() {
         .unwrap()
         .iter()
         .any(|topic| topic["id"] == "cli-reference"));
-    for topic_id in ["docs", "mcp", "sql", "storage"] {
+    for topic_id in ["archive", "docs", "mcp", "sql", "storage"] {
         assert!(list["topics"]
             .as_array()
             .unwrap()
@@ -4459,6 +4459,12 @@ fn docs_commands_expose_embedded_docs_and_man_pages() {
     assert_eq!(show["schema_version"], 1);
     assert_eq!(show["id"], "cli-reference");
     assert!(show["body"].as_str().unwrap().contains("ctx search"));
+
+    let archive = json_output(ctx(&temp).args(["docs", "show", "archive", "--format", "json"]));
+    assert!(archive["body"]
+        .as_str()
+        .unwrap()
+        .contains("ctx archive restore"));
 
     let mcp = json_output(ctx(&temp).args(["docs", "show", "mcp", "--format", "json"]));
     assert!(mcp["body"].as_str().unwrap().contains("ctx mcp serve"));

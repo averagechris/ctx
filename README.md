@@ -67,7 +67,8 @@ Search results include session and event IDs; use `ctx show event <id>` or
 | [MCP](docs/mcp.md) | Serving ctx tools to agents over MCP. |
 | [Providers](docs/providers.md) | Which agent histories ctx can discover, import, and search. |
 | [Large-index profile](docs/large-index-profile.md) | Deterministic bounded synthetic profile harness and manual large-run commands. |
-| [Archive format v1](docs/archive-format-v1.md) | Contract and implementation notes for `ctx archive create`, the portable, checksummed logical archive writer. |
+| [Portable archive workflows](docs/archive.md) | Create, verify, and restore private logical archives into fresh data roots. |
+| [Archive format v1](docs/archive-format-v1.md) | Normative container and stream contract for the portable, checksummed logical archive. |
 | [Fork plan](docs/fork-plan.md) | Why this fork exists and what was removed. |
 
 ## Privacy

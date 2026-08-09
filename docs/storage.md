@@ -67,6 +67,9 @@ This table describes core command effects.
 | `ctx search` | native provider transcript files, path metadata, enabled auto history-source plugin stdout, and SQLite index | SQLite index for newly discovered native provider or plugin history |
 | `ctx sql` | existing SQLite index only | none |
 | `ctx docs` | embedded documentation in the binary | selected topic `--out` path for `ctx docs show --out` or selected `--out` directory for `ctx docs man --out` |
+| `ctx archive create` | current SQLite content and referenced object bytes | absent private archive bundle, published atomically |
+| `ctx archive verify` | archive bundle and its private verifier scratch state | private sibling `.ctxar-verify-<id>/state.sqlite` scratch database, normally removed; bundle contents are not changed |
+| `ctx archive restore` | verified archive bundle and current binary's store schema | absent private data root, published atomically after staging |
 | `ctx doctor --storage` | SQLite index, data root metadata, file sizes, SQLite page/freelist metrics | none |
 
 `ctx status` and `ctx doctor --storage` do not migrate schemas, import history,
@@ -75,6 +78,31 @@ plain SQLite read-only opens so committed rows in a live WAL remain visible;
 SQLite may still coordinate through SHM while preserving database/WAL logical
 content. If an existing database cannot be opened or counted read-only, status
 returns an error rather than reporting zero counts.
+
+## Portable Archives
+
+Use [`archive.md`](archive.md) for the create, verify, and restore workflow. An
+archive is a private logical bundle, not a SQLite disaster-recovery snapshot:
+it contains canonical content and referenced object bytes, while active record
+and event FTS projections, explicit rowid maps, import ledgers, device/runtime
+state, and SQLite WAL/SHM/page state are rebuilt or intentionally excluded.
+Restore clears `artifact_search` and intentionally leaves it empty and unused;
+it does not repopulate every FTS table. Archive format v1 is independent of
+SQLite `user_version`; restore creates the destination using the current
+binary's normal schema path.
+
+Archive and restore destinations must be absent, including empty directories.
+Both operations stage beside the requested destination and publish with an
+atomic exclusive rename. Before that publication point, a handled failure
+leaves the target absent and cleans staging. A crash may leave unpublished but
+potentially complete `<target>.tmp-*` staging or
+`.ctxar-verify-*/state.sqlite` scratch residue; all of it is sensitive. Do not
+open unknown roots or point ctx at residue. After confirming no operation is
+running, remove only an expected residue as a whole directory; inspect only
+parent-level metadata if needed. A parent-directory `fsync` can fail after
+rename, so an error can be reported even though a complete target exists:
+inspect and verify before retrying, and never overwrite. Bundles hold verbatim
+history and are local-only; compression is not encryption.
 
 Storage status reports logical file sizes, not allocated disk blocks. Deep
 storage diagnostics distinguish SQLite logical bytes (`page_size * page_count`),

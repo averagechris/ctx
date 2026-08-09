@@ -105,6 +105,15 @@ const TOPICS: &[DocTopic] = &[
         body: include_str!("../../../docs/cli-reference.md"),
     },
     DocTopic {
+        id: "archive",
+        title: "Portable Archive Workflows",
+        audience: "human-agent",
+        summary: "Create, verify, and restore private portable archives into fresh data roots.",
+        tags: &["archive", "backup", "restore", "privacy"],
+        source_path: "docs/archive.md",
+        body: include_str!("../../../docs/archive.md"),
+    },
+    DocTopic {
         id: "docs",
         title: "Docs",
         audience: "human-agent",

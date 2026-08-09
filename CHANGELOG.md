@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+
+## v1.1.0 - 2026-08-09
+
 ### Added
 
 - `ctx evidence session|search|events` exports deterministic private JSONL or
@@ -12,7 +15,6 @@
   content proof, bounded provenance and citations, exact normalized byte
   accounting, and no raw payload, path, cursor, clock, filesystem, or ambient
   environment exposure (#278).
-
 ## v1.0.3 - 2026-08-06
 
 ### Added

@@ -59,9 +59,11 @@ use ctx_history_query::{
     DEFAULT_PAGE_BYTES, DEFAULT_SHOW_LIMIT, MAX_SHOW_LIMIT,
 };
 use ctx_history_store::{
-    ArchiveOptions, CatalogSession, CatalogSourceIndexUpdate, IdPrefixResolution, RawSqlOptions,
-    RawSqlResult, RawSqlValue, SourceHealthClassification, SourceImportFile,
-    SourceImportFileIndexUpdate, Store, StoreError, CATALOG_IMPORT_OUTCOME_UNATTRIBUTED_CODE,
+    archive_verification_error_code, verify_archive_bundle_with_options, ArchiveOptions,
+    ArchiveVerifyOptions, CatalogSession, CatalogSourceIndexUpdate, IdPrefixResolution,
+    RawSqlOptions, RawSqlResult, RawSqlValue, SourceHealthClassification, SourceImportFile,
+    SourceImportFileIndexUpdate, Store, StoreError, ARCHIVE_MAX_ENTITIES, ARCHIVE_MAX_OBJECTS,
+    ARCHIVE_MAX_OBJECT_BYTES, ARCHIVE_MAX_TOTAL_BYTES, CATALOG_IMPORT_OUTCOME_UNATTRIBUTED_CODE,
     RAW_SQL_DEFAULT_MAX_COLUMNS, RAW_SQL_DEFAULT_MAX_ROWS, RAW_SQL_DEFAULT_MAX_SQL_BYTES,
     RAW_SQL_DEFAULT_MAX_VALUE_BYTES, RAW_SQL_MAX_TIMEOUT, SOURCE_IMPORT_ZERO_YIELD_ANOMALY_CODE,
 };
@@ -139,6 +141,8 @@ struct ArchiveArgs {
 enum ArchiveCommand {
     #[command(about = "Stream the current data root into an atomic archive bundle")]
     Create(ArchiveCreateArgs),
+    #[command(about = "Verify a complete archive bundle without modifying it")]
+    Verify(ArchiveVerifyArgs),
 }
 
 #[derive(Debug, Args)]
@@ -147,6 +151,22 @@ struct ArchiveCreateArgs {
     target: PathBuf,
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ArchiveVerifyArgs {
+    #[arg(help = "Published archive bundle directory")]
+    bundle: PathBuf,
+    #[arg(long)]
+    json: bool,
+    #[arg(long, default_value_t = ARCHIVE_MAX_ENTITIES)]
+    max_entities: u64,
+    #[arg(long, default_value_t = ARCHIVE_MAX_OBJECTS)]
+    max_objects: u64,
+    #[arg(long, default_value_t = ARCHIVE_MAX_OBJECT_BYTES)]
+    max_object_bytes: u64,
+    #[arg(long, default_value_t = ARCHIVE_MAX_TOTAL_BYTES)]
+    max_bytes: u64,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -1773,6 +1793,7 @@ fn main_result() -> Result<()> {
 fn run_archive(args: ArchiveArgs, data_root: PathBuf) -> Result<()> {
     match args.command {
         ArchiveCommand::Create(create) => run_archive_create(create, data_root),
+        ArchiveCommand::Verify(verify) => run_archive_verify(verify),
     }
 }
 
@@ -1819,6 +1840,99 @@ fn run_archive_create(args: ArchiveCreateArgs, data_root: PathBuf) -> Result<()>
         );
     }
     Ok(())
+}
+
+fn archive_verification_message(code: &str) -> &'static str {
+    match code {
+        "marker_missing" => "the bundle has no completion marker",
+        "marker_invalid" => "the completion marker is malformed or unsupported",
+        "manifest_digest_mismatch" => "the completion marker does not authenticate the manifest",
+        "manifest_too_large" => "manifest.json exceeds the v1 size bound",
+        "format_unsupported" => "the bundle format or version is not supported",
+        "unknown_field" => "a manifest or stream record contains an unknown field",
+        "layout_mismatch" => "the bundle layout is not the exact v1 layout",
+        "stream_integrity_mismatch" => {
+            "a stream count, size, or digest does not match the manifest"
+        }
+        "stream_truncated" => "a stream is truncated or missing its final newline",
+        "line_too_long" => "a JSONL record exceeds the v1 line bound",
+        "record_malformed" => "a stream record is malformed or noncanonical",
+        "vocabulary_unknown" => "a stream enum value is outside the v1 vocabulary",
+        "duplicate_id" => "the bundle contains a duplicate entity ID",
+        "natural_key_conflict" => "the bundle contains a conflicting natural key",
+        "stream_unsorted" => "a stream is not in canonical order",
+        "dangling_reference" => "a stream reference does not resolve",
+        "blob_missing" => "a referenced object blob is missing",
+        "blob_unreferenced" => "the bundle contains an unreferenced object blob",
+        "blob_mismatch" => "an object blob path, size, or checksum is invalid",
+        "special_file" => "the bundle contains a symlink, hard link, or non-regular entry",
+        "permissions_writable" => "a bundle entry is group- or world-writable",
+        "size_cap_exceeded" => "the bundle exceeds a verifier size or count cap",
+        _ => "the bundle could not be verified",
+    }
+}
+
+fn run_archive_verify(args: ArchiveVerifyArgs) -> Result<()> {
+    let options = ArchiveVerifyOptions {
+        max_entities: args.max_entities,
+        max_objects: args.max_objects,
+        max_object_bytes: args.max_object_bytes,
+        max_total_bytes: args.max_bytes,
+    };
+    match verify_archive_bundle_with_options(&args.bundle, options) {
+        Ok(report) => {
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&json!({
+                        "format": "ctx-archive",
+                        "format_version": 1,
+                        "path": report.path,
+                        "verified": true,
+                        "entity_count": report.entity_count,
+                        "objects": {
+                            "count": report.object_count,
+                            "total_bytes": report.object_bytes,
+                        },
+                    }))?
+                );
+            } else {
+                println!(
+                    "verified archive ({} entities, {} objects): {}",
+                    report.entity_count,
+                    report.object_count,
+                    report.path.display()
+                );
+            }
+            Ok(())
+        }
+        Err(error) => {
+            let Some(code) = archive_verification_error_code(&error) else {
+                return Err(error.into());
+            };
+            let message = archive_verification_message(code);
+            if args.json {
+                eprintln!(
+                    "{}",
+                    serde_json::to_string(&json!({
+                        "error": {
+                            "code": code,
+                            "message": message,
+                            "path": args.bundle,
+                        }
+                    }))?
+                );
+            } else {
+                eprintln!(
+                    "archive verification failed [{}] for {}: {}",
+                    code,
+                    args.bundle.display(),
+                    message
+                );
+            }
+            Err(anyhow::Error::new(SilentExit { code: 1 }))
+        }
+    }
 }
 
 fn progress_mode_name(progress: ProgressArg) -> &'static str {

@@ -4,6 +4,7 @@ use ctx_history_store::verify_archive_bundle;
 use predicates::prelude::*;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
@@ -99,6 +100,262 @@ fn archive_cli_create_and_verify_work_under_system_tmp() {
         json_output(ctx(&temp).args(["archive", "create", target.to_str().unwrap(), "--json"]));
     assert_eq!(report["verified"], true);
     verify_archive_bundle(&target).unwrap();
+}
+
+#[test]
+fn archive_verify_has_stable_json_success_and_failure_without_mutating_bundle() {
+    let temp = tempdir();
+    json_output(ctx(&temp).args(["setup", "--catalog-only", "--progress", "none", "--json"]));
+    let target = temp.path().join("verify-contract.ctxar");
+    json_output(ctx(&temp).args(["archive", "create", target.to_str().unwrap(), "--json"]));
+
+    let before = fs::read(target.join("streams/01-capture_sources.jsonl")).unwrap();
+    let success = ctx(&temp)
+        .args(["archive", "verify", target.to_str().unwrap(), "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert_eq!(success.stderr, b"");
+    let success_json: Value = serde_json::from_slice(&success.stdout).unwrap();
+    assert_eq!(success_json["verified"], true);
+    assert_eq!(success_json["format_version"], 1);
+
+    let mut stream = fs::OpenOptions::new()
+        .append(true)
+        .open(target.join("streams/01-capture_sources.jsonl"))
+        .unwrap();
+    stream.write_all(b"{}\n").unwrap();
+    let failed = ctx(&temp)
+        .args(["archive", "verify", target.to_str().unwrap(), "--json"])
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    assert_eq!(failed.stdout, b"");
+    let error_json: Value = serde_json::from_slice(&failed.stderr).unwrap();
+    assert_eq!(error_json["error"]["code"], "stream_integrity_mismatch");
+    assert_eq!(error_json["error"]["path"], target.to_str().unwrap());
+    assert_eq!(
+        fs::read(target.join("streams/01-capture_sources.jsonl")).unwrap(),
+        {
+            let mut expected = before;
+            expected.extend_from_slice(b"{}\n");
+            expected
+        }
+    );
+
+    let capped = temp.path().join("caps.ctxar");
+    json_output(ctx(&temp).args(["archive", "create", capped.to_str().unwrap(), "--json"]));
+    let lowered = ctx(&temp)
+        .args([
+            "archive",
+            "verify",
+            capped.to_str().unwrap(),
+            "--json",
+            "--max-entities",
+            "0",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&lowered.stdout).unwrap()["verified"],
+        true
+    );
+    assert_eq!(lowered.stderr, b"");
+
+    let above_ceiling = ctx(&temp)
+        .args([
+            "archive",
+            "verify",
+            capped.to_str().unwrap(),
+            "--json",
+            "--max-entities",
+            "10000001",
+        ])
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    assert_eq!(above_ceiling.stdout, b"");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&above_ceiling.stderr).unwrap()["error"]["code"],
+        "size_cap_exceeded"
+    );
+
+    let usage = ctx(&temp)
+        .args(["archive", "verify", "--json"])
+        .assert()
+        .code(2)
+        .get_output()
+        .clone();
+    assert!(usage.stdout.is_empty());
+    assert!(!usage.stderr.is_empty());
+}
+
+fn archive_digest(bytes: impl AsRef<[u8]>) -> String {
+    bytes
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn archive_tree_snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    fn visit(root: &Path, path: &Path, output: &mut Vec<(PathBuf, Vec<u8>)>) {
+        let mut entries = fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let relative = path.strip_prefix(root).unwrap().to_path_buf();
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            if metadata.is_dir() {
+                output.push((relative.clone(), b"directory".to_vec()));
+                visit(root, &path, output);
+            } else if metadata.file_type().is_symlink() {
+                output.push((
+                    relative,
+                    fs::read_link(&path)
+                        .unwrap()
+                        .as_os_str()
+                        .as_encoded_bytes()
+                        .to_vec(),
+                ));
+            } else {
+                output.push((relative, fs::read(&path).unwrap()));
+            }
+        }
+    }
+    let mut output = Vec::new();
+    visit(root, root, &mut output);
+    output
+}
+
+fn assert_archive_verify_json_failure(temp: &TempDir, bundle: &Path, code: &str, message: &str) {
+    let before = archive_tree_snapshot(bundle);
+    let output = ctx(temp)
+        .args(["archive", "verify", bundle.to_str().unwrap(), "--json"])
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    assert!(output.stdout.is_empty());
+    let value: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(value.as_object().unwrap().len(), 1);
+    assert_eq!(value["error"].as_object().unwrap().len(), 3);
+    assert_eq!(value["error"]["code"], code);
+    assert_eq!(value["error"]["message"], message);
+    assert_eq!(value["error"]["path"], bundle.to_str().unwrap());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!stderr.contains("diagnostic"));
+    assert!(!stderr.contains(".ctxar-verify-"));
+    assert_eq!(archive_tree_snapshot(bundle), before);
+    assert!(fs::read_dir(temp.path()).unwrap().all(|entry| !entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with(".ctxar-verify-")));
+}
+
+#[cfg(unix)]
+#[test]
+fn archive_verify_cli_reports_public_marker_filesystem_and_object_boundaries() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir();
+    json_output(ctx(&temp).args(["setup", "--catalog-only", "--progress", "none", "--json"]));
+    let blob = b"public archive verifier object";
+    let hash = archive_digest(Sha256::digest(blob));
+    let shard = temp.path().join("objects").join(&hash[..2]);
+    fs::create_dir_all(&shard).unwrap();
+    fs::write(shard.join(&hash), blob).unwrap();
+    Connection::open(temp.path().join("work.sqlite"))
+        .unwrap()
+        .execute(
+            "INSERT INTO artifacts (id,kind,blob_hash,blob_path,byte_size,redaction_state,created_at_ms,updated_at_ms,metadata_json) VALUES (?1,'binary',?2,?3,?4,'raw',1,1,'{}')",
+            params!["30000000-0000-7000-8000-000000000001", hash, format!("objects/{}/{}", &hash[..2], hash), blob.len() as i64],
+        )
+        .unwrap();
+    let base = temp.path().join("public-boundary-base.ctxar");
+    json_output(ctx(&temp).args(["archive", "create", base.to_str().unwrap(), "--json"]));
+
+    let marker_invalid = temp.path().join("marker-invalid.ctxar");
+    copy_dir_all(&base, &marker_invalid);
+    let marker = fs::read_to_string(marker_invalid.join("COMPLETE"))
+        .unwrap()
+        .replace("\"format_version\":1", "\"format_version\":\"1\"");
+    fs::write(marker_invalid.join("COMPLETE"), marker).unwrap();
+    assert_archive_verify_json_failure(
+        &temp,
+        &marker_invalid,
+        "marker_invalid",
+        "the completion marker is malformed or unsupported",
+    );
+
+    let unsupported = temp.path().join("version-unsupported.ctxar");
+    copy_dir_all(&base, &unsupported);
+    let marker = fs::read_to_string(unsupported.join("COMPLETE"))
+        .unwrap()
+        .replace("\"format_version\":1", "\"format_version\":2");
+    fs::write(unsupported.join("COMPLETE"), marker).unwrap();
+    assert_archive_verify_json_failure(
+        &temp,
+        &unsupported,
+        "format_unsupported",
+        "the bundle format or version is not supported",
+    );
+
+    let writable = temp.path().join("writable.ctxar");
+    copy_dir_all(&base, &writable);
+    fs::set_permissions(
+        writable.join("streams/01-capture_sources.jsonl"),
+        fs::Permissions::from_mode(0o622),
+    )
+    .unwrap();
+    assert_archive_verify_json_failure(
+        &temp,
+        &writable,
+        "permissions_writable",
+        "a bundle entry is group- or world-writable",
+    );
+    assert_eq!(
+        fs::metadata(writable.join("streams/01-capture_sources.jsonl"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o622
+    );
+
+    let missing = temp.path().join("object-missing.ctxar");
+    copy_dir_all(&base, &missing);
+    fs::remove_file(missing.join("objects").join(&hash[..2]).join(&hash)).unwrap();
+    fs::remove_dir(missing.join("objects").join(&hash[..2])).unwrap();
+    assert_archive_verify_json_failure(
+        &temp,
+        &missing,
+        "blob_missing",
+        "a referenced object blob is missing",
+    );
+
+    let corrupt = temp.path().join("object-corrupt.ctxar");
+    copy_dir_all(&base, &corrupt);
+    fs::write(
+        corrupt.join("objects").join(&hash[..2]).join(&hash),
+        vec![b'x'; blob.len()],
+    )
+    .unwrap();
+    assert_archive_verify_json_failure(
+        &temp,
+        &corrupt,
+        "blob_mismatch",
+        "an object blob path, size, or checksum is invalid",
+    );
 }
 
 fn insert_ambiguous_ctx_ids(temp: &TempDir) {

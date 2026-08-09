@@ -74,7 +74,102 @@ const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_JSONL_LINE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_COMPLETE_BYTES: usize = 4 * 1024;
+/// Fixed v1 verifier ceilings.  An invocation may lower these ceilings, but
+/// never raise them.  They bound declarations before the verifier starts
+/// reading untrusted stream or object content.
+pub const ARCHIVE_MAX_ENTITIES: u64 = 10_000_000;
+pub const ARCHIVE_MAX_OBJECTS: u64 = 1_000_000;
+pub const ARCHIVE_MAX_OBJECT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+pub const ARCHIVE_MAX_TOTAL_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const EXPORT_PAGE_ROWS: usize = 256;
+
+/// The stable machine-readable rejection vocabulary for archive verification.
+/// Keep this list in lockstep with the v1 contract and the CLI documentation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveVerificationCode {
+    MarkerMissing,
+    MarkerInvalid,
+    ManifestDigestMismatch,
+    ManifestTooLarge,
+    FormatUnsupported,
+    UnknownField,
+    LayoutMismatch,
+    StreamIntegrityMismatch,
+    StreamTruncated,
+    LineTooLong,
+    RecordMalformed,
+    VocabularyUnknown,
+    DuplicateId,
+    NaturalKeyConflict,
+    StreamUnsorted,
+    DanglingReference,
+    BlobMissing,
+    BlobUnreferenced,
+    BlobMismatch,
+    SpecialFile,
+    PermissionsWritable,
+    SizeCapExceeded,
+}
+
+impl ArchiveVerificationCode {
+    pub const ALL: [Self; 22] = [
+        Self::MarkerMissing,
+        Self::MarkerInvalid,
+        Self::ManifestDigestMismatch,
+        Self::ManifestTooLarge,
+        Self::FormatUnsupported,
+        Self::UnknownField,
+        Self::LayoutMismatch,
+        Self::StreamIntegrityMismatch,
+        Self::StreamTruncated,
+        Self::LineTooLong,
+        Self::RecordMalformed,
+        Self::VocabularyUnknown,
+        Self::DuplicateId,
+        Self::NaturalKeyConflict,
+        Self::StreamUnsorted,
+        Self::DanglingReference,
+        Self::BlobMissing,
+        Self::BlobUnreferenced,
+        Self::BlobMismatch,
+        Self::SpecialFile,
+        Self::PermissionsWritable,
+        Self::SizeCapExceeded,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MarkerMissing => "marker_missing",
+            Self::MarkerInvalid => "marker_invalid",
+            Self::ManifestDigestMismatch => "manifest_digest_mismatch",
+            Self::ManifestTooLarge => "manifest_too_large",
+            Self::FormatUnsupported => "format_unsupported",
+            Self::UnknownField => "unknown_field",
+            Self::LayoutMismatch => "layout_mismatch",
+            Self::StreamIntegrityMismatch => "stream_integrity_mismatch",
+            Self::StreamTruncated => "stream_truncated",
+            Self::LineTooLong => "line_too_long",
+            Self::RecordMalformed => "record_malformed",
+            Self::VocabularyUnknown => "vocabulary_unknown",
+            Self::DuplicateId => "duplicate_id",
+            Self::NaturalKeyConflict => "natural_key_conflict",
+            Self::StreamUnsorted => "stream_unsorted",
+            Self::DanglingReference => "dangling_reference",
+            Self::BlobMissing => "blob_missing",
+            Self::BlobUnreferenced => "blob_unreferenced",
+            Self::BlobMismatch => "blob_mismatch",
+            Self::SpecialFile => "special_file",
+            Self::PermissionsWritable => "permissions_writable",
+            Self::SizeCapExceeded => "size_cap_exceeded",
+        }
+    }
+}
+
+impl std::fmt::Display for ArchiveVerificationCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 #[cfg(unix)]
 struct AnchoredDir(File);
@@ -240,7 +335,20 @@ fn openat_checked(
         | if directory { libc::O_DIRECTORY } else { 0 };
     let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
     if fd < 0 {
-        return Err(std::io::Error::last_os_error().into());
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ELOOP) {
+            return Err(verification_error(
+                ArchiveVerificationCode::SpecialFile,
+                "bundle entry is a symlink",
+            ));
+        }
+        if directory && error.raw_os_error() == Some(libc::ENOTDIR) {
+            return Err(verification_error(
+                ArchiveVerificationCode::SpecialFile,
+                "bundle entry is not a directory",
+            ));
+        }
+        return Err(error.into());
     }
     let file = unsafe { File::from_raw_fd(fd) };
     validate_open_file(&file, directory, allow_sticky_tmp)?;
@@ -252,10 +360,16 @@ fn validate_open_file(file: &File, directory: bool, allow_sticky_tmp: bool) -> R
     let metadata = file.metadata()?;
     if directory {
         if !metadata.is_dir() {
-            return Err(archive_error("expected a directory descriptor"));
+            return Err(verification_error(
+                ArchiveVerificationCode::SpecialFile,
+                "expected a directory descriptor",
+            ));
         }
     } else if !metadata.is_file() || metadata.nlink() > 1 {
-        return Err(archive_error("expected a regular non-hard-linked file"));
+        return Err(verification_error(
+            ArchiveVerificationCode::SpecialFile,
+            "expected a regular non-hard-linked file",
+        ));
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let _ = allow_sticky_tmp;
@@ -263,7 +377,8 @@ fn validate_open_file(file: &File, directory: bool, allow_sticky_tmp: bool) -> R
     if allow_sticky_tmp {
         use std::os::unix::fs::PermissionsExt;
         if metadata.permissions().mode() & 0o7777 != 0o1777 {
-            return Err(archive_error(
+            return Err(verification_error(
+                ArchiveVerificationCode::PermissionsWritable,
                 "trusted temporary root has an unexpected mode",
             ));
         }
@@ -310,6 +425,33 @@ pub struct ArchiveReport {
     pub object_count: u64,
     pub object_bytes: u64,
     pub entity_count: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ArchiveVerifyOptions {
+    pub max_entities: u64,
+    pub max_objects: u64,
+    pub max_object_bytes: u64,
+    pub max_total_bytes: u64,
+}
+
+impl Default for ArchiveVerifyOptions {
+    fn default() -> Self {
+        Self {
+            max_entities: ARCHIVE_MAX_ENTITIES,
+            max_objects: ARCHIVE_MAX_OBJECTS,
+            max_object_bytes: ARCHIVE_MAX_OBJECT_BYTES,
+            max_total_bytes: ARCHIVE_MAX_TOTAL_BYTES,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ArchiveVerificationReport {
+    pub path: PathBuf,
+    pub entity_count: u64,
+    pub object_count: u64,
+    pub object_bytes: u64,
 }
 
 impl Store {
@@ -1175,14 +1317,32 @@ fn self_verify_staged(
     if read_bounded(&stage.join("manifest.json"), MAX_MANIFEST_BYTES, "manifest")? != manifest {
         return Err(archive_error("manifest changed before completion"));
     }
-    verify_v1_bundle(stage)
+    verify_v1_bundle(stage, ArchiveVerifyOptions::default(), false).map(|_| ())
 }
 
-/// Verify a complete v1 bundle without modifying it. The public command and
-/// stable rejection vocabulary are intentionally owned by the follow-up
-/// verifier ticket; this reusable core is shared by the writer now.
+/// Verify a complete v1 bundle without modifying it.
 pub fn verify_archive_bundle(path: impl AsRef<Path>) -> Result<()> {
-    verify_v1_bundle(path.as_ref())
+    verify_v1_bundle(path.as_ref(), ArchiveVerifyOptions::default(), true).map(|_| ())
+}
+
+/// Verify a complete v1 bundle with caller-selected lower resource ceilings.
+/// The fixed v1 ceilings remain load-bearing and cannot be raised.
+pub fn verify_archive_bundle_with_options(
+    path: impl AsRef<Path>,
+    options: ArchiveVerifyOptions,
+) -> Result<ArchiveVerificationReport> {
+    let fixed = ArchiveVerifyOptions::default();
+    if options.max_entities > fixed.max_entities
+        || options.max_objects > fixed.max_objects
+        || options.max_object_bytes > fixed.max_object_bytes
+        || options.max_total_bytes > fixed.max_total_bytes
+    {
+        return Err(verification_error(
+            ArchiveVerificationCode::SizeCapExceeded,
+            "archive verification cap exceeds the v1 bound",
+        ));
+    }
+    verify_v1_bundle(path.as_ref(), options, true)
 }
 
 #[derive(Debug, Clone)]
@@ -1294,7 +1454,10 @@ fn parse_json_object(bytes: &[u8]) -> Result<OrderedObject> {
     deserializer.end()?;
     match value {
         JsonNode::Object(object) => Ok(object),
-        _ => Err(archive_error("archive record is not a JSON object")),
+        _ => Err(verification_error(
+            ArchiveVerificationCode::RecordMalformed,
+            "archive record is not a JSON object",
+        )),
     }
 }
 
@@ -1303,15 +1466,21 @@ fn object_value<'a>(object: &'a OrderedObject, name: &str) -> Result<&'a JsonNod
         .iter()
         .find(|(key, _)| key == name)
         .map(|(_, value)| value)
-        .ok_or_else(|| archive_error(format!("missing archive field: {name}")))
+        .ok_or_else(|| {
+            verification_error(
+                ArchiveVerificationCode::RecordMalformed,
+                format!("missing archive field: {name}"),
+            )
+        })
 }
 
 fn required_string(object: &OrderedObject, name: &str) -> Result<String> {
     match object_value(object, name)? {
         JsonNode::String(value) => Ok(value.clone()),
-        _ => Err(archive_error(format!(
-            "archive field {name} is not a string"
-        ))),
+        _ => Err(verification_error(
+            ArchiveVerificationCode::RecordMalformed,
+            format!("archive field {name} is not a string"),
+        )),
     }
 }
 
@@ -1319,27 +1488,35 @@ fn optional_string(object: &OrderedObject, name: &str) -> Result<Option<String>>
     match object.iter().find(|(key, _)| key == name) {
         None => Ok(None),
         Some((_, JsonNode::String(value))) => Ok(Some(value.clone())),
-        Some(_) => Err(archive_error(format!(
-            "archive field {name} is not a string"
-        ))),
+        Some(_) => Err(verification_error(
+            ArchiveVerificationCode::RecordMalformed,
+            format!("archive field {name} is not a string"),
+        )),
     }
 }
 
 fn required_i64(object: &OrderedObject, name: &str) -> Result<i64> {
     match object_value(object, name)? {
-        JsonNode::Number(value) => value
-            .as_i64()
-            .ok_or_else(|| archive_error(format!("archive field {name} is not a signed integer"))),
-        _ => Err(archive_error(format!(
-            "archive field {name} is not an integer"
-        ))),
+        JsonNode::Number(value) => value.as_i64().ok_or_else(|| {
+            verification_error(
+                ArchiveVerificationCode::RecordMalformed,
+                format!("archive field {name} is not a signed integer"),
+            )
+        }),
+        _ => Err(verification_error(
+            ArchiveVerificationCode::RecordMalformed,
+            format!("archive field {name} is not an integer"),
+        )),
     }
 }
 
 fn required_nonnegative_i64(object: &OrderedObject, name: &str) -> Result<i64> {
     let value = required_i64(object, name)?;
     if value < 0 {
-        return Err(archive_error(format!("archive field {name} is negative")));
+        return Err(verification_error(
+            ArchiveVerificationCode::RecordMalformed,
+            format!("archive field {name} is negative"),
+        ));
     }
     Ok(value)
 }
@@ -1347,9 +1524,10 @@ fn required_nonnegative_i64(object: &OrderedObject, name: &str) -> Result<i64> {
 fn required_bool(object: &OrderedObject, name: &str) -> Result<bool> {
     match object_value(object, name)? {
         JsonNode::Bool(value) => Ok(*value),
-        _ => Err(archive_error(format!(
-            "archive field {name} is not a boolean"
-        ))),
+        _ => Err(verification_error(
+            ArchiveVerificationCode::RecordMalformed,
+            format!("archive field {name} is not a boolean"),
+        )),
     }
 }
 
@@ -1648,26 +1826,33 @@ fn validate_field_order(object: &OrderedObject, schema: &[FieldSpec]) -> Result<
     for (key, value) in object {
         while position < schema.len() && schema[position].name != key {
             if !schema[position].optional {
-                return Err(archive_error(format!(
-                    "archive field order or required field mismatch: {key}"
-                )));
+                return Err(verification_error(
+                    ArchiveVerificationCode::RecordMalformed,
+                    format!("archive field order or required field mismatch: {key}"),
+                ));
             }
             position += 1;
         }
         if position == schema.len() {
-            return Err(archive_error(format!("unknown archive field: {key}")));
+            return Err(verification_error(
+                ArchiveVerificationCode::UnknownField,
+                format!("unknown archive field: {key}"),
+            ));
         }
         if matches!(value, JsonNode::Null) {
-            return Err(archive_error(format!("archive field is null: {key}")));
+            return Err(verification_error(
+                ArchiveVerificationCode::RecordMalformed,
+                format!("archive field is null: {key}"),
+            ));
         }
         position += 1;
     }
     while position < schema.len() {
         if !schema[position].optional {
-            return Err(archive_error(format!(
-                "missing archive field: {}",
-                schema[position].name
-            )));
+            return Err(verification_error(
+                ArchiveVerificationCode::RecordMalformed,
+                format!("missing archive field: {}", schema[position].name),
+            ));
         }
         position += 1;
     }
@@ -1688,10 +1873,15 @@ fn uuid_field(name: &str) -> bool {
 }
 
 fn validate_uuid(value: &str) -> Result<()> {
-    let uuid = Uuid::parse_str(value)
-        .map_err(|_| archive_error(format!("archive UUID is malformed: {value}")))?;
+    let uuid = Uuid::parse_str(value).map_err(|_| {
+        verification_error(
+            ArchiveVerificationCode::RecordMalformed,
+            format!("archive UUID is malformed: {value}"),
+        )
+    })?;
     if uuid.to_string() != value {
-        return Err(archive_error(
+        return Err(verification_error(
+            ArchiveVerificationCode::RecordMalformed,
             "archive UUID is not canonical lowercase hyphenated form",
         ));
     }
@@ -1839,18 +2029,29 @@ fn validate_record(stream: usize, object: &OrderedObject) -> Result<()> {
         if uuid_field(key) {
             validate_uuid(match value {
                 JsonNode::String(value) => value,
-                _ => return Err(archive_error(format!("UUID field is not a string: {key}"))),
+                _ => {
+                    return Err(verification_error(
+                        ArchiveVerificationCode::RecordMalformed,
+                        format!("UUID field is not a string: {key}"),
+                    ))
+                }
             })?;
         }
         if let Some(values) = enum_values(stream, key) {
             let value = match value {
                 JsonNode::String(value) => value,
-                _ => return Err(archive_error(format!("enum field is not a string: {key}"))),
+                _ => {
+                    return Err(verification_error(
+                        ArchiveVerificationCode::RecordMalformed,
+                        format!("enum field is not a string: {key}"),
+                    ))
+                }
             };
             if !values.contains(&value.as_str()) {
-                return Err(archive_error(format!(
-                    "unknown archive vocabulary value for {key}"
-                )));
+                return Err(verification_error(
+                    ArchiveVerificationCode::VocabularyUnknown,
+                    format!("unknown archive vocabulary value for {key}"),
+                ));
             }
         }
         match key.as_str() {
@@ -1861,12 +2062,20 @@ fn validate_record(stream: usize, object: &OrderedObject) -> Result<()> {
                 required_nonnegative_i64(object, key)?;
             }
             "process_id" => {
-                u32::try_from(required_i64(object, key)?)
-                    .map_err(|_| archive_error("archive process_id is outside u32 range"))?;
+                u32::try_from(required_i64(object, key)?).map_err(|_| {
+                    verification_error(
+                        ArchiveVerificationCode::RecordMalformed,
+                        "archive process_id is outside u32 range",
+                    )
+                })?;
             }
             "exit_code" => {
-                i32::try_from(required_i64(object, key)?)
-                    .map_err(|_| archive_error("archive exit_code is outside i32 range"))?;
+                i32::try_from(required_i64(object, key)?).map_err(|_| {
+                    verification_error(
+                        ArchiveVerificationCode::RecordMalformed,
+                        "archive exit_code is outside i32 range",
+                    )
+                })?;
             }
             "line_count_delta"
             | "created_at_ms"
@@ -1882,21 +2091,26 @@ fn validate_record(stream: usize, object: &OrderedObject) -> Result<()> {
             }
             _ => {
                 if !matches!(value, JsonNode::String(_)) {
-                    return Err(archive_error(format!(
-                        "archive field has wrong type: {key}"
-                    )));
+                    return Err(verification_error(
+                        ArchiveVerificationCode::RecordMalformed,
+                        format!("archive field has wrong type: {key}"),
+                    ));
                 }
             }
         }
     }
     if let Some(hash) = optional_string(object, "blob_hash")? {
         if !is_sha256_hex(&hash) {
-            return Err(archive_error("archive blob hash is malformed"));
+            return Err(verification_error(
+                ArchiveVerificationCode::RecordMalformed,
+                "archive blob hash is malformed",
+            ));
         }
     }
     if let Some(provider) = optional_string(object, "provider")? {
         if !PROVIDERS.contains(&provider.as_str()) {
-            return Err(archive_error(
+            return Err(verification_error(
+                ArchiveVerificationCode::VocabularyUnknown,
                 "archive provider is outside the v1 vocabulary",
             ));
         }
@@ -1965,35 +2179,69 @@ fn named_schema(name: &str) -> Vec<FieldSpec> {
 fn as_object<'a>(value: &'a JsonNode, label: &str) -> Result<&'a OrderedObject> {
     match value {
         JsonNode::Object(object) => Ok(object),
-        _ => Err(archive_error(format!("{label} is not an object"))),
+        _ => Err(verification_error(
+            ArchiveVerificationCode::RecordMalformed,
+            format!("{label} is not an object"),
+        )),
     }
 }
 
 fn as_array<'a>(value: &'a JsonNode, label: &str) -> Result<&'a [JsonNode]> {
     match value {
         JsonNode::Array(values) => Ok(values),
-        _ => Err(archive_error(format!("{label} is not an array"))),
+        _ => Err(verification_error(
+            ArchiveVerificationCode::RecordMalformed,
+            format!("{label} is not an array"),
+        )),
     }
 }
 
 fn required_u64(object: &OrderedObject, name: &str) -> Result<u64> {
     let value = required_nonnegative_i64(object, name)?;
-    u64::try_from(value).map_err(|_| archive_error(format!("archive field {name} is out of range")))
+    u64::try_from(value).map_err(|_| {
+        verification_error(
+            ArchiveVerificationCode::RecordMalformed,
+            format!("archive field {name} is out of range"),
+        )
+    })
 }
 
-fn parse_manifest(bytes: &[u8]) -> Result<ManifestInfo> {
+fn require_v1_version(object: &OrderedObject, name: &str) -> Result<()> {
+    match object_value(object, name)? {
+        JsonNode::Number(value) if value.as_i64() == Some(1) => Ok(()),
+        JsonNode::Number(_) => Err(verification_error(
+            ArchiveVerificationCode::FormatUnsupported,
+            format!("unsupported {name}"),
+        )),
+        _ => Err(verification_error(
+            ArchiveVerificationCode::FormatUnsupported,
+            format!("{name} is not a numeric v1 version"),
+        )),
+    }
+}
+
+fn parse_manifest(bytes: &[u8], options: ArchiveVerifyOptions) -> Result<ManifestInfo> {
     let line = single_line(bytes, MAX_MANIFEST_BYTES, "manifest")?;
     let object = parse_json_object(line)?;
     validate_field_order(&object, &named_schema("manifest"))?;
-    if required_string(&object, "format")? != "ctx-archive"
-        || required_i64(&object, "format_version")? != 1
-    {
-        return Err(archive_error("unsupported archive format or version"));
+    if required_string(&object, "format")? != "ctx-archive" {
+        return Err(verification_error(
+            ArchiveVerificationCode::FormatUnsupported,
+            "unsupported archive format",
+        ));
     }
-    let archive_id = Uuid::parse_str(&required_string(&object, "archive_id")?)
-        .map_err(|_| archive_error("manifest archive_id is malformed"))?;
+    require_v1_version(&object, "format_version")?;
+    let archive_id = Uuid::parse_str(&required_string(&object, "archive_id")?).map_err(|_| {
+        verification_error(
+            ArchiveVerificationCode::RecordMalformed,
+            "manifest archive_id is malformed",
+        )
+    })?;
     if archive_id.to_string() != required_string(&object, "archive_id")? {
-        return Err(archive_error("manifest archive_id is not canonical"));
+        return Err(verification_error(
+            ArchiveVerificationCode::RecordMalformed,
+            "manifest archive_id is not canonical",
+        ));
     }
     required_i64(&object, "created_at_ms")?;
     required_i64(&object, "source_schema_version")?;
@@ -2001,17 +2249,24 @@ fn parse_manifest(bytes: &[u8]) -> Result<ManifestInfo> {
     let generator = as_object(object_value(&object, "generator")?, "manifest generator")?;
     validate_field_order(generator, &named_schema("generator"))?;
     if required_string(generator, "name")? != "ctx" {
-        return Err(archive_error("manifest generator name is invalid"));
+        return Err(verification_error(
+            ArchiveVerificationCode::RecordMalformed,
+            "manifest generator name is invalid",
+        ));
     }
     required_string(generator, "version")?;
     let scope = as_object(object_value(&object, "scope")?, "manifest scope")?;
     validate_field_order(scope, &named_schema("scope"))?;
     if required_string(scope, "kind")? != "full" {
-        return Err(archive_error("manifest scope is not full"));
+        return Err(verification_error(
+            ArchiveVerificationCode::RecordMalformed,
+            "manifest scope is not full",
+        ));
     }
     let streams = as_array(object_value(&object, "streams")?, "manifest streams")?;
     if streams.len() != STREAMS.len() {
-        return Err(archive_error(
+        return Err(verification_error(
+            ArchiveVerificationCode::RecordMalformed,
             "manifest does not list exactly fifteen streams",
         ));
     }
@@ -2030,34 +2285,81 @@ fn parse_manifest(bytes: &[u8]) -> Result<ManifestInfo> {
             || meta.path != format!("streams/{}", STREAMS[index].1)
             || !is_sha256_hex(&meta.sha256)
         {
-            return Err(archive_error("manifest stream index or path is invalid"));
+            return Err(verification_error(
+                ArchiveVerificationCode::LayoutMismatch,
+                "manifest stream index or path is invalid",
+            ));
         }
         stream_meta.push(meta);
     }
     let objects = as_object(object_value(&object, "objects")?, "manifest objects")?;
     validate_field_order(objects, &named_schema("objects"))?;
     if canonical_json(&JsonNode::Object(object.clone())).as_bytes() != line {
-        return Err(archive_error("manifest is not canonical v1 JSON"));
+        return Err(verification_error(
+            ArchiveVerificationCode::RecordMalformed,
+            "manifest is not canonical v1 JSON",
+        ));
+    }
+    let entity_count = required_u64(&object, "entity_count")?;
+    let object_count = required_u64(objects, "count")?;
+    let object_bytes = required_u64(objects, "total_bytes")?;
+    let stream_bytes = stream_meta.iter().try_fold(0_u64, |total, stream| {
+        total.checked_add(stream.bytes).ok_or_else(|| {
+            verification_error(
+                ArchiveVerificationCode::SizeCapExceeded,
+                "archive declared byte total overflows",
+            )
+        })
+    })?;
+    let total_bytes = stream_bytes.checked_add(object_bytes).ok_or_else(|| {
+        verification_error(
+            ArchiveVerificationCode::SizeCapExceeded,
+            "archive declared byte total overflows",
+        )
+    })?;
+    if entity_count > options.max_entities
+        || object_count > options.max_objects
+        || object_bytes > options.max_object_bytes
+        || total_bytes > options.max_total_bytes
+    {
+        return Err(verification_error(
+            ArchiveVerificationCode::SizeCapExceeded,
+            "archive declared size cap exceeded",
+        ));
     }
     Ok(ManifestInfo {
-        entity_count: required_u64(&object, "entity_count")?,
-        object_count: required_u64(objects, "count")?,
-        object_bytes: required_u64(objects, "total_bytes")?,
+        entity_count,
+        object_count,
+        object_bytes,
         streams: stream_meta,
     })
 }
 
 fn single_line<'a>(bytes: &'a [u8], maximum: usize, label: &str) -> Result<&'a [u8]> {
     if bytes.len() > maximum {
-        return Err(archive_error(format!("{label} exceeds its size limit")));
+        let code = if label == "manifest" {
+            ArchiveVerificationCode::ManifestTooLarge
+        } else {
+            ArchiveVerificationCode::MarkerInvalid
+        };
+        return Err(verification_error(
+            code,
+            format!("{label} exceeds its size limit"),
+        ));
     }
     if !bytes.ends_with(b"\n")
         || bytes[..bytes.len() - 1].contains(&b'\n')
         || bytes.contains(&b'\r')
     {
-        return Err(archive_error(format!(
-            "{label} is not one newline-terminated line"
-        )));
+        let code = if label == "manifest" {
+            ArchiveVerificationCode::RecordMalformed
+        } else {
+            ArchiveVerificationCode::MarkerInvalid
+        };
+        return Err(verification_error(
+            code,
+            format!("{label} is not one newline-terminated line"),
+        ));
     }
     Ok(&bytes[..bytes.len() - 1])
 }
@@ -2068,14 +2370,26 @@ fn read_bounded(path: &Path, maximum: usize, label: &str) -> Result<Vec<u8>> {
 }
 
 fn read_bounded_file(mut file: File, maximum: usize, label: &str) -> Result<Vec<u8>> {
-    let limit = u64::try_from(maximum)
-        .map_err(|_| archive_error(format!("{label} size limit is out of range")))?;
+    let limit = u64::try_from(maximum).map_err(|_| {
+        verification_error(
+            ArchiveVerificationCode::SizeCapExceeded,
+            format!("{label} size limit is out of range"),
+        )
+    })?;
     let mut bytes = Vec::with_capacity(maximum.min(64 * 1024).saturating_add(1));
     Read::by_ref(&mut file)
         .take(limit.saturating_add(1))
         .read_to_end(&mut bytes)?;
     if bytes.len() > maximum {
-        return Err(archive_error(format!("{label} exceeds its size limit")));
+        let code = if label == "manifest" {
+            ArchiveVerificationCode::ManifestTooLarge
+        } else {
+            ArchiveVerificationCode::MarkerInvalid
+        };
+        return Err(verification_error(
+            code,
+            format!("{label} exceeds its size limit"),
+        ));
     }
     Ok(bytes)
 }
@@ -2091,12 +2405,18 @@ fn read_capped_line<R: BufRead>(reader: &mut R, line: &mut Vec<u8>) -> Result<us
             .saturating_add(1)
             .saturating_sub(line.len());
         if remaining == 0 {
-            return Err(archive_error("stream line exceeds the 32 MiB limit"));
+            return Err(verification_error(
+                ArchiveVerificationCode::LineTooLong,
+                "stream line exceeds the 32 MiB limit",
+            ));
         }
         let newline = available.iter().position(|byte| *byte == b'\n');
         let take = newline.map_or(available.len(), |index| index + 1);
         if take > remaining {
-            return Err(archive_error("stream line exceeds the 32 MiB limit"));
+            return Err(verification_error(
+                ArchiveVerificationCode::LineTooLong,
+                "stream line exceeds the 32 MiB limit",
+            ));
         }
         line.extend_from_slice(&available[..take]);
         reader.consume(take);
@@ -2114,17 +2434,29 @@ fn open_read_nofollow(path: &Path, directory: bool) -> Result<File> {
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
             .open(path)
-            .map_err(|error| archive_error(format!("open {}: {error}", path.display())))?
+            .map_err(|error| {
+                let code = if error.raw_os_error() == Some(libc::ELOOP) {
+                    ArchiveVerificationCode::SpecialFile
+                } else {
+                    ArchiveVerificationCode::LayoutMismatch
+                };
+                verification_error(code, format!("open {}: {error}", path.display()))
+            })?
     };
     #[cfg(not(unix))]
-    let file = OpenOptions::new()
-        .read(true)
-        .open(path)
-        .map_err(|error| archive_error(format!("open {}: {error}", path.display())))?;
+    let file = OpenOptions::new().read(true).open(path).map_err(|error| {
+        verification_error(
+            ArchiveVerificationCode::LayoutMismatch,
+            format!("open {}: {error}", path.display()),
+        )
+    })?;
     let metadata = file.metadata()?;
     if directory {
         if !metadata.is_dir() {
-            return Err(archive_error("expected a directory descriptor"));
+            return Err(verification_error(
+                ArchiveVerificationCode::SpecialFile,
+                "expected a directory descriptor",
+            ));
         }
     } else if !metadata.is_file() || {
         #[cfg(unix)]
@@ -2136,59 +2468,123 @@ fn open_read_nofollow(path: &Path, directory: bool) -> Result<File> {
             false
         }
     } {
-        return Err(archive_error("expected a regular non-hard-linked file"));
+        return Err(verification_error(
+            ArchiveVerificationCode::SpecialFile,
+            "expected a regular non-hard-linked file",
+        ));
     }
     Ok(file)
 }
 
-fn verify_v1_bundle(stage: &Path) -> Result<()> {
+fn verify_v1_bundle(
+    stage: &Path,
+    options: ArchiveVerifyOptions,
+    reject_staging_path: bool,
+) -> Result<ArchiveVerificationReport> {
+    if reject_staging_path
+        && stage
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains(".tmp-"))
+    {
+        return Err(verification_error(
+            ArchiveVerificationCode::LayoutMismatch,
+            "temporary archive staging paths are not verifiable",
+        ));
+    }
     #[cfg(unix)]
-    let root = AnchoredDir::open_path(stage)?;
+    let root = AnchoredDir::open_path(stage).map_err(|error| {
+        preserve_verification_error(error, ArchiveVerificationCode::LayoutMismatch)
+    })?;
     verify_root_layout(
         stage,
         #[cfg(unix)]
         &root,
     )
-    .map_err(|error| archive_error(format!("layout: {error}")))?;
+    .map_err(|error| preserve_verification_error(error, ArchiveVerificationCode::LayoutMismatch))?;
+    #[cfg(unix)]
+    let manifest_file = root.file("manifest.json").map_err(|error| {
+        preserve_verification_error(error, ArchiveVerificationCode::LayoutMismatch)
+    })?;
     #[cfg(unix)]
     let manifest_bytes =
-        read_bounded_file(root.file("manifest.json")?, MAX_MANIFEST_BYTES, "manifest")
-            .map_err(|error| archive_error(format!("manifest read: {error}")))?;
+        read_bounded_file(manifest_file, MAX_MANIFEST_BYTES, "manifest").map_err(|error| {
+            preserve_verification_error(error, ArchiveVerificationCode::RecordMalformed)
+        })?;
     #[cfg(not(unix))]
     let manifest_bytes = read_bounded(&stage.join("manifest.json"), MAX_MANIFEST_BYTES, "manifest")
-        .map_err(|error| archive_error(format!("manifest read: {error}")))?;
-    let manifest = parse_manifest(&manifest_bytes)?;
+        .map_err(|error| {
+            preserve_verification_error(error, ArchiveVerificationCode::RecordMalformed)
+        })?;
+    let manifest = parse_manifest(&manifest_bytes, options).map_err(|error| {
+        preserve_verification_error(error, ArchiveVerificationCode::RecordMalformed)
+    })?;
     #[cfg(unix)]
-    let marker = read_bounded_file(
-        root.file("COMPLETE")?,
-        MAX_COMPLETE_BYTES,
-        "completion marker",
-    )
-    .map_err(|error| archive_error(format!("marker read: {error}")))?;
+    let marker_file = root.file("COMPLETE").map_err(|error| {
+        preserve_verification_error(error, ArchiveVerificationCode::MarkerInvalid)
+    })?;
+    #[cfg(unix)]
+    let marker = read_bounded_file(marker_file, MAX_COMPLETE_BYTES, "completion marker").map_err(
+        |error| preserve_verification_error(error, ArchiveVerificationCode::MarkerInvalid),
+    )?;
     #[cfg(not(unix))]
     let marker = read_bounded(
         &stage.join("COMPLETE"),
         MAX_COMPLETE_BYTES,
         "completion marker",
     )
-    .map_err(|error| archive_error(format!("marker read: {error}")))?;
+    .map_err(|error| preserve_verification_error(error, ArchiveVerificationCode::MarkerInvalid))?;
     let marker_line = single_line(&marker, MAX_COMPLETE_BYTES, "completion marker")?;
-    let marker_object = parse_json_object(marker_line)?;
-    validate_field_order(&marker_object, &named_schema("complete"))?;
-    if required_string(&marker_object, "format")? != "ctx-archive-complete"
-        || required_i64(&marker_object, "format_version")? != 1
-        || required_string(&marker_object, "manifest_sha256")?
-            != hex_digest(Sha256::digest(&manifest_bytes))
-    {
-        return Err(archive_error(
+    let marker_object = parse_json_object(marker_line).map_err(|error| {
+        preserve_verification_error(error, ArchiveVerificationCode::MarkerInvalid)
+    })?;
+    validate_field_order(&marker_object, &named_schema("complete")).map_err(|error| {
+        verification_error(ArchiveVerificationCode::MarkerInvalid, error.to_string())
+    })?;
+    let marker_format = required_string(&marker_object, "format").map_err(|error| {
+        verification_error(ArchiveVerificationCode::MarkerInvalid, error.to_string())
+    })?;
+    if marker_format != "ctx-archive-complete" {
+        return Err(verification_error(
+            ArchiveVerificationCode::FormatUnsupported,
+            "unsupported completion marker format",
+        ));
+    }
+    match object_value(&marker_object, "format_version") {
+        Ok(JsonNode::Number(value)) if value.as_i64() == Some(1) => {}
+        Ok(JsonNode::Number(_)) => {
+            return Err(verification_error(
+                ArchiveVerificationCode::FormatUnsupported,
+                "unsupported completion marker format_version",
+            ));
+        }
+        _ => {
+            return Err(verification_error(
+                ArchiveVerificationCode::MarkerInvalid,
+                "completion marker format_version must be numeric",
+            ));
+        }
+    }
+    let marker_manifest_sha256 =
+        required_string(&marker_object, "manifest_sha256").map_err(|error| {
+            verification_error(ArchiveVerificationCode::MarkerInvalid, error.to_string())
+        })?;
+    if marker_manifest_sha256 != hex_digest(Sha256::digest(&manifest_bytes)) {
+        return Err(verification_error(
+            ArchiveVerificationCode::ManifestDigestMismatch,
             "completion marker does not authenticate manifest",
         ));
     }
     if canonical_json(&JsonNode::Object(marker_object)).as_bytes() != marker_line {
-        return Err(archive_error("completion marker is not canonical v1 JSON"));
+        return Err(verification_error(
+            ArchiveVerificationCode::MarkerInvalid,
+            "completion marker is not canonical v1 JSON",
+        ));
     }
-    let mut state = VerifierState::new(stage.parent().unwrap_or_else(|| Path::new(".")))
-        .map_err(|error| archive_error(format!("state: {error}")))?;
+    let mut state = VerifierState::new(stage.parent().unwrap_or_else(|| Path::new(".")), options)
+        .map_err(|error| {
+        preserve_verification_error(error, ArchiveVerificationCode::RecordMalformed)
+    })?;
     let mut entities = 0_u64;
     for (index, descriptor) in STREAMS.iter().enumerate() {
         let (count, _) = verify_stream_file(
@@ -2200,15 +2596,25 @@ fn verify_v1_bundle(stage: &Path) -> Result<()> {
             &manifest.streams[index],
             &mut state,
         )
-        .map_err(|error| archive_error(format!("stream {}: {error}", index + 1)))?;
-        entities = entities
-            .checked_add(count)
-            .ok_or_else(|| archive_error("entity count overflow"))?;
+        .map_err(|error| {
+            preserve_verification_error(error, ArchiveVerificationCode::RecordMalformed)
+        })?;
+        entities = entities.checked_add(count).ok_or_else(|| {
+            verification_error(
+                ArchiveVerificationCode::SizeCapExceeded,
+                "entity count overflow",
+            )
+        })?;
     }
     if entities != manifest.entity_count {
-        return Err(archive_error("manifest entity count mismatch"));
+        return Err(verification_error(
+            ArchiveVerificationCode::StreamIntegrityMismatch,
+            "manifest entity count mismatch",
+        ));
     }
-    verify_references(&state).map_err(|error| archive_error(format!("references: {error}")))?;
+    verify_references(&state).map_err(|error| {
+        preserve_verification_error(error, ArchiveVerificationCode::DanglingReference)
+    })?;
     let (object_count, object_bytes) = verify_objects(
         stage,
         #[cfg(unix)]
@@ -2216,36 +2622,91 @@ fn verify_v1_bundle(stage: &Path) -> Result<()> {
         &manifest,
         &mut state,
     )
-    .map_err(|error| archive_error(format!("objects: {error}")))?;
+    .map_err(|error| preserve_verification_error(error, ArchiveVerificationCode::BlobMismatch))?;
     if object_count != manifest.object_count || object_bytes != manifest.object_bytes {
-        return Err(archive_error("manifest object totals mismatch"));
+        return Err(verification_error(
+            ArchiveVerificationCode::StreamIntegrityMismatch,
+            "manifest object totals mismatch",
+        ));
     }
-    Ok(())
+    Ok(ArchiveVerificationReport {
+        path: stage.to_path_buf(),
+        entity_count: entities,
+        object_count,
+        object_bytes,
+    })
 }
 
 fn verify_root_layout(_stage: &Path, #[cfg(unix)] root: &AnchoredDir) -> Result<()> {
     #[cfg(unix)]
     {
         for name in ["manifest.json", "COMPLETE"] {
-            root.file(name)?;
+            root.file(name).map_err(|error| {
+                if is_security_entry_error(&error) {
+                    error
+                } else if name == "COMPLETE" {
+                    verification_error(
+                        ArchiveVerificationCode::MarkerMissing,
+                        "missing COMPLETE marker",
+                    )
+                } else {
+                    verification_error(
+                        ArchiveVerificationCode::LayoutMismatch,
+                        "missing manifest.json",
+                    )
+                }
+            })?;
         }
-        let streams = root.dir("streams")?;
-        root.dir("objects")?;
+        let streams = root.dir("streams").map_err(|error| {
+            if is_security_entry_error(&error) {
+                error
+            } else {
+                verification_error(
+                    ArchiveVerificationCode::LayoutMismatch,
+                    "missing streams directory",
+                )
+            }
+        })?;
+        root.dir("objects").map_err(|error| {
+            if is_security_entry_error(&error) {
+                error
+            } else {
+                verification_error(
+                    ArchiveVerificationCode::LayoutMismatch,
+                    "missing objects directory",
+                )
+            }
+        })?;
         root.for_each_name(|name| {
             if matches!(name, "manifest.json" | "COMPLETE" | "streams" | "objects") {
                 Ok(())
             } else {
-                Err(archive_error("bundle contains an unexpected root entry"))
+                Err(verification_error(
+                    ArchiveVerificationCode::LayoutMismatch,
+                    "bundle contains an unexpected root entry",
+                ))
             }
         })?;
         for (_, file, _) in STREAMS {
-            streams.file(file)?;
+            streams.file(file).map_err(|error| {
+                if is_security_entry_error(&error) {
+                    error
+                } else {
+                    verification_error(
+                        ArchiveVerificationCode::LayoutMismatch,
+                        "missing contractual stream file",
+                    )
+                }
+            })?;
         }
         streams.for_each_name(|name| {
             if STREAMS.iter().any(|(_, file, _)| name == *file) {
                 Ok(())
             } else {
-                Err(archive_error("bundle contains an unexpected stream file"))
+                Err(verification_error(
+                    ArchiveVerificationCode::LayoutMismatch,
+                    "bundle contains an unexpected stream file",
+                ))
             }
         })?;
         Ok(())
@@ -2266,7 +2727,10 @@ fn verify_root_layout(_stage: &Path, #[cfg(unix)] root: &AnchoredDir) -> Result<
                 || name == "streams"
                 || name == "objects";
             if !valid {
-                return Err(archive_error("bundle contains an unexpected root entry"));
+                return Err(verification_error(
+                    ArchiveVerificationCode::LayoutMismatch,
+                    "bundle contains an unexpected root entry",
+                ));
             }
         }
         for (_, file, _) in STREAMS {
@@ -2279,7 +2743,10 @@ fn verify_root_layout(_stage: &Path, #[cfg(unix)] root: &AnchoredDir) -> Result<
                 .map(|name| STREAMS.iter().any(|(_, file, _)| name == *file))
                 .unwrap_or(false);
             if !valid {
-                return Err(archive_error("bundle contains an unexpected stream file"));
+                return Err(verification_error(
+                    ArchiveVerificationCode::LayoutMismatch,
+                    "bundle contains an unexpected stream file",
+                ));
             }
         }
         Ok(())
@@ -2290,10 +2757,10 @@ fn verify_root_layout(_stage: &Path, #[cfg(unix)] root: &AnchoredDir) -> Result<
 fn check_directory(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(archive_error(format!(
-            "bundle directory is not regular: {}",
-            path.display()
-        )));
+        return Err(verification_error(
+            ArchiveVerificationCode::SpecialFile,
+            format!("bundle directory is not regular: {}", path.display()),
+        ));
     }
     check_mode(&metadata)
 }
@@ -2302,15 +2769,18 @@ fn check_directory(path: &Path) -> Result<()> {
 fn check_regular(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.file_type().is_file() {
-        return Err(archive_error(format!(
-            "bundle entry is not regular: {}",
-            path.display()
-        )));
+        return Err(verification_error(
+            ArchiveVerificationCode::SpecialFile,
+            format!("bundle entry is not regular: {}", path.display()),
+        ));
     }
     check_mode(&metadata)?;
     #[cfg(unix)]
     if metadata.nlink() > 1 {
-        return Err(archive_error("bundle entry is hard-linked"));
+        return Err(verification_error(
+            ArchiveVerificationCode::SpecialFile,
+            "bundle entry is hard-linked",
+        ));
     }
     Ok(())
 }
@@ -2320,7 +2790,10 @@ fn check_mode(metadata: &fs::Metadata) -> Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         if metadata.permissions().mode() & 0o022 != 0 {
-            return Err(archive_error("bundle entry is group/world writable"));
+            return Err(verification_error(
+                ArchiveVerificationCode::PermissionsWritable,
+                "bundle entry is group/world writable",
+            ));
         }
     }
     Ok(())
@@ -2337,10 +2810,19 @@ fn verify_stream_file(
     #[cfg(not(unix))]
     let path = _stage.join("streams").join(descriptor.1);
     if expected.name != descriptor.0 || expected.path != format!("streams/{}", descriptor.1) {
-        return Err(archive_error("stream path differs from contract"));
+        return Err(verification_error(
+            ArchiveVerificationCode::LayoutMismatch,
+            "stream path differs from contract",
+        ));
     }
     #[cfg(unix)]
-    let mut file = root.dir("streams")?.file(descriptor.1)?;
+    let streams = root.dir("streams").map_err(|error| {
+        preserve_verification_error(error, ArchiveVerificationCode::LayoutMismatch)
+    })?;
+    #[cfg(unix)]
+    let mut file = streams.file(descriptor.1).map_err(|error| {
+        preserve_verification_error(error, ArchiveVerificationCode::LayoutMismatch)
+    })?;
     #[cfg(not(unix))]
     let mut file = open_read_nofollow(&path, false)?;
     let mut reader = BufReader::new(&mut file);
@@ -2350,44 +2832,102 @@ fn verify_stream_file(
     let mut bytes = 0_u64;
     let mut previous = None;
     loop {
-        let read = read_capped_line(&mut reader, &mut line)?;
+        let read = read_capped_line(&mut reader, &mut line).map_err(|error| {
+            preserve_verification_error(error, ArchiveVerificationCode::StreamTruncated)
+        })?;
         if read == 0 {
             break;
         }
-        if !line.ends_with(b"\n") || line[..line.len() - 1].contains(&b'\r') {
-            return Err(archive_error(
-                "stream line is too long, truncated, or contains CR",
+        if !line.ends_with(b"\n") {
+            return Err(verification_error(
+                ArchiveVerificationCode::StreamTruncated,
+                "stream line is not newline terminated",
+            ));
+        }
+        if line[..line.len() - 1].contains(&b'\r') {
+            return Err(verification_error(
+                ArchiveVerificationCode::RecordMalformed,
+                "stream line contains CR",
+            ));
+        }
+        let read = read as u64;
+        if read > expected.bytes.saturating_sub(bytes) {
+            return Err(verification_error(
+                ArchiveVerificationCode::StreamIntegrityMismatch,
+                "stream exceeds its declared byte count",
+            ));
+        }
+        if read
+            > state
+                .options
+                .max_total_bytes
+                .saturating_sub(state.total_bytes)
+        {
+            return Err(verification_error(
+                ArchiveVerificationCode::SizeCapExceeded,
+                "observed stream bytes exceed the selected aggregate cap",
             ));
         }
         hasher.update(&line);
-        bytes = bytes
-            .checked_add(read as u64)
-            .ok_or_else(|| archive_error("stream byte count overflow"))?;
+        bytes = bytes.checked_add(read).ok_or_else(|| {
+            verification_error(
+                ArchiveVerificationCode::StreamIntegrityMismatch,
+                "stream byte count overflow",
+            )
+        })?;
+        state.total_bytes = state.total_bytes.checked_add(read).ok_or_else(|| {
+            verification_error(
+                ArchiveVerificationCode::SizeCapExceeded,
+                "aggregate stream byte count overflow",
+            )
+        })?;
         let record = &line[..line.len() - 1];
         if record.is_empty() {
-            return Err(archive_error("stream contains a blank line"));
+            return Err(verification_error(
+                ArchiveVerificationCode::RecordMalformed,
+                "stream contains a blank line",
+            ));
         }
+        if state.remaining_entities == 0 {
+            return Err(verification_error(
+                ArchiveVerificationCode::SizeCapExceeded,
+                "observed entities exceed the selected aggregate cap",
+            ));
+        }
+        state.remaining_entities -= 1;
         let object = parse_json_object(record)?;
         validate_record(index, &object)?;
         if canonical_json(&JsonNode::Object(object.clone())).as_bytes() != record {
-            return Err(archive_error("stream record is not canonical v1 JSON"));
+            return Err(verification_error(
+                ArchiveVerificationCode::RecordMalformed,
+                "stream record is not canonical v1 JSON",
+            ));
         }
         let sort_key = state.record(index, &object)?;
         if let Some(previous) = &previous {
             if compare_sort_keys(previous, &sort_key) != std::cmp::Ordering::Less {
-                return Err(archive_error("stream is not in canonical order"));
+                return Err(verification_error(
+                    ArchiveVerificationCode::StreamUnsorted,
+                    "stream is not in canonical order",
+                ));
             }
         }
         previous = Some(sort_key);
-        count = count
-            .checked_add(1)
-            .ok_or_else(|| archive_error("stream count overflow"))?;
+        count = count.checked_add(1).ok_or_else(|| {
+            verification_error(
+                ArchiveVerificationCode::SizeCapExceeded,
+                "stream count overflow",
+            )
+        })?;
     }
     if count != expected.count
         || bytes != expected.bytes
         || hex_digest(hasher.finalize()) != expected.sha256
     {
-        return Err(archive_error("stream count, size, or digest mismatch"));
+        return Err(verification_error(
+            ArchiveVerificationCode::StreamIntegrityMismatch,
+            "stream count, size, or digest mismatch",
+        ));
     }
     Ok((count, bytes))
 }
@@ -2421,20 +2961,27 @@ fn composite_key(components: &[&str]) -> Vec<u8> {
 struct VerifierState {
     temp_dir: PathBuf,
     conn: Connection,
+    options: ArchiveVerifyOptions,
+    total_bytes: u64,
+    remaining_entities: u64,
 }
 
 impl VerifierState {
-    fn new(parent: &Path) -> Result<Self> {
+    fn new(parent: &Path, options: ArchiveVerifyOptions) -> Result<Self> {
         let temp_dir = parent.join(format!(".ctxar-verify-{}", Uuid::new_v4()));
         create_private_dir(&temp_dir)?;
         let result = (|| {
             let database = temp_dir.join("state.sqlite");
             let conn = Connection::open(&database)?;
             restrict_private_file(&database)?;
-            conn.execute_batch("PRAGMA journal_mode = DELETE; PRAGMA synchronous = FULL; CREATE TABLE ids(id TEXT PRIMARY KEY, kind INTEGER NOT NULL); CREATE TABLE refs(kind INTEGER NOT NULL, id TEXT NOT NULL); CREATE TABLE unique_keys(kind TEXT NOT NULL, key BLOB NOT NULL, PRIMARY KEY(kind, key)); CREATE TABLE blobs(hash TEXT PRIMARY KEY, byte_size INTEGER NOT NULL); CREATE TABLE order_events(seq INTEGER PRIMARY KEY);")?;
+            conn.execute_batch("PRAGMA journal_mode = DELETE; PRAGMA synchronous = FULL; CREATE TABLE ids(id BLOB PRIMARY KEY, kind INTEGER NOT NULL); CREATE TABLE refs(kind INTEGER NOT NULL, id BLOB NOT NULL); CREATE TABLE unique_keys(kind TEXT NOT NULL, key BLOB NOT NULL, PRIMARY KEY(kind, key)); CREATE TABLE blobs(hash BLOB PRIMARY KEY, byte_size INTEGER NOT NULL); CREATE TABLE order_events(seq INTEGER PRIMARY KEY);")?;
+            let remaining_entities = options.max_entities;
             Ok(Self {
                 temp_dir: temp_dir.clone(),
                 conn,
+                options,
+                total_bytes: 0,
+                remaining_entities,
             })
         })();
         if result.is_err() {
@@ -2444,16 +2991,23 @@ impl VerifierState {
     }
 
     fn insert_unique(&self, kind: &str, key: &[u8]) -> Result<()> {
+        let digest = Sha256::digest(key);
         self.conn
             .execute(
                 "INSERT INTO unique_keys(kind, key) VALUES (?1, ?2)",
-                rusqlite::params![kind, key],
+                rusqlite::params![kind, digest.as_slice()],
             )
-            .map_err(|_| archive_error(format!("duplicate or conflicting natural key: {kind}")))?;
+            .map_err(|_| {
+                verification_error(
+                    ArchiveVerificationCode::NaturalKeyConflict,
+                    format!("duplicate or conflicting natural key: {kind}"),
+                )
+            })?;
         Ok(())
     }
 
     fn reference(&self, kind: i64, id: &str) -> Result<()> {
+        let id = uuid_bytes(id)?;
         self.conn.execute(
             "INSERT INTO refs(kind, id) VALUES (?1, ?2)",
             rusqlite::params![kind, id],
@@ -2472,12 +3026,18 @@ impl VerifierState {
         };
         if stream != 12 {
             let id = required_string(object, "id")?;
+            let id_bytes = uuid_bytes(&id)?;
             self.conn
                 .execute(
                     "INSERT INTO ids(id, kind) VALUES (?1, ?2)",
-                    rusqlite::params![id, stream as i64],
+                    rusqlite::params![id_bytes, stream as i64],
                 )
-                .map_err(|_| archive_error("duplicate or cross-stream entity ID"))?;
+                .map_err(|_| {
+                    verification_error(
+                        ArchiveVerificationCode::DuplicateId,
+                        "duplicate or cross-stream entity ID",
+                    )
+                })?;
         }
         match stream {
             0 => {
@@ -2485,11 +3045,18 @@ impl VerifierState {
                     let value = match value {
                         JsonNode::Number(_) => required_i64(object, "process_id")?,
                         _ => {
-                            return Err(archive_error("archive field process_id is not an integer"))
+                            return Err(verification_error(
+                                ArchiveVerificationCode::RecordMalformed,
+                                "archive field process_id is not an integer",
+                            ))
                         }
                     };
-                    u32::try_from(value)
-                        .map_err(|_| archive_error("archive process_id is outside u32 range"))?;
+                    u32::try_from(value).map_err(|_| {
+                        verification_error(
+                            ArchiveVerificationCode::RecordMalformed,
+                            "archive process_id is outside u32 range",
+                        )
+                    })?;
                 }
             }
             1 => {
@@ -2519,7 +3086,17 @@ impl VerifierState {
                 )?;
                 let hash = required_string(object, "blob_hash")?;
                 let size = required_nonnegative_i64(object, "byte_size")?;
-                self.conn.execute("INSERT INTO blobs(hash, byte_size) VALUES (?1, ?2) ON CONFLICT(hash) DO UPDATE SET byte_size = CASE WHEN blobs.byte_size = excluded.byte_size THEN blobs.byte_size ELSE -1 END", rusqlite::params![hash, size])?;
+                if u64::try_from(size).unwrap_or(u64::MAX) > self.options.max_object_bytes {
+                    return Err(verification_error(
+                        ArchiveVerificationCode::SizeCapExceeded,
+                        "archive declared size cap exceeded",
+                    ));
+                }
+                let hash_bytes = hex_bytes(&hash)?;
+                self.conn.execute("INSERT INTO blobs(hash, byte_size) VALUES (?1, ?2) ON CONFLICT(hash) DO UPDATE SET byte_size = CASE WHEN blobs.byte_size = excluded.byte_size THEN blobs.byte_size ELSE -1 END", rusqlite::params![hash_bytes, size])?;
+                if let Some(id) = optional_string(object, "source_id")? {
+                    self.reference(0, &id)?;
+                }
             }
             4 => {
                 for (field, kind) in [
@@ -2548,8 +3125,12 @@ impl VerifierState {
             6 => {
                 if object.iter().any(|(name, _)| name == "exit_code") {
                     let value = required_i64(object, "exit_code")?;
-                    i32::try_from(value)
-                        .map_err(|_| archive_error("archive exit_code is outside i32 range"))?;
+                    i32::try_from(value).map_err(|_| {
+                        verification_error(
+                            ArchiveVerificationCode::RecordMalformed,
+                            "archive exit_code is outside i32 range",
+                        )
+                    })?;
                 }
                 for (field, kind) in [
                     ("history_record_id", 2),
@@ -2683,7 +3264,10 @@ impl Drop for VerifierState {
 fn verify_references(state: &VerifierState) -> Result<()> {
     let dangling: i64 = state.conn.query_row("SELECT COUNT(*) FROM refs WHERE NOT EXISTS (SELECT 1 FROM ids WHERE ids.id = refs.id AND ids.kind = refs.kind)", [], |row| row.get(0))?;
     if dangling != 0 {
-        return Err(archive_error("archive contains dangling reference"));
+        return Err(verification_error(
+            ArchiveVerificationCode::DanglingReference,
+            "archive contains dangling reference",
+        ));
     }
     let conflicting_sizes: i64 = state.conn.query_row(
         "SELECT COUNT(*) FROM blobs WHERE byte_size < 0",
@@ -2691,7 +3275,8 @@ fn verify_references(state: &VerifierState) -> Result<()> {
         |row| row.get(0),
     )?;
     if conflicting_sizes != 0 {
-        return Err(archive_error(
+        return Err(verification_error(
+            ArchiveVerificationCode::BlobMismatch,
             "archive artifacts have conflicting blob sizes",
         ));
     }
@@ -2719,14 +3304,22 @@ fn verify_objects(
                     .bytes()
                     .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
             {
-                return Err(archive_error("object shard is malformed"));
+                return Err(verification_error(
+                    ArchiveVerificationCode::LayoutMismatch,
+                    "object shard is malformed",
+                ));
             }
+            let mut shard_entries = 0_u64;
             for child in fs::read_dir(entry.path())? {
+                shard_entries += 1;
                 let child = child?;
                 let hash = child.file_name().to_string_lossy().into_owned();
                 check_regular(&child.path())?;
                 if !is_sha256_hex(&hash) || hash[..2] != *shard {
-                    return Err(archive_error("object path is malformed"));
+                    return Err(verification_error(
+                        ArchiveVerificationCode::LayoutMismatch,
+                        "object path is malformed",
+                    ));
                 }
                 let mut file = open_read_nofollow(&child.path(), false)?;
                 let mut reader = BufReader::new(&mut file);
@@ -2742,38 +3335,63 @@ fn verify_objects(
                     size += read as u64;
                 }
                 if hex_digest(hasher.finalize()) != hash {
-                    return Err(archive_error("object checksum mismatch"));
+                    return Err(verification_error(
+                        ArchiveVerificationCode::BlobMismatch,
+                        "object checksum mismatch",
+                    ));
                 }
                 let expected: Option<i64> = state
                     .conn
                     .query_row(
                         "SELECT byte_size FROM blobs WHERE hash = ?1",
-                        [&hash],
+                        [hex_bytes(&hash)?],
                         |row| row.get(0),
                     )
                     .optional()?;
-                let expected = expected
-                    .ok_or_else(|| archive_error("archive contains an unreferenced object"))?;
+                let expected = expected.ok_or_else(|| {
+                    verification_error(
+                        ArchiveVerificationCode::BlobUnreferenced,
+                        "archive contains an unreferenced object",
+                    )
+                })?;
                 if size != u64::try_from(expected).unwrap_or(u64::MAX) {
-                    return Err(archive_error("object size mismatch"));
+                    return Err(verification_error(
+                        ArchiveVerificationCode::BlobMismatch,
+                        "object size mismatch",
+                    ));
                 }
                 state
                     .conn
-                    .execute("DELETE FROM blobs WHERE hash = ?1", [&hash])?;
+                    .execute("DELETE FROM blobs WHERE hash = ?1", [hex_bytes(&hash)?])?;
                 count += 1;
-                bytes = bytes
-                    .checked_add(size)
-                    .ok_or_else(|| archive_error("object byte count overflow"))?;
+                bytes = bytes.checked_add(size).ok_or_else(|| {
+                    verification_error(
+                        ArchiveVerificationCode::SizeCapExceeded,
+                        "object byte count overflow",
+                    )
+                })?;
+            }
+            if shard_entries == 0 {
+                return Err(verification_error(
+                    ArchiveVerificationCode::LayoutMismatch,
+                    "object shard is empty",
+                ));
             }
         }
         let remaining: i64 = state
             .conn
             .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))?;
         if remaining != 0 {
-            return Err(archive_error("archive is missing a referenced object"));
+            return Err(verification_error(
+                ArchiveVerificationCode::BlobMissing,
+                "archive is missing a referenced object",
+            ));
         }
         if count != manifest.object_count || bytes != manifest.object_bytes {
-            return Err(archive_error("manifest object totals mismatch"));
+            return Err(verification_error(
+                ArchiveVerificationCode::BlobMismatch,
+                "manifest object totals mismatch",
+            ));
         }
         Ok((count, bytes))
     }
@@ -2794,26 +3412,42 @@ fn verify_objects_anchored(
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
         {
-            return Err(archive_error("object shard is malformed"));
+            return Err(verification_error(
+                ArchiveVerificationCode::LayoutMismatch,
+                "object shard is malformed",
+            ));
         }
         let shard_dir = objects.dir(shard)?;
+        let mut shard_entries = 0_u64;
         shard_dir.for_each_name(|hash| {
+            shard_entries = shard_entries.saturating_add(1);
             if !is_sha256_hex(hash) || hash[..2] != *shard {
-                return Err(archive_error("object path is malformed"));
+                return Err(verification_error(
+                    ArchiveVerificationCode::LayoutMismatch,
+                    "object path is malformed",
+                ));
             }
             let mut reader = BufReader::new(shard_dir.file(hash)?);
             let expected: Option<i64> = state
                 .conn
                 .query_row(
                     "SELECT byte_size FROM blobs WHERE hash = ?1",
-                    [&hash],
+                    [hex_bytes(hash)?],
                     |row| row.get(0),
                 )
                 .optional()?;
-            let expected =
-                expected.ok_or_else(|| archive_error("archive contains an unreferenced object"))?;
-            let expected =
-                u64::try_from(expected).map_err(|_| archive_error("object size is invalid"))?;
+            let expected = expected.ok_or_else(|| {
+                verification_error(
+                    ArchiveVerificationCode::BlobUnreferenced,
+                    "archive contains an unreferenced object",
+                )
+            })?;
+            let expected = u64::try_from(expected).map_err(|_| {
+                verification_error(
+                    ArchiveVerificationCode::BlobMismatch,
+                    "object size is invalid",
+                )
+            })?;
             let mut hasher = Sha256::new();
             let mut size = 0_u64;
             let mut buffer = [0_u8; COPY_BUFFER_BYTES];
@@ -2822,41 +3456,71 @@ fn verify_objects_anchored(
                 if read == 0 {
                     break;
                 }
-                size = size
-                    .checked_add(read as u64)
-                    .ok_or_else(|| archive_error("object size overflow"))?;
+                size = size.checked_add(read as u64).ok_or_else(|| {
+                    verification_error(
+                        ArchiveVerificationCode::SizeCapExceeded,
+                        "object size overflow",
+                    )
+                })?;
                 if size > expected {
-                    return Err(archive_error("object size mismatch"));
+                    return Err(verification_error(
+                        ArchiveVerificationCode::BlobMismatch,
+                        "object size mismatch",
+                    ));
                 }
                 hasher.update(&buffer[..read]);
             }
             if size != expected || hex_digest(hasher.finalize()) != hash {
-                return Err(archive_error("object size or checksum mismatch"));
+                return Err(verification_error(
+                    ArchiveVerificationCode::BlobMismatch,
+                    "object size or checksum mismatch",
+                ));
             }
             state
                 .conn
-                .execute("DELETE FROM blobs WHERE hash = ?1", [&hash])?;
-            count = count
-                .checked_add(1)
-                .ok_or_else(|| archive_error("object count overflow"))?;
-            bytes = bytes
-                .checked_add(size)
-                .ok_or_else(|| archive_error("object byte count overflow"))?;
+                .execute("DELETE FROM blobs WHERE hash = ?1", [hex_bytes(hash)?])?;
+            count = count.checked_add(1).ok_or_else(|| {
+                verification_error(
+                    ArchiveVerificationCode::SizeCapExceeded,
+                    "object count overflow",
+                )
+            })?;
+            bytes = bytes.checked_add(size).ok_or_else(|| {
+                verification_error(
+                    ArchiveVerificationCode::SizeCapExceeded,
+                    "object byte count overflow",
+                )
+            })?;
             if count > manifest.object_count || bytes > manifest.object_bytes {
-                return Err(archive_error("manifest object totals exceeded"));
+                return Err(verification_error(
+                    ArchiveVerificationCode::BlobMismatch,
+                    "manifest object totals exceeded",
+                ));
             }
             Ok(())
         })?;
+        if shard_entries == 0 {
+            return Err(verification_error(
+                ArchiveVerificationCode::LayoutMismatch,
+                "object shard is empty",
+            ));
+        }
         Ok(())
     })?;
     let remaining: i64 = state
         .conn
         .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))?;
     if remaining != 0 {
-        return Err(archive_error("archive is missing a referenced object"));
+        return Err(verification_error(
+            ArchiveVerificationCode::BlobMissing,
+            "archive is missing a referenced object",
+        ));
     }
     if count != manifest.object_count || bytes != manifest.object_bytes {
-        return Err(archive_error("manifest object totals mismatch"));
+        return Err(verification_error(
+            ArchiveVerificationCode::BlobMismatch,
+            "manifest object totals mismatch",
+        ));
     }
     Ok((count, bytes))
 }
@@ -3063,6 +3727,43 @@ fn is_sha256_hex(value: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
+fn uuid_bytes(value: &str) -> Result<Vec<u8>> {
+    Uuid::parse_str(value)
+        .map(|uuid| uuid.as_bytes().to_vec())
+        .map_err(|_| {
+            verification_error(
+                ArchiveVerificationCode::RecordMalformed,
+                "archive UUID reference is malformed",
+            )
+        })
+}
+
+fn hex_bytes(value: &str) -> Result<Vec<u8>> {
+    if !is_sha256_hex(value) {
+        return Err(verification_error(
+            ArchiveVerificationCode::RecordMalformed,
+            "archive hash is malformed",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(32);
+    for pair in value.as_bytes().chunks_exact(2) {
+        let high = (pair[0] as char).to_digit(16).ok_or_else(|| {
+            verification_error(
+                ArchiveVerificationCode::RecordMalformed,
+                "archive hash is malformed",
+            )
+        })?;
+        let low = (pair[1] as char).to_digit(16).ok_or_else(|| {
+            verification_error(
+                ArchiveVerificationCode::RecordMalformed,
+                "archive hash is malformed",
+            )
+        })?;
+        bytes.push(((high << 4) | low) as u8);
+    }
+    Ok(bytes)
+}
+
 fn hex_digest<D: AsRef<[u8]>>(digest: D) -> String {
     digest
         .as_ref()
@@ -3073,6 +3774,42 @@ fn hex_digest<D: AsRef<[u8]>>(digest: D) -> String {
 
 fn archive_error(message: impl Into<String>) -> StoreError {
     StoreError::Archive(message.into())
+}
+
+fn verification_error(code: ArchiveVerificationCode, diagnostic: impl Into<String>) -> StoreError {
+    StoreError::ArchiveVerification {
+        code,
+        diagnostic: diagnostic.into(),
+    }
+}
+
+fn preserve_verification_error(error: StoreError, fallback: ArchiveVerificationCode) -> StoreError {
+    if matches!(error, StoreError::ArchiveVerification { .. }) {
+        error
+    } else {
+        verification_error(fallback, error.to_string())
+    }
+}
+
+/// Stable v1 rejection category for the CLI and other machine consumers.
+/// Diagnostics remain attached to the typed store error and are not used for
+/// classification or emitted by the JSON CLI surface.
+pub fn archive_verification_error_code(error: &StoreError) -> Option<&'static str> {
+    match error {
+        StoreError::ArchiveVerification { code, .. } => Some(code.as_str()),
+        _ => None,
+    }
+}
+
+fn is_security_entry_error(error: &StoreError) -> bool {
+    matches!(
+        error,
+        StoreError::ArchiveVerification {
+            code: ArchiveVerificationCode::SpecialFile
+                | ArchiveVerificationCode::PermissionsWritable,
+            ..
+        }
+    )
 }
 
 #[cfg(test)]
@@ -3541,6 +4278,321 @@ mod tests {
             .unwrap();
         stream.write_all(b"{}\n").unwrap();
         assert!(verify_archive_bundle(&target).is_err());
+    }
+
+    #[test]
+    fn verifier_rejection_corpus_covers_public_failure_categories_and_cleans_state() {
+        let temp = root();
+        let mut store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let rewrite_manifest = |target: &Path, old: &[u8], new: &[u8]| {
+            let manifest_path = target.join("manifest.json");
+            let mut manifest = fs::read(&manifest_path).unwrap();
+            let position = manifest
+                .windows(old.len())
+                .position(|window| window == old)
+                .unwrap();
+            manifest.splice(position..position + old.len(), new.iter().copied());
+            fs::write(&manifest_path, &manifest).unwrap();
+            fs::write(target.join("COMPLETE"), completion_bytes(&manifest)).unwrap();
+        };
+
+        let truncated = temp.path().join("truncated.ctxar");
+        store
+            .create_archive(&truncated, ArchiveOptions::default())
+            .unwrap();
+        fs::write(truncated.join("streams/01-capture_sources.jsonl"), b"{}").unwrap();
+        let error = verify_archive_bundle(&truncated).unwrap_err();
+        assert_eq!(
+            archive_verification_error_code(&error),
+            Some("stream_truncated")
+        );
+
+        let missing_marker = temp.path().join("missing-marker.ctxar");
+        store
+            .create_archive(&missing_marker, ArchiveOptions::default())
+            .unwrap();
+        fs::remove_file(missing_marker.join("COMPLETE")).unwrap();
+        let error = verify_archive_bundle(&missing_marker).unwrap_err();
+        assert_eq!(
+            archive_verification_error_code(&error),
+            Some("marker_missing")
+        );
+
+        let extra = temp.path().join("extra.ctxar");
+        store
+            .create_archive(&extra, ArchiveOptions::default())
+            .unwrap();
+        fs::write(extra.join("foreign"), b"not part of v1").unwrap();
+        let error = verify_archive_bundle(&extra).unwrap_err();
+        assert_eq!(
+            archive_verification_error_code(&error),
+            Some("layout_mismatch")
+        );
+
+        let marker_grammar = temp.path().join("marker-grammar.ctxar");
+        store
+            .create_archive(&marker_grammar, ArchiveOptions::default())
+            .unwrap();
+        fs::write(marker_grammar.join("COMPLETE"), b"{}\n").unwrap();
+        let error = verify_archive_bundle(&marker_grammar).unwrap_err();
+        assert_eq!(
+            archive_verification_error_code(&error),
+            Some("marker_invalid")
+        );
+
+        let unsupported = temp.path().join("unsupported.ctxar");
+        store
+            .create_archive(&unsupported, ArchiveOptions::default())
+            .unwrap();
+        rewrite_manifest(
+            &unsupported,
+            b"\"format\":\"ctx-archive\"",
+            b"\"format\":\"bad-archive\"",
+        );
+        let error = verify_archive_bundle(&unsupported).unwrap_err();
+        assert_eq!(
+            archive_verification_error_code(&error),
+            Some("format_unsupported")
+        );
+
+        let future_version = temp.path().join("future-version.ctxar");
+        store
+            .create_archive(&future_version, ArchiveOptions::default())
+            .unwrap();
+        rewrite_manifest(
+            &future_version,
+            b"\"format_version\":1",
+            b"\"format_version\":2",
+        );
+        let error = verify_archive_bundle(&future_version).unwrap_err();
+        assert_eq!(
+            archive_verification_error_code(&error),
+            Some("format_unsupported")
+        );
+
+        let extreme_version = temp.path().join("extreme-version.ctxar");
+        store
+            .create_archive(&extreme_version, ArchiveOptions::default())
+            .unwrap();
+        rewrite_manifest(
+            &extreme_version,
+            b"\"format_version\":1",
+            b"\"format_version\":9223372036854775808",
+        );
+        let error = verify_archive_bundle(&extreme_version).unwrap_err();
+        assert_eq!(
+            archive_verification_error_code(&error),
+            Some("format_unsupported")
+        );
+
+        let shard_file = temp.path().join("shard-file.ctxar");
+        store
+            .create_archive(&shard_file, ArchiveOptions::default())
+            .unwrap();
+        fs::write(shard_file.join("objects/aa"), b"not a shard directory").unwrap();
+        let error = verify_archive_bundle(&shard_file).unwrap_err();
+        assert_eq!(
+            archive_verification_error_code(&error),
+            Some("special_file")
+        );
+
+        let empty_shard = temp.path().join("empty-shard.ctxar");
+        store
+            .create_archive(&empty_shard, ArchiveOptions::default())
+            .unwrap();
+        fs::create_dir(empty_shard.join("objects/bb")).unwrap();
+        let error = verify_archive_bundle(&empty_shard).unwrap_err();
+        assert_eq!(
+            archive_verification_error_code(&error),
+            Some("layout_mismatch")
+        );
+
+        let oversized = temp.path().join("oversized.ctxar");
+        store
+            .create_archive(&oversized, ArchiveOptions::default())
+            .unwrap();
+        rewrite_manifest(
+            &oversized,
+            b"\"entity_count\":0",
+            b"\"entity_count\":10000001",
+        );
+        let error = verify_archive_bundle(&oversized).unwrap_err();
+        assert_eq!(
+            archive_verification_error_code(&error),
+            Some("size_cap_exceeded")
+        );
+
+        assert!(!temp.path().join(".ctxar-verify").exists());
+        assert!(fs::read_dir(temp.path()).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".ctxar-verify-")));
+    }
+
+    #[test]
+    fn verifier_applies_entity_limit_once_across_all_streams() {
+        let temp = root();
+        let mut store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        store.conn.execute_batch(
+            "INSERT INTO capture_sources (id,kind,provider,machine_id,started_at_ms,fidelity,visibility,sync_state,sync_version,metadata_json) VALUES ('10000000-0000-7000-8000-000000000001','provider_import','codex','machine',1,'full','local_only','local_only',0,'{}');
+             INSERT INTO vcs_workspaces (id,kind,root_path,repo_fingerprint,created_at_ms,updated_at_ms,visibility,fidelity,sync_state,sync_version,metadata_json) VALUES ('10000000-0000-7000-8000-000000000002','git','/repo','fingerprint',1,1,'local_only','full','local_only',0,'{}');",
+        ).unwrap();
+        let target = temp.path().join("aggregate-cap.ctxar");
+        store
+            .create_archive(&target, ArchiveOptions::default())
+            .unwrap();
+        // Keep the declared total inside the selected cap so this cannot fail
+        // manifest preflight. The two signed stream declarations and records
+        // intentionally disagree with that total and force the shared budget
+        // to reject the first record in the second non-empty stream.
+        let manifest_path = target.join("manifest.json");
+        let manifest = fs::read(&manifest_path).unwrap();
+        let manifest = String::from_utf8(manifest)
+            .unwrap()
+            .replace("\"entity_count\":2", "\"entity_count\":1")
+            .into_bytes();
+        fs::write(&manifest_path, &manifest).unwrap();
+        fs::write(target.join("COMPLETE"), completion_bytes(&manifest)).unwrap();
+
+        let error = verify_archive_bundle_with_options(
+            &target,
+            ArchiveVerifyOptions {
+                max_entities: 1,
+                ..ArchiveVerifyOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            archive_verification_error_code(&error),
+            Some("size_cap_exceeded")
+        );
+        assert!(matches!(
+            error,
+            StoreError::ArchiveVerification { diagnostic, .. }
+                if diagnostic.contains("observed entities")
+        ));
+    }
+
+    #[test]
+    fn late_reference_failure_cleans_populated_verifier_sqlite_and_journal() {
+        let temp = root();
+        let mut store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        store.conn.execute_batch(
+            "INSERT INTO capture_sources (id,kind,provider,machine_id,started_at_ms,fidelity,visibility,sync_state,sync_version,metadata_json) VALUES ('20000000-0000-7000-8000-000000000001','provider_import','codex','machine',1,'full','local_only','local_only',0,'{}');
+             INSERT INTO vcs_workspaces (id,kind,root_path,repo_fingerprint,created_at_ms,updated_at_ms,source_id,visibility,fidelity,sync_state,sync_version,metadata_json) VALUES ('20000000-0000-7000-8000-000000000002','git','/repo','fingerprint',1,1,'20000000-0000-7000-8000-000000000001','local_only','full','local_only',0,'{}');",
+        ).unwrap();
+        let target = temp.path().join("late-reference.ctxar");
+        store
+            .create_archive(&target, ArchiveOptions::default())
+            .unwrap();
+
+        let stream_path = target.join("streams/02-vcs_workspaces.jsonl");
+        let stream = fs::read_to_string(&stream_path).unwrap().replace(
+            "20000000-0000-7000-8000-000000000001",
+            "29999999-9999-7999-8999-999999999999",
+        );
+        fs::write(&stream_path, &stream).unwrap();
+        let manifest_path = target.join("manifest.json");
+        let old_manifest = fs::read_to_string(&manifest_path).unwrap();
+        let old_hash = hex_digest(Sha256::digest(
+            fs::read(target.join("streams/02-vcs_workspaces.jsonl")).unwrap(),
+        ));
+        // The replacement above was already written; recover the original
+        // digest from the second stream declaration rather than guessing it.
+        let stream_name = "\"name\":\"vcs_workspaces\"";
+        let start = old_manifest.find(stream_name).unwrap();
+        let hash_start =
+            old_manifest[start..].find("\"sha256\":\"").unwrap() + start + "\"sha256\":\"".len();
+        let original_hash = &old_manifest[hash_start..hash_start + 64];
+        let manifest = old_manifest
+            .replacen(original_hash, &old_hash, 1)
+            .into_bytes();
+        fs::write(&manifest_path, &manifest).unwrap();
+        fs::write(target.join("COMPLETE"), completion_bytes(&manifest)).unwrap();
+
+        let error = verify_archive_bundle(&target).unwrap_err();
+        assert_eq!(
+            archive_verification_error_code(&error),
+            Some("dangling_reference")
+        );
+        assert!(fs::read_dir(temp.path()).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".ctxar-verify-")));
+    }
+
+    #[test]
+    fn completion_marker_version_classification_is_stable() {
+        let temp = root();
+        let mut store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let target = temp.path().join("marker-version.ctxar");
+        store
+            .create_archive(&target, ArchiveOptions::default())
+            .unwrap();
+        let valid = fs::read_to_string(target.join("COMPLETE")).unwrap();
+
+        for replacement in ["\"format_version\":\"1\"", "\"wrong_field\":1"] {
+            let marker = valid.replace("\"format_version\":1", replacement);
+            fs::write(target.join("COMPLETE"), marker).unwrap();
+            let error = verify_archive_bundle(&target).unwrap_err();
+            assert_eq!(
+                archive_verification_error_code(&error),
+                Some("marker_invalid")
+            );
+        }
+
+        fs::write(
+            target.join("COMPLETE"),
+            valid.replace("\"format_version\":1", "\"format_version\":2"),
+        )
+        .unwrap();
+        let error = verify_archive_bundle(&target).unwrap_err();
+        assert_eq!(
+            archive_verification_error_code(&error),
+            Some("format_unsupported")
+        );
+    }
+
+    #[test]
+    fn stable_rejection_codes_are_exhaustive_and_wording_independent() {
+        let expected = [
+            "marker_missing",
+            "marker_invalid",
+            "manifest_digest_mismatch",
+            "manifest_too_large",
+            "format_unsupported",
+            "unknown_field",
+            "layout_mismatch",
+            "stream_integrity_mismatch",
+            "stream_truncated",
+            "line_too_long",
+            "record_malformed",
+            "vocabulary_unknown",
+            "duplicate_id",
+            "natural_key_conflict",
+            "stream_unsorted",
+            "dangling_reference",
+            "blob_missing",
+            "blob_unreferenced",
+            "blob_mismatch",
+            "special_file",
+            "permissions_writable",
+            "size_cap_exceeded",
+        ];
+        assert_eq!(ArchiveVerificationCode::ALL.len(), expected.len());
+        for (code, expected) in ArchiveVerificationCode::ALL.into_iter().zip(expected) {
+            let error = StoreError::ArchiveVerification {
+                code,
+                diagnostic: "deliberately different internal wording".into(),
+            };
+            assert_eq!(archive_verification_error_code(&error), Some(expected));
+        }
+        assert_eq!(
+            archive_verification_error_code(&StoreError::Archive("other".into())),
+            None
+        );
     }
 
     #[test]

@@ -1,12 +1,12 @@
 # ctx Archive Format v1 (`ctx-archive`, format_version 1)
 
 Status: **accepted design contract**, with the v1 writer shipped by
-`ctx archive create`; verification and restore remain follow-up commands, for
+`ctx archive create` and the read-only verifier shipped by `ctx archive verify`;
+restore remains a follow-up command for
 [~averagechris/projects#185](https://todo.sr.ht/~averagechris/projects/185).
-The verifier and restore implementation are sliced into follow-up tickets (see
-[Implementation slicing](#implementation-slicing)). Until those land, ctx has
-a supported create-only backup format; the internal `SessionHistoryArchive`
-JSON structure must not be presented as one.
+The restore implementation remains a follow-up ticket (see [Implementation
+slicing](#implementation-slicing)). The internal `SessionHistoryArchive` JSON
+structure must not be presented as this format.
 
 This contract defines the smallest safe, portable, streaming, checksummed
 **logical content archive** of a ctx data root. It is a portable re-import
@@ -556,10 +556,10 @@ path):
 | error name | rejects |
 | --- | --- |
 | `marker_missing` | no `COMPLETE` file (unpublished/incomplete bundle) |
-| `marker_invalid` | `COMPLETE` over 4 KiB, wrong grammar, or unsupported marker format/version |
+| `marker_invalid` | `COMPLETE` over 4 KiB, malformed JSON, wrong key grammar, or noncanonical marker |
 | `manifest_digest_mismatch` | `manifest.json` bytes do not hash to `manifest_sha256` |
 | `manifest_too_large` | `manifest.json` exceeds 16 MiB |
-| `format_unsupported` | unknown `format`, or `format_version` other than 1 (including newer) |
+| `format_unsupported` | unknown manifest/marker `format`, or numeric `format_version` other than 1 (including newer or out-of-range values) |
 | `unknown_field` | unknown key in the manifest or in any stream record |
 | `layout_mismatch` | missing/extra/renamed bundle entry or stream file; manifest `path` differing from the contractual value (traversal attempts never influence I/O because no archive-supplied path is ever joined into the filesystem — the difference itself is the error) |
 | `stream_integrity_mismatch` | stream digest, byte size, or line count differs from the manifest |
@@ -580,6 +580,38 @@ path):
 
 Implementations may append more specific error names in later tickets but
 must not repurpose or weaken the ones above.
+
+### `ctx archive verify` CLI contract
+
+`ctx archive verify <bundle>` performs the complete verification pass above and
+never writes to the bundle. It exits `0` only after all phases succeed. A
+verification rejection exits `1`; command-line usage errors retain clap's exit
+code `2`. The human failure form includes the stable category and the
+explicitly requested bundle path, but never includes transcript fields or
+verifier temporary paths.
+
+With `--json`, success writes exactly one JSON object to stdout and nothing to
+stderr:
+
+```json
+{"format":"ctx-archive","format_version":1,"path":"...","verified":true,"entity_count":0,"objects":{"count":0,"total_bytes":0}}
+```
+
+With `--json`, a verification rejection writes exactly one JSON object to
+stderr, nothing to stdout, and exits `1`:
+
+```json
+{"error":{"code":"stream_truncated","message":"...","path":"..."}}
+```
+
+The `error.code` values are the rejection-matrix names in this document. The
+message is a stable, non-sensitive summary; consumers must branch on `code`,
+not on message text. The store API carries the same exhaustive typed
+`ArchiveVerificationCode` taxonomy; diagnostics are retained separately and
+are not used to derive the public code. `--max-entities`, `--max-objects`, `--max-object-bytes`,
+and `--max-bytes` may lower the fixed v1 ceilings. Values above the fixed
+ceilings are rejected as `size_cap_exceeded`; defaults are 10,000,000 entities,
+1,000,000 objects, 4 GiB per object, and 16 GiB total stream-plus-object bytes.
 
 ## Restore
 

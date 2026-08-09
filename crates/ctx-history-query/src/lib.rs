@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -31,12 +31,17 @@ use uuid::Uuid;
 
 pub const QUERY_DTO_SCHEMA_VERSION: u32 = 1;
 pub const QUERY_REVISION: u32 = 1;
+pub const EVIDENCE_SELECTOR_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_SHOW_LIMIT: usize = 200;
 pub const MAX_SHOW_LIMIT: usize = 1000;
 pub const DEFAULT_ITEM_BYTES: usize = 4096;
 pub const MAX_ITEM_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_PAGE_BYTES: usize = 256 * 1024;
 pub const MAX_PAGE_BYTES: usize = 16 * 1024 * 1024;
+pub const DEFAULT_ARTIFACT_BYTES: usize = 1024 * 1024;
+pub const MAX_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_EVIDENCE_EVENT_IDS: usize = 256;
+pub const MAX_EVIDENCE_SEARCH_LIMIT: usize = 200;
 /// Compatibility name retained for callers that used the scaffold constant.
 pub const MAX_SNIPPET_BYTES: usize = MAX_ITEM_BYTES;
 const MAX_TOKEN_BYTES: usize = 4096;
@@ -101,6 +106,14 @@ pub enum QueryError {
         required_bytes: usize,
         page_bytes: usize,
     },
+    #[error("evidence selector is invalid: {0}")]
+    InvalidEvidenceSelector(String),
+    #[error("evidence selector combines unsupported options: {0}")]
+    UnsupportedEvidenceCombination(String),
+    #[error("explicit event target is missing: {id}")]
+    MissingEvidenceTarget { id: Uuid },
+    #[error("explicit event target is deleted: {id}")]
+    DeletedEvidenceTarget { id: Uuid },
 }
 
 pub type Result<T> = std::result::Result<T, QueryError>;
@@ -318,6 +331,7 @@ impl TranscriptMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BytePolicy {
     pub per_item_bytes: usize,
     pub page_bytes: usize,
@@ -350,6 +364,393 @@ impl Default for BytePolicy {
             page_bytes: DEFAULT_PAGE_BYTES,
         }
     }
+}
+
+/// Output format is part of evidence continuation identity even though this
+/// crate deliberately does not render either format yet.  Binding it here
+/// prevents a future renderer from accidentally replaying a token in another
+/// contract domain.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceFormat {
+    #[default]
+    Jsonl,
+    Markdown,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceRefresh {
+    #[default]
+    Off,
+    Auto,
+    Strict,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(tag = "domain", rename_all = "snake_case")]
+pub enum EvidenceSelector {
+    SessionPage {
+        ctx_session_id: Uuid,
+        mode: TranscriptMode,
+    },
+    SearchPage {
+        query: String,
+        #[serde(default)]
+        terms: Vec<String>,
+        #[serde(default)]
+        options: Box<PacketOptions>,
+    },
+    EventIds {
+        event_ids: Vec<Uuid>,
+    },
+}
+
+/// Explicit evidence-owned search wire fields.  This is deliberately not a
+/// serialization of `SearchFilters`: every effective #195 field, including
+/// `primary_only`, is named here so continuation arguments cannot silently
+/// lose a skipped or future filter field.
+#[derive(Debug, Clone, Serialize)]
+struct EvidenceSearchOptionsV1<'a> {
+    limit: usize,
+    snippet_chars: usize,
+    filters: EvidenceSearchFiltersV1<'a>,
+    result_mode: SearchResultMode,
+    match_mode: SearchMatchMode,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct EvidenceSearchFiltersV1<'a> {
+    session: Option<Uuid>,
+    provider: Option<CaptureProvider>,
+    history_source: &'a Option<String>,
+    provider_key: &'a Option<String>,
+    source_id: &'a Option<String>,
+    source_format: &'a Option<String>,
+    workspace: &'a Option<String>,
+    since: Option<DateTime<Utc>>,
+    primary_only: bool,
+    include_subagents: bool,
+    event_type: Option<EventType>,
+    roles: &'a [EventRole],
+    exclude_roles: &'a [EventRole],
+    exclude_tool_noise: bool,
+    exclude_tool_names: &'a [String],
+    file: &'a Option<String>,
+    exclude_provider_session: Option<EvidenceProviderSessionFilterV1<'a>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct EvidenceProviderSessionFilterV1<'a> {
+    provider: CaptureProvider,
+    provider_session_id: &'a str,
+    session_id: Option<Uuid>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "domain", rename_all = "snake_case")]
+enum EvidenceSelectorWire<'a> {
+    SessionPage {
+        ctx_session_id: Uuid,
+        mode: TranscriptMode,
+    },
+    SearchPage {
+        query: &'a str,
+        terms: &'a [String],
+        options: Box<EvidenceSearchOptionsV1<'a>>,
+    },
+    EventIds {
+        event_ids: &'a [Uuid],
+    },
+}
+
+impl Serialize for EvidenceSelector {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let wire = match self {
+            Self::SessionPage {
+                ctx_session_id,
+                mode,
+            } => EvidenceSelectorWire::SessionPage {
+                ctx_session_id: *ctx_session_id,
+                mode: *mode,
+            },
+            Self::SearchPage {
+                query,
+                terms,
+                options,
+            } => {
+                let filters = &options.filters;
+                EvidenceSelectorWire::SearchPage {
+                    query,
+                    terms,
+                    options: Box::new(EvidenceSearchOptionsV1 {
+                        limit: options.limit,
+                        snippet_chars: options.snippet_chars,
+                        filters: EvidenceSearchFiltersV1 {
+                            session: filters.session,
+                            provider: filters.provider,
+                            history_source: &filters.history_source,
+                            provider_key: &filters.provider_key,
+                            source_id: &filters.source_id,
+                            source_format: &filters.source_format,
+                            workspace: &filters.repo,
+                            since: filters.since,
+                            primary_only: filters.primary_only,
+                            include_subagents: filters.include_subagents,
+                            event_type: filters.event_type,
+                            roles: &filters.roles,
+                            exclude_roles: &filters.exclude_roles,
+                            exclude_tool_noise: filters.exclude_tool_noise,
+                            exclude_tool_names: &filters.exclude_tool_names,
+                            file: &filters.file,
+                            exclude_provider_session: filters
+                                .exclude_provider_session
+                                .as_ref()
+                                .map(|value| EvidenceProviderSessionFilterV1 {
+                                    provider: value.provider,
+                                    provider_session_id: &value.provider_session_id,
+                                    session_id: value.session_id,
+                                }),
+                        },
+                        result_mode: options.result_mode,
+                        match_mode: options.match_mode,
+                    }),
+                }
+            }
+            Self::EventIds { event_ids } => EvidenceSelectorWire::EventIds { event_ids },
+        };
+        wire.serialize(serializer)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceSelectorRequest {
+    pub selector: EvidenceSelector,
+    pub limit: usize,
+    #[serde(default)]
+    pub fields: FieldSet,
+    #[serde(default)]
+    pub byte_policy: BytePolicy,
+    #[serde(default = "default_artifact_bytes")]
+    pub artifact_bytes: usize,
+    #[serde(default)]
+    pub format: EvidenceFormat,
+    #[serde(default)]
+    pub refresh: EvidenceRefresh,
+    /// The effective evidence rule is always true.  It is explicit in the
+    /// replay arguments so a continuation never depends on ambient agent
+    /// environment such as CODEX_THREAD_ID.
+    #[serde(default = "default_include_current_session")]
+    pub include_current_session: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<String>,
+}
+
+fn default_include_current_session() -> bool {
+    true
+}
+
+fn default_artifact_bytes() -> usize {
+    DEFAULT_ARTIFACT_BYTES
+}
+
+impl Default for EvidenceSelectorRequest {
+    fn default() -> Self {
+        Self {
+            selector: EvidenceSelector::EventIds { event_ids: vec![] },
+            limit: 1,
+            fields: FieldSet::default(),
+            byte_policy: BytePolicy::default(),
+            artifact_bytes: DEFAULT_ARTIFACT_BYTES,
+            format: EvidenceFormat::default(),
+            refresh: EvidenceRefresh::default(),
+            include_current_session: true,
+            continuation: None,
+        }
+    }
+}
+
+impl EvidenceSelectorRequest {
+    /// Normalize caller ordering and all bounded page defaults.  The returned
+    /// request is the one that belongs in a token and in `next_arguments`.
+    pub fn canonicalized(&self) -> Result<Self> {
+        let mut request = self.clone();
+        request.byte_policy = request.byte_policy.validate()?;
+        if request.artifact_bytes == 0 || request.artifact_bytes > MAX_ARTIFACT_BYTES {
+            return Err(QueryError::InvalidBytePolicy {
+                field: "artifact_bytes",
+                value: request.artifact_bytes,
+                maximum: MAX_ARTIFACT_BYTES,
+            });
+        }
+        if !request.include_current_session {
+            return Err(QueryError::UnsupportedEvidenceCombination(
+                "include_current_session must be true".to_owned(),
+            ));
+        }
+        if request.refresh != EvidenceRefresh::Off {
+            return Err(QueryError::UnsupportedEvidenceCombination(
+                "evidence selection requires refresh=off".to_owned(),
+            ));
+        }
+        if request.limit == 0 {
+            return Err(QueryError::InvalidPageSize);
+        }
+        request.limit = match &request.selector {
+            EvidenceSelector::SessionPage { .. } => request.limit.min(MAX_SHOW_LIMIT),
+            EvidenceSelector::SearchPage { .. } | EvidenceSelector::EventIds { .. } => {
+                request.limit.min(MAX_EVIDENCE_SEARCH_LIMIT)
+            }
+        };
+        if let EvidenceSelector::SearchPage { options, .. } = &mut request.selector {
+            options.limit = request.limit;
+        }
+        if let EvidenceSelector::EventIds { event_ids } = &mut request.selector {
+            if event_ids.is_empty() {
+                return Err(QueryError::InvalidEvidenceSelector(
+                    "event_ids must not be empty".to_owned(),
+                ));
+            }
+            if event_ids.len() > MAX_EVIDENCE_EVENT_IDS {
+                return Err(QueryError::InvalidEvidenceSelector(format!(
+                    "event_ids exceeds the maximum of {MAX_EVIDENCE_EVENT_IDS}"
+                )));
+            }
+            let mut sorted = event_ids.clone();
+            sorted.sort_unstable();
+            if sorted.windows(2).any(|ids| ids[0] == ids[1]) {
+                return Err(QueryError::InvalidEvidenceSelector(
+                    "event_ids must not contain duplicates".to_owned(),
+                ));
+            }
+            *event_ids = sorted;
+        }
+        if let EvidenceSelector::SearchPage {
+            query,
+            terms,
+            options,
+        } = &request.selector
+        {
+            validate_query_request(query, terms)?;
+            // Search itself has no refresh operation in QueryService.  Keep a
+            // defensive normalization here so a caller-provided ambient
+            // exclusion cannot turn an evidence request into a hidden current
+            // session filter.
+            let _ = options;
+        }
+        request.continuation = self.continuation.clone();
+        Ok(request)
+    }
+
+    fn without_continuation(&self) -> Self {
+        let mut value = self.clone();
+        value.continuation = None;
+        value
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EvidenceCountV1 {
+    pub kind: &'static str,
+    pub value: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EvidenceSearchTruncationV1 {
+    pub truncated: bool,
+    pub omitted_results: usize,
+    pub omitted_results_exact: bool,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EvidenceWorkBoundsV1 {
+    pub selector_limit: usize,
+    pub explicit_event_id_limit: usize,
+    pub search_candidate_limit: usize,
+    pub per_item_bytes: usize,
+    pub page_bytes: usize,
+    pub artifact_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "record_type", rename_all = "snake_case")]
+pub enum EvidenceItemV1 {
+    Session { value: SessionProjectionV1 },
+    Event { value: EventProjectionV1 },
+    Result { value: SearchResultProjectionV1 },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EvidenceContinuationV1 {
+    pub token: String,
+    pub next_arguments: EvidenceSelectorRequest,
+}
+
+/// A bounded source lookup carried alongside a selection page.  A missing
+/// lookup row is represented by `None`; it is not permission to reread an
+/// ambient source or inspect the filesystem later.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EvidenceSourceLookupV1 {
+    pub capture_source_id: Uuid,
+    pub source: Option<SourceFullV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EvidenceEventSourceRefsV1 {
+    pub ctx_event_id: Uuid,
+    pub event_capture_source_id: Option<Uuid>,
+    /// Only a distinct owning-session source is repeated here.  When the
+    /// source IDs are equal, the event reference and lookup row are shared.
+    pub session_capture_source_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EvidenceSearchSourceIdentityV1 {
+    pub result_id: Uuid,
+    pub history_source: Option<String>,
+    pub provider_key: Option<String>,
+    pub source_id: Option<String>,
+    pub source_format: Option<String>,
+}
+
+/// Provenance selected by one admitted search result. Event references follow
+/// the result's primary event and then its event citations, with duplicates
+/// removed in first-occurrence order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EvidenceSearchSourceRefsV1 {
+    pub result_id: Uuid,
+    pub session_capture_source_id: Option<Uuid>,
+    pub events: Vec<EvidenceEventSourceRefsV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EvidenceSelectionPageV1 {
+    pub schema_version: u32,
+    pub domain: &'static str,
+    pub ordering: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionProjectionV1>,
+    pub source_lookup: Vec<EvidenceSourceLookupV1>,
+    pub event_source_refs: Vec<EvidenceEventSourceRefsV1>,
+    pub search_source_identity: Vec<EvidenceSearchSourceIdentityV1>,
+    pub search_source_refs: Vec<EvidenceSearchSourceRefsV1>,
+    pub items: Vec<EvidenceItemV1>,
+    pub selected_total: Option<usize>,
+    pub retained_pool_total: Option<usize>,
+    pub corpus_count: Option<EvidenceCountV1>,
+    pub omitted: OmittedCountsV1,
+    pub pagination: PaginationV1,
+    pub bytes: PageBytesV1,
+    pub work: EvidenceWorkBoundsV1,
+    pub search_truncation: Option<EvidenceSearchTruncationV1>,
+    pub continuation: Option<EvidenceContinuationV1>,
+    pub format: EvidenceFormat,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -711,6 +1112,8 @@ pub struct SearchPageV1 {
     pub query_plan: SearchQueryPlan,
     pub generated_at: DateTime<Utc>,
     pub results: Vec<SearchResultProjectionV1>,
+    #[serde(skip)]
+    pub admitted_results: Vec<SearchPacketResult>,
     /// Exact size of the stable, bounded candidate pool used by all pages.
     pub pool_total: usize,
     pub omitted: OmittedCountsV1,
@@ -909,9 +1312,33 @@ impl<'a> QueryService<'a> {
         }
         let page_size = limit.min(MAX_SHOW_LIMIT);
         let request = show_request_hash(session.id, mode, page_size, fields, byte_policy)?;
+        self.session_events_bound(
+            session,
+            mode,
+            page_size,
+            continuation,
+            fields,
+            byte_policy,
+            request,
+            "show_session",
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn session_events_bound(
+        &self,
+        session: Session,
+        mode: TranscriptMode,
+        page_size: usize,
+        continuation: Option<&str>,
+        fields: FieldSet,
+        byte_policy: BytePolicy,
+        request: String,
+        token_kind: &'static str,
+    ) -> Result<EventPageV1> {
         let snapshot = self.store().snapshot_fingerprint()?;
         let token = continuation
-            .map(|raw| decode_token(raw, "show_session", &request, &snapshot))
+            .map(|raw| decode_token(raw, token_kind, &request, &snapshot))
             .transpose()?;
         let offset = token_offset(token.as_ref())?;
         let after = token.as_ref().and_then(|value| value.seq.zip(value.id));
@@ -949,38 +1376,32 @@ impl<'a> QueryService<'a> {
             after,
             fetch_limit,
         )?;
-        let source = if fields == FieldSet::Full {
-            session
-                .capture_source_id
-                .map(|id| self.store().get_capture_source(id).map(project_source))
-                .transpose()?
+        let candidate_events = raw_events.iter().take(page_size).collect::<Vec<_>>();
+        let source_ids = candidate_events
+            .iter()
+            .filter_map(|event| event.capture_source_id)
+            .chain(session.capture_source_id)
+            .collect::<BTreeSet<_>>();
+        let source_cache = if fields == FieldSet::Full {
+            self.store()
+                .capture_sources_for_ids(&source_ids.into_iter().collect::<Vec<_>>())?
+                .into_iter()
+                .map(|(id, source)| (id, Some(project_source(source))))
+                .collect::<HashMap<_, _>>()
         } else {
-            None
+            HashMap::new()
         };
-        let mut source_cache = HashMap::<Uuid, Option<SourceFullV1>>::new();
-        if let (Some(source_id), Some(source)) = (session.capture_source_id, source.clone()) {
-            source_cache.insert(source_id, Some(source));
-        }
+        let source = session
+            .capture_source_id
+            .and_then(|id| source_cache.get(&id))
+            .and_then(Option::clone);
 
         let mut events = Vec::new();
         let mut compact_json_bytes = 0usize;
         let mut item_text_truncated = 0usize;
         let mut page_budget_exhausted = false;
         let mut last_key = None;
-        for event in raw_events.iter().take(page_size) {
-            if fields == FieldSet::Full {
-                if let Some(source_id) = event.capture_source_id {
-                    if let std::collections::hash_map::Entry::Vacant(entry) =
-                        source_cache.entry(source_id)
-                    {
-                        let projected = self
-                            .store()
-                            .get_capture_source(source_id)
-                            .map(project_source)?;
-                        entry.insert(Some(projected));
-                    }
-                }
-            }
+        for event in candidate_events {
             let event_source = event
                 .capture_source_id
                 .and_then(|source_id| source_cache.get(&source_id))
@@ -1034,7 +1455,7 @@ impl<'a> QueryService<'a> {
             let cursor_key = last_key.or(after);
             Some(encode_token(&Token {
                 v: QUERY_DTO_SCHEMA_VERSION,
-                kind: "show_session".to_owned(),
+                kind: token_kind.to_owned(),
                 request: request.clone(),
                 snapshot: snapshot.clone(),
                 offset: u64::try_from(next_offset).map_err(|_| QueryError::ArithmeticOverflow)?,
@@ -1093,9 +1514,35 @@ impl<'a> QueryService<'a> {
         }
         let page_size = options.limit.min(ctx_history_search::MAX_RESULT_LIMIT);
         let request = search_request_hash(query, terms, &options, page_size, fields, byte_policy)?;
+        self.search_bound(
+            query,
+            terms,
+            options,
+            page_size,
+            continuation,
+            fields,
+            byte_policy,
+            request,
+            "search",
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn search_bound(
+        &self,
+        query: &str,
+        terms: &[String],
+        options: PacketOptions,
+        page_size: usize,
+        continuation: Option<&str>,
+        fields: FieldSet,
+        byte_policy: BytePolicy,
+        request: String,
+        token_kind: &'static str,
+    ) -> Result<SearchPageV1> {
         let snapshot = self.store().snapshot_fingerprint()?;
         let token = continuation
-            .map(|raw| decode_token(raw, "search", &request, &snapshot))
+            .map(|raw| decode_token(raw, token_kind, &request, &snapshot))
             .transpose()?;
         let offset = token_offset(token.as_ref())?;
 
@@ -1146,6 +1593,7 @@ impl<'a> QueryService<'a> {
         }
 
         let mut results = Vec::new();
+        let mut admitted_results = Vec::new();
         let mut compact_json_bytes = 0usize;
         let mut item_text_truncated = 0usize;
         let mut page_budget_exhausted = false;
@@ -1179,6 +1627,7 @@ impl<'a> QueryService<'a> {
             });
             compact_json_bytes = next_bytes;
             results.push(projection);
+            admitted_results.push(result.clone());
         }
         let returned = results.len();
         let next_offset = offset
@@ -1195,7 +1644,7 @@ impl<'a> QueryService<'a> {
         let next_continuation = if has_more {
             Some(encode_token(&Token {
                 v: QUERY_DTO_SCHEMA_VERSION,
-                kind: "search".to_owned(),
+                kind: token_kind.to_owned(),
                 request,
                 snapshot,
                 offset: u64::try_from(next_offset).map_err(|_| QueryError::ArithmeticOverflow)?,
@@ -1223,6 +1672,7 @@ impl<'a> QueryService<'a> {
             // it per request keeps cache hits indistinguishable from misses.
             generated_at: utc_now(),
             results,
+            admitted_results,
             pool_total,
             omitted: OmittedCountsV1 {
                 before: offset,
@@ -1245,6 +1695,558 @@ impl<'a> QueryService<'a> {
             },
             fields,
         })
+    }
+
+    /// Execute exactly one evidence selector domain.  This is intentionally a
+    /// query-core API: it has no CLI/MCP state, reads no ambient session
+    /// variables, and does not render or write an artifact.
+    pub fn select_evidence(
+        &self,
+        request: EvidenceSelectorRequest,
+    ) -> Result<EvidenceSelectionPageV1> {
+        let request = request.canonicalized()?;
+        let request_hash = evidence_request_hash(&request.without_continuation())?;
+        let continuation = request.continuation.as_deref();
+        match &request.selector {
+            EvidenceSelector::SessionPage {
+                ctx_session_id,
+                mode,
+            } => self.select_evidence_session(
+                &request,
+                *ctx_session_id,
+                *mode,
+                continuation,
+                request_hash,
+            ),
+            EvidenceSelector::SearchPage {
+                query,
+                terms,
+                options,
+            } => self.select_evidence_search(
+                &request,
+                query,
+                terms,
+                options,
+                continuation,
+                request_hash,
+            ),
+            EvidenceSelector::EventIds { event_ids } => {
+                self.select_evidence_events(&request, event_ids, continuation, request_hash)
+            }
+        }
+    }
+
+    fn select_evidence_session(
+        &self,
+        request: &EvidenceSelectorRequest,
+        session_id: Uuid,
+        mode: TranscriptMode,
+        continuation: Option<&str>,
+        request_hash: String,
+    ) -> Result<EvidenceSelectionPageV1> {
+        let session = match self.store().get_session(session_id) {
+            Ok(session) if session.sync.deleted_at.is_none() => session,
+            Ok(_) => return Err(QueryError::DeletedEvidenceTarget { id: session_id }),
+            Err(ctx_history_store::StoreError::NotFound(_)) => {
+                return Err(QueryError::MissingEvidenceTarget { id: session_id })
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let page = self.session_events_bound(
+            session,
+            mode,
+            request.limit,
+            continuation,
+            request.fields,
+            request.byte_policy,
+            request_hash,
+            "evidence_session_page",
+        )?;
+        let admitted_event_ids = page
+            .events
+            .iter()
+            .map(event_projection_id)
+            .collect::<Vec<_>>();
+        let (event_source_refs, source_lookup) =
+            self.evidence_event_provenance(&admitted_event_ids, request.fields)?;
+        let items = page
+            .events
+            .into_iter()
+            .map(|value| EvidenceItemV1::Event { value })
+            .collect::<Vec<_>>();
+        let continuation =
+            page.pagination
+                .continuation
+                .clone()
+                .map(|token| EvidenceContinuationV1 {
+                    token: token.clone(),
+                    next_arguments: next_evidence_arguments(request, token),
+                });
+        Ok(EvidenceSelectionPageV1 {
+            schema_version: EVIDENCE_SELECTOR_SCHEMA_VERSION,
+            domain: "session_page",
+            ordering: "session_seq_id_asc",
+            session: Some(page.session),
+            source_lookup,
+            event_source_refs,
+            search_source_identity: Vec::new(),
+            search_source_refs: Vec::new(),
+            items,
+            selected_total: Some(page.selected_total),
+            retained_pool_total: None,
+            corpus_count: None,
+            omitted: page.omitted,
+            pagination: page.pagination,
+            bytes: page.bytes,
+            work: evidence_work_bounds(request),
+            search_truncation: None,
+            continuation,
+            format: request.format,
+        })
+    }
+
+    fn select_evidence_search(
+        &self,
+        request: &EvidenceSelectorRequest,
+        query: &str,
+        terms: &[String],
+        options: &PacketOptions,
+        continuation: Option<&str>,
+        request_hash: String,
+    ) -> Result<EvidenceSelectionPageV1> {
+        let page = self.search_bound(
+            query,
+            terms,
+            options.clone(),
+            request.limit,
+            continuation,
+            request.fields,
+            request.byte_policy,
+            request_hash,
+            "evidence_search_page",
+        )?;
+        let search_truncation = EvidenceSearchTruncationV1 {
+            truncated: page.source_truncation.truncated,
+            omitted_results: page.source_truncation.omitted_results,
+            omitted_results_exact: page.source_truncation.omitted_results_exact,
+            reason: page.source_truncation.reason.clone(),
+        };
+        let search_source_identity = page
+            .results
+            .iter()
+            .filter_map(project_search_source_identity)
+            .collect::<Vec<_>>();
+        let result_event_ids = page
+            .admitted_results
+            .iter()
+            .flat_map(search_result_event_ids)
+            .collect::<Vec<_>>();
+        let (all_event_refs, mut source_lookup) =
+            self.evidence_event_provenance(&result_event_ids, request.fields)?;
+        let event_refs_by_id = all_event_refs
+            .into_iter()
+            .map(|refs| (refs.ctx_event_id, refs))
+            .collect::<HashMap<_, _>>();
+        let result_session_ids = page
+            .admitted_results
+            .iter()
+            .filter_map(|result| result.session_id)
+            .collect::<Vec<_>>();
+        let result_sessions = self.store().live_sessions_for_ids(&result_session_ids)?;
+        let search_source_refs = page
+            .admitted_results
+            .iter()
+            .map(|result| EvidenceSearchSourceRefsV1 {
+                result_id: result.record_id,
+                session_capture_source_id: result
+                    .session_id
+                    .and_then(|id| result_sessions.get(&id))
+                    .and_then(|session| session.capture_source_id),
+                events: search_result_event_ids(result)
+                    .into_iter()
+                    .filter_map(|id| event_refs_by_id.get(&id).cloned())
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        let existing_source_ids = source_lookup
+            .iter()
+            .map(|source| source.capture_source_id)
+            .collect::<BTreeSet<_>>();
+        let session_source_ids = search_source_refs
+            .iter()
+            .filter_map(|refs| refs.session_capture_source_id)
+            .filter(|id| !existing_source_ids.contains(id))
+            .collect::<BTreeSet<_>>();
+        source_lookup.extend(self.evidence_source_lookup(&session_source_ids, request.fields)?);
+        source_lookup.sort_by_key(|source| source.capture_source_id);
+        let corpus_count = if search_truncation.truncated {
+            Some(EvidenceCountV1 {
+                kind: "lower_bound",
+                value: page.pool_total,
+            })
+        } else {
+            Some(EvidenceCountV1 {
+                kind: "exact",
+                value: page.pool_total,
+            })
+        };
+        let items = page
+            .results
+            .into_iter()
+            .map(|value| EvidenceItemV1::Result { value })
+            .collect::<Vec<_>>();
+        let continuation =
+            page.pagination
+                .continuation
+                .clone()
+                .map(|token| EvidenceContinuationV1 {
+                    token: token.clone(),
+                    next_arguments: next_evidence_arguments(request, token),
+                });
+        Ok(EvidenceSelectionPageV1 {
+            schema_version: EVIDENCE_SELECTOR_SCHEMA_VERSION,
+            domain: "search_page",
+            ordering: "search_ranked_v1",
+            session: None,
+            source_lookup,
+            event_source_refs: Vec::new(),
+            search_source_identity,
+            search_source_refs,
+            items,
+            selected_total: None,
+            retained_pool_total: Some(page.pool_total),
+            corpus_count,
+            omitted: page.omitted,
+            pagination: page.pagination,
+            bytes: page.bytes,
+            work: evidence_work_bounds(request),
+            search_truncation: Some(search_truncation),
+            continuation,
+            format: request.format,
+        })
+    }
+
+    fn select_evidence_events(
+        &self,
+        request: &EvidenceSelectorRequest,
+        event_ids: &[Uuid],
+        continuation: Option<&str>,
+        request_hash: String,
+    ) -> Result<EvidenceSelectionPageV1> {
+        let snapshot = self.store().snapshot_fingerprint()?;
+        let offset = if let Some(token) = continuation {
+            let token = decode_token(token, "evidence_event_ids", &request_hash, &snapshot)?;
+            token_offset(Some(&token))?
+        } else {
+            0
+        };
+        let statuses = self.store().event_target_statuses(event_ids)?;
+        if let Some(id) = event_ids.iter().find(|id| {
+            matches!(
+                statuses.get(id),
+                Some(ctx_history_store::EventTargetStatus::Missing)
+            )
+        }) {
+            return Err(QueryError::MissingEvidenceTarget { id: *id });
+        }
+        if let Some(id) = event_ids.iter().find(|id| {
+            matches!(
+                statuses.get(id),
+                Some(ctx_history_store::EventTargetStatus::Deleted)
+            )
+        }) {
+            return Err(QueryError::DeletedEvidenceTarget { id: *id });
+        }
+        let events = self.store().live_events_for_ids(event_ids)?;
+        if offset > events.len() || (continuation.is_some() && offset == events.len()) {
+            return Err(QueryError::InvalidContinuation(
+                "event_ids offset is outside the selected set".to_owned(),
+            ));
+        }
+        let fetch_end = offset
+            .checked_add(request.limit)
+            .ok_or(QueryError::ArithmeticOverflow)?
+            .min(events.len());
+        let page_events = events
+            .iter()
+            .skip(offset)
+            .take(fetch_end.saturating_sub(offset))
+            .collect::<Vec<_>>();
+        let mut items = Vec::new();
+        let mut item_bytes = 0usize;
+        let mut page_budget_exhausted = false;
+        let session_ids = page_events
+            .iter()
+            .filter_map(|event| event.session_id)
+            .collect::<Vec<_>>();
+        let sessions = self.store().live_sessions_for_ids(&session_ids)?;
+        let mut source_ids = BTreeSet::new();
+        for event in &page_events {
+            if let Some(source_id) = event.capture_source_id {
+                source_ids.insert(source_id);
+            }
+            if let Some(session_id) = event.session_id {
+                if let Some(source_id) = sessions
+                    .get(&session_id)
+                    .and_then(|session| session.capture_source_id)
+                {
+                    source_ids.insert(source_id);
+                }
+            }
+        }
+        let source_ids = source_ids.into_iter().collect::<Vec<_>>();
+        let sources = self.store().capture_sources_for_ids(&source_ids)?;
+        let projected_sources = sources
+            .into_iter()
+            .map(|(id, source)| (id, project_source(source)))
+            .collect::<HashMap<_, _>>();
+        let mut admitted_events = Vec::new();
+        for event in &page_events {
+            let session = event.session_id.and_then(|id| sessions.get(&id));
+            let provider = session
+                .map(|session| session.provider)
+                .unwrap_or(CaptureProvider::Unknown);
+            let provider_session_id =
+                session.and_then(|session| session.external_session_id.as_deref());
+            let projection = project_event(
+                event,
+                request.byte_policy.per_item_bytes,
+                provider,
+                provider_session_id,
+                event
+                    .capture_source_id
+                    .and_then(|id| projected_sources.get(&id)),
+                request.fields,
+            );
+            let bytes = serde_json::to_vec(&projection)?.len();
+            let next_bytes = item_bytes
+                .checked_add(bytes)
+                .ok_or(QueryError::ArithmeticOverflow)?;
+            if next_bytes > request.byte_policy.page_bytes {
+                if items.is_empty() {
+                    return Err(QueryError::ItemExceedsPageBudget {
+                        required_bytes: bytes,
+                        page_bytes: request.byte_policy.page_bytes,
+                    });
+                }
+                page_budget_exhausted = true;
+                break;
+            }
+            item_bytes = next_bytes;
+            items.push(EvidenceItemV1::Event { value: projection });
+            admitted_events.push(*event);
+        }
+        let event_source_refs = admitted_events
+            .iter()
+            .map(|event| {
+                let session_source_id = event
+                    .session_id
+                    .and_then(|session_id| sessions.get(&session_id))
+                    .and_then(|session| session.capture_source_id)
+                    .filter(|source_id| Some(*source_id) != event.capture_source_id);
+                EvidenceEventSourceRefsV1 {
+                    ctx_event_id: event.id,
+                    event_capture_source_id: event.capture_source_id,
+                    session_capture_source_id: session_source_id,
+                }
+            })
+            .collect::<Vec<_>>();
+        let admitted_source_ids = event_source_refs
+            .iter()
+            .flat_map(|refs| {
+                [refs.event_capture_source_id, refs.session_capture_source_id]
+                    .into_iter()
+                    .flatten()
+            })
+            .collect::<BTreeSet<_>>();
+        let source_lookup = self.evidence_source_lookup(&admitted_source_ids, request.fields)?;
+        let returned = items.len();
+        let next_offset = offset
+            .checked_add(returned)
+            .ok_or(QueryError::ArithmeticOverflow)?;
+        let has_more = returned > 0 && next_offset < events.len();
+        let after_snapshot = self.store().snapshot_fingerprint()?;
+        if after_snapshot != snapshot {
+            return Err(QueryError::SnapshotChanged);
+        }
+        let next_token = if has_more {
+            Some(encode_token(&Token {
+                v: QUERY_DTO_SCHEMA_VERSION,
+                kind: "evidence_event_ids".to_owned(),
+                request: request_hash,
+                snapshot,
+                offset: u64::try_from(next_offset).map_err(|_| QueryError::ArithmeticOverflow)?,
+                seq: None,
+                id: None,
+            })?)
+        } else {
+            None
+        };
+        let pagination = PaginationV1 {
+            continuation: next_token.clone(),
+            has_more,
+            offset,
+            page_size: request.limit,
+            returned_items: returned,
+        };
+        let continuation = next_token.map(|token| EvidenceContinuationV1 {
+            token: token.clone(),
+            next_arguments: next_evidence_arguments(request, token),
+        });
+        Ok(EvidenceSelectionPageV1 {
+            schema_version: EVIDENCE_SELECTOR_SCHEMA_VERSION,
+            domain: "event_ids",
+            ordering: "event_occurred_at_id_asc",
+            session: None,
+            source_lookup,
+            event_source_refs,
+            search_source_identity: Vec::new(),
+            search_source_refs: Vec::new(),
+            items,
+            selected_total: Some(events.len()),
+            retained_pool_total: None,
+            corpus_count: None,
+            omitted: OmittedCountsV1 {
+                before: offset,
+                after: events.len().saturating_sub(next_offset),
+                exact: true,
+            },
+            pagination,
+            bytes: PageBytesV1 {
+                policy: request.byte_policy,
+                item_json_bytes: item_bytes,
+                page_budget_exhausted,
+                item_text_truncated: 0,
+            },
+            work: evidence_work_bounds(request),
+            search_truncation: None,
+            continuation,
+            format: request.format,
+        })
+    }
+
+    fn evidence_event_provenance(
+        &self,
+        event_ids: &[Uuid],
+        fields: FieldSet,
+    ) -> Result<(Vec<EvidenceEventSourceRefsV1>, Vec<EvidenceSourceLookupV1>)> {
+        let events = self.store().live_events_for_ids(event_ids)?;
+        let events = events
+            .into_iter()
+            .map(|event| (event.id, event))
+            .collect::<HashMap<_, _>>();
+        let session_ids = events
+            .values()
+            .filter_map(|event| event.session_id)
+            .collect::<Vec<_>>();
+        let sessions = self.store().live_sessions_for_ids(&session_ids)?;
+        let refs = event_ids
+            .iter()
+            .filter_map(|event_id| events.get(event_id))
+            .map(|event| {
+                let session_capture_source_id = event
+                    .session_id
+                    .and_then(|id| sessions.get(&id))
+                    .and_then(|session| session.capture_source_id)
+                    .filter(|id| Some(*id) != event.capture_source_id);
+                EvidenceEventSourceRefsV1 {
+                    ctx_event_id: event.id,
+                    event_capture_source_id: event.capture_source_id,
+                    session_capture_source_id,
+                }
+            })
+            .collect::<Vec<_>>();
+        let source_ids = refs
+            .iter()
+            .flat_map(|refs| {
+                [refs.event_capture_source_id, refs.session_capture_source_id]
+                    .into_iter()
+                    .flatten()
+            })
+            .collect::<BTreeSet<_>>();
+        let lookup = self.evidence_source_lookup(&source_ids, fields)?;
+        Ok((refs, lookup))
+    }
+
+    /// Shared bounded projection boundary for every evidence domain.
+    fn evidence_source_lookup(
+        &self,
+        source_ids: &BTreeSet<Uuid>,
+        fields: FieldSet,
+    ) -> Result<Vec<EvidenceSourceLookupV1>> {
+        let sources = if fields == FieldSet::Full {
+            self.store()
+                .capture_sources_for_ids(&source_ids.iter().copied().collect::<Vec<_>>())?
+        } else {
+            BTreeMap::new()
+        };
+        Ok(source_ids
+            .iter()
+            .copied()
+            .map(|capture_source_id| EvidenceSourceLookupV1 {
+                capture_source_id,
+                source: sources
+                    .get(&capture_source_id)
+                    .cloned()
+                    .map(project_evidence_source),
+            })
+            .collect())
+    }
+}
+
+fn evidence_work_bounds(request: &EvidenceSelectorRequest) -> EvidenceWorkBoundsV1 {
+    EvidenceWorkBoundsV1 {
+        selector_limit: request.limit,
+        explicit_event_id_limit: MAX_EVIDENCE_EVENT_IDS,
+        search_candidate_limit: ctx_history_search::MAX_RESULT_LIMIT,
+        per_item_bytes: request.byte_policy.per_item_bytes,
+        page_bytes: request.byte_policy.page_bytes,
+        artifact_bytes: request.artifact_bytes,
+    }
+}
+
+fn next_evidence_arguments(
+    request: &EvidenceSelectorRequest,
+    token: String,
+) -> EvidenceSelectorRequest {
+    let mut next = request.without_continuation();
+    next.continuation = Some(token);
+    next
+}
+
+#[derive(Serialize)]
+struct EvidenceRequestBinding<'a> {
+    kind: &'static str,
+    query_revision: u32,
+    schema_version: u32,
+    evidence_schema_version: u32,
+    search_packet_schema_version: u32,
+    request: &'a EvidenceSelectorRequest,
+}
+
+fn evidence_request_hash(request: &EvidenceSelectorRequest) -> Result<String> {
+    hash_serializable(&EvidenceRequestBinding {
+        kind: "evidence_selector",
+        query_revision: QUERY_REVISION,
+        schema_version: QUERY_DTO_SCHEMA_VERSION,
+        evidence_schema_version: EVIDENCE_SELECTOR_SCHEMA_VERSION,
+        search_packet_schema_version: SEARCH_PACKET_SCHEMA_VERSION,
+        request,
+    })
+}
+
+fn project_search_source_identity(
+    result: &SearchResultProjectionV1,
+) -> Option<EvidenceSearchSourceIdentityV1> {
+    match result {
+        SearchResultProjectionV1::Full(value) => Some(EvidenceSearchSourceIdentityV1 {
+            result_id: value.item_id,
+            history_source: value.history_source.clone(),
+            provider_key: value.provider_key.clone(),
+            source_id: value.source_id.clone(),
+            source_format: value.source_format.clone(),
+        }),
+        SearchResultProjectionV1::Compact(_) => None,
     }
 }
 
@@ -1506,6 +2508,39 @@ fn project_source(source: CaptureSource) -> SourceFullV1 {
         cursor: source_cursor.clone(),
         source_cursor,
     }
+}
+
+fn project_evidence_source(source: CaptureSource) -> SourceFullV1 {
+    let mut projected = project_source(source);
+    projected.cwd = None;
+    projected.path = None;
+    projected.exists = None;
+    projected.source_cursor = None;
+    projected.cursor = None;
+    projected
+}
+
+fn event_projection_id(event: &EventProjectionV1) -> Uuid {
+    match event {
+        EventProjectionV1::Full(value) => value.ctx_event_id,
+        EventProjectionV1::Compact(value) => value.ctx_event_id,
+    }
+}
+
+fn search_result_event_ids(result: &SearchPacketResult) -> Vec<Uuid> {
+    let mut seen = BTreeSet::new();
+    result
+        .event_id
+        .into_iter()
+        .chain(
+            result
+                .citations
+                .iter()
+                .filter(|citation| citation.citation_type == ContextCitationType::Event)
+                .map(|citation| citation.id),
+        )
+        .filter(|id| seen.insert(*id))
+        .collect()
 }
 
 fn project_event(
@@ -2041,14 +3076,16 @@ fn decode_token(raw: &str, kind: &'static str, request: &str, snapshot: &str) ->
         });
     }
     match kind {
-        "show_session"
+        "show_session" | "evidence_session_page"
             if !matches!((token.offset, token.seq, token.id), (1.., Some(_), Some(_))) =>
         {
             return Err(QueryError::InvalidContinuation(
                 "show token requires both seq and id after the first item".to_owned(),
             ));
         }
-        "search" if token.offset == 0 || token.seq.is_some() || token.id.is_some() => {
+        "search" | "evidence_search_page" | "evidence_event_ids"
+            if token.offset == 0 || token.seq.is_some() || token.id.is_some() =>
+        {
             return Err(QueryError::InvalidContinuation(
                 "search token forbids seq and id".to_owned(),
             ));
@@ -2352,6 +3389,7 @@ mod tests {
         CaptureSourceDescriptor, ContextCitation, EntityTimestamps, HistoryRecord, SyncMetadata,
         SyncState,
     };
+    use ctx_history_search::ProviderSessionFilter;
     use std::time::{Duration, Instant};
 
     trait EventProjectionTestExt {
@@ -4643,6 +5681,678 @@ mod tests {
             100.0 * (1.0 - cached_page2_median as f64 / control_page2_median as f64),
             100.0 * (cached_page1_median as f64 / control_page1_median as f64 - 1.0),
         );
+    }
+
+    #[test]
+    fn evidence_session_selector_replays_without_ambient_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("work.sqlite");
+        let (session, _) = transcript_fixture(&path);
+        let store = Store::open_read_only(&path).unwrap();
+        let service = QueryService::new(&store);
+        let request = EvidenceSelectorRequest {
+            selector: EvidenceSelector::SessionPage {
+                ctx_session_id: session.id,
+                mode: TranscriptMode::Log,
+            },
+            limit: 2,
+            fields: FieldSet::Compact,
+            format: EvidenceFormat::Markdown,
+            ..EvidenceSelectorRequest::default()
+        };
+        let first = service.select_evidence(request).unwrap();
+        assert_eq!(first.domain, "session_page");
+        assert_eq!(first.selected_total, Some(9));
+        assert_eq!(first.omitted.before, 0);
+        assert_eq!(first.omitted.after, 7);
+        let continuation = first.continuation.unwrap();
+        assert_eq!(continuation.next_arguments.format, EvidenceFormat::Markdown);
+        assert!(continuation.next_arguments.include_current_session);
+        assert_eq!(
+            continuation.next_arguments.continuation.as_deref(),
+            Some(continuation.token.as_str())
+        );
+        let second = QueryService::new(&store)
+            .select_evidence(continuation.next_arguments)
+            .unwrap();
+        assert_eq!(second.domain, "session_page");
+        assert_eq!(second.omitted.before, 2);
+        assert_eq!(second.items.len(), 2);
+        assert!(matches!(second.items[0], EvidenceItemV1::Event { .. }));
+    }
+
+    #[test]
+    fn evidence_event_ids_are_sorted_bounded_and_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("work.sqlite");
+        let (_session, events) = transcript_fixture(&path);
+        let deleted_id = events[6].id;
+        let mut deleted = events[6].clone();
+        deleted.sync.deleted_at = Some(fixed_time());
+        let writable = Store::open(&path).unwrap();
+        writable.upsert_event(&deleted).unwrap();
+        drop(writable);
+        let store = Store::open_read_only(&path).unwrap();
+        let service = QueryService::new(&store);
+        let live_log = service
+            .session_events(
+                session(Uuid::from_u128(42)),
+                TranscriptMode::Log,
+                20,
+                None,
+                FieldSet::Compact,
+                bytes(),
+            )
+            .unwrap();
+        assert_eq!(live_log.selected_total, 8);
+        let live_lite = service
+            .session_events(
+                session(Uuid::from_u128(42)),
+                TranscriptMode::Lite,
+                20,
+                None,
+                FieldSet::Compact,
+                bytes(),
+            )
+            .unwrap();
+        assert_eq!(event_sequences(&live_lite.events), vec![1, 7]);
+        let request = EvidenceSelectorRequest {
+            selector: EvidenceSelector::EventIds {
+                event_ids: vec![events[2].id, events[0].id],
+            },
+            limit: 1,
+            fields: FieldSet::Compact,
+            ..EvidenceSelectorRequest::default()
+        };
+        let first = service.select_evidence(request).unwrap();
+        assert_eq!(first.selected_total, Some(2));
+        assert_eq!(first.items.len(), 1);
+        assert!(first.pagination.has_more);
+        let next = first.continuation.unwrap().next_arguments;
+        let second = QueryService::new(&store).select_evidence(next).unwrap();
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(second.omitted.before, 1);
+
+        let missing = EvidenceSelectorRequest {
+            selector: EvidenceSelector::EventIds {
+                event_ids: vec![Uuid::from_u128(0xdead)],
+            },
+            ..EvidenceSelectorRequest::default()
+        };
+        assert!(matches!(
+            service.select_evidence(missing),
+            Err(QueryError::MissingEvidenceTarget { .. })
+        ));
+        let deleted = EvidenceSelectorRequest {
+            selector: EvidenceSelector::EventIds {
+                event_ids: vec![deleted_id],
+            },
+            ..EvidenceSelectorRequest::default()
+        };
+        assert!(matches!(
+            service.select_evidence(deleted),
+            Err(QueryError::DeletedEvidenceTarget { id }) if id == deleted_id
+        ));
+        let duplicate = EvidenceSelectorRequest {
+            selector: EvidenceSelector::EventIds {
+                event_ids: vec![events[0].id, events[0].id],
+            },
+            ..EvidenceSelectorRequest::default()
+        };
+        assert!(matches!(
+            service.select_evidence(duplicate),
+            Err(QueryError::InvalidEvidenceSelector(_))
+        ));
+    }
+
+    #[test]
+    fn evidence_event_ids_carry_distinct_event_and_session_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("work.sqlite");
+        let (fixture_session, events) = transcript_fixture(&path);
+        let event_source_id = Uuid::from_u128(60_001);
+        let session_source_id = Uuid::from_u128(60_002);
+        let later_event_source_id = Uuid::from_u128(60_003);
+        let writable = Store::open(&path).unwrap();
+        for (source_id, external_session_id) in [
+            (event_source_id, "event-source"),
+            (session_source_id, "session-source"),
+            (later_event_source_id, "later-event-source"),
+        ] {
+            writable
+                .upsert_capture_source(&CaptureSource {
+                    id: source_id,
+                    descriptor: CaptureSourceDescriptor {
+                        kind: CaptureSourceKind::ProviderImport,
+                        provider: CaptureProvider::Codex,
+                        machine_id: "test-machine".into(),
+                        process_id: None,
+                        cwd: Some("/tmp/evidence".into()),
+                        raw_source_path: Some("/private/evidence/source.jsonl".into()),
+                        external_session_id: Some(external_session_id.into()),
+                    },
+                    started_at: fixed_time(),
+                    ended_at: None,
+                    sync: SyncMetadata {
+                        metadata: json!({"cursor": "private-cursor"}),
+                        ..sync()
+                    },
+                })
+                .unwrap();
+        }
+        let mut sourced_session = fixture_session.clone();
+        let search_record_id = Uuid::from_u128(60_004);
+        writable
+            .insert_record(&HistoryRecord {
+                id: search_record_id,
+                title: "provenance search".into(),
+                body: "sys sys2".into(),
+                tags: Vec::new(),
+                kind: "test".into(),
+                workspace: None,
+                created_at: fixed_time(),
+                updated_at: fixed_time(),
+            })
+            .unwrap();
+        sourced_session.history_record_id = Some(search_record_id);
+        sourced_session.capture_source_id = Some(session_source_id);
+        writable.upsert_session(&sourced_session).unwrap();
+        let mut sourced_event = events[0].clone();
+        sourced_event.history_record_id = Some(search_record_id);
+        sourced_event.capture_source_id = Some(event_source_id);
+        writable.upsert_event(&sourced_event).unwrap();
+        let mut later_event = events[1].clone();
+        later_event.capture_source_id = Some(later_event_source_id);
+        writable.upsert_event(&later_event).unwrap();
+        let mut later_search_event = events[5].clone();
+        later_search_event.history_record_id = Some(search_record_id);
+        later_search_event.capture_source_id = Some(later_event_source_id);
+        writable.upsert_event(&later_search_event).unwrap();
+        writable.refresh_search_index().unwrap();
+        drop(writable);
+
+        let store = Store::open_read_only(&path).unwrap();
+        let probe = QueryService::new(&store)
+            .select_evidence(EvidenceSelectorRequest {
+                selector: EvidenceSelector::EventIds {
+                    event_ids: vec![sourced_event.id, later_event.id],
+                },
+                limit: 1,
+                fields: FieldSet::Full,
+                ..EvidenceSelectorRequest::default()
+            })
+            .unwrap();
+        let page = QueryService::new(&store)
+            .select_evidence(EvidenceSelectorRequest {
+                selector: EvidenceSelector::EventIds {
+                    event_ids: vec![sourced_event.id, later_event.id],
+                },
+                limit: 2,
+                fields: FieldSet::Full,
+                byte_policy: BytePolicy {
+                    page_bytes: probe.bytes.item_json_bytes + 16,
+                    ..BytePolicy::default()
+                },
+                ..EvidenceSelectorRequest::default()
+            })
+            .unwrap();
+        assert!(page.bytes.page_budget_exhausted);
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.event_source_refs.len(), 1);
+        assert_eq!(
+            page.event_source_refs[0].event_capture_source_id,
+            Some(event_source_id)
+        );
+        assert_eq!(
+            page.event_source_refs[0].session_capture_source_id,
+            Some(session_source_id)
+        );
+        assert_eq!(page.source_lookup.len(), 2);
+        assert_eq!(
+            page.source_lookup
+                .iter()
+                .map(|source| source.capture_source_id)
+                .collect::<Vec<_>>(),
+            vec![event_source_id, session_source_id]
+        );
+        assert!(page
+            .source_lookup
+            .iter()
+            .all(|source| source.source.is_some()));
+        assert!(!page
+            .source_lookup
+            .iter()
+            .any(|source| source.capture_source_id == later_event_source_id));
+        let next = page.continuation.clone().unwrap().next_arguments;
+        let replay = QueryService::new(&store)
+            .select_evidence(next.clone())
+            .unwrap();
+        let replay_again = QueryService::new(&store).select_evidence(next).unwrap();
+        assert_eq!(replay.event_source_refs, replay_again.event_source_refs);
+        assert_eq!(replay.source_lookup, replay_again.source_lookup);
+        assert_eq!(replay.items.len(), 1);
+        assert_eq!(replay.event_source_refs[0].ctx_event_id, later_event.id);
+        assert!(replay
+            .source_lookup
+            .iter()
+            .any(|source| source.capture_source_id == later_event_source_id));
+
+        let session_probe = QueryService::new(&store)
+            .select_evidence(EvidenceSelectorRequest {
+                selector: EvidenceSelector::SessionPage {
+                    ctx_session_id: sourced_session.id,
+                    mode: TranscriptMode::Log,
+                },
+                limit: 1,
+                fields: FieldSet::Full,
+                ..EvidenceSelectorRequest::default()
+            })
+            .unwrap();
+        let session_page = QueryService::new(&store)
+            .select_evidence(EvidenceSelectorRequest {
+                selector: EvidenceSelector::SessionPage {
+                    ctx_session_id: sourced_session.id,
+                    mode: TranscriptMode::Log,
+                },
+                limit: 2,
+                fields: FieldSet::Full,
+                byte_policy: BytePolicy {
+                    page_bytes: session_probe.bytes.item_json_bytes + 16,
+                    ..BytePolicy::default()
+                },
+                ..EvidenceSelectorRequest::default()
+            })
+            .unwrap();
+        assert_eq!(session_page.items.len(), 1);
+        assert!(session_page.bytes.page_budget_exhausted);
+        assert_eq!(session_page.event_source_refs.len(), 1);
+        assert_eq!(session_page.source_lookup.len(), 2);
+        assert!(!session_page
+            .source_lookup
+            .iter()
+            .any(|source| source.capture_source_id == later_event_source_id));
+        let session_next = session_page.continuation.clone().unwrap().next_arguments;
+        let session_replay = QueryService::new(&store)
+            .select_evidence(session_next.clone())
+            .unwrap();
+        let session_replay_again = QueryService::new(&store)
+            .select_evidence(session_next)
+            .unwrap();
+        assert_eq!(
+            session_replay.event_source_refs,
+            session_replay_again.event_source_refs
+        );
+        assert!(session_replay
+            .source_lookup
+            .iter()
+            .any(|source| source.capture_source_id == later_event_source_id));
+
+        let search_request = |limit, page_bytes| EvidenceSelectorRequest {
+            selector: EvidenceSelector::SearchPage {
+                query: "sys".to_owned(),
+                terms: Vec::new(),
+                options: Box::new(PacketOptions {
+                    result_mode: SearchResultMode::Events,
+                    ..PacketOptions::default()
+                }),
+            },
+            limit,
+            fields: FieldSet::Full,
+            byte_policy: BytePolicy {
+                page_bytes,
+                ..BytePolicy::default()
+            },
+            ..EvidenceSelectorRequest::default()
+        };
+        let search_probe = QueryService::new(&store)
+            .select_evidence(search_request(1, MAX_PAGE_BYTES))
+            .unwrap();
+        let search_page = QueryService::new(&store)
+            .select_evidence(search_request(2, search_probe.bytes.item_json_bytes + 16))
+            .unwrap();
+        assert_eq!(search_page.items.len(), 1);
+        assert_eq!(search_page.search_source_refs.len(), 1);
+        assert!(!search_page.search_source_refs[0].events.is_empty());
+        assert_eq!(
+            search_page.search_source_refs[0].events[0].event_capture_source_id,
+            Some(event_source_id)
+        );
+        assert_eq!(search_page.source_lookup.len(), 2);
+
+        let evidence_source = |page: &EvidenceSelectionPageV1| {
+            page.source_lookup
+                .iter()
+                .find(|lookup| lookup.capture_source_id == event_source_id)
+                .and_then(|lookup| lookup.source.clone())
+                .unwrap()
+        };
+        let explicit_source = evidence_source(&page);
+        let session_source = evidence_source(&session_page);
+        let search_source = evidence_source(&search_page);
+        assert_eq!(explicit_source, session_source);
+        assert_eq!(explicit_source, search_source);
+        for source in [explicit_source, session_source, search_source] {
+            assert!(source.cwd.is_none());
+            assert!(source.path.is_none());
+            assert!(source.exists.is_none());
+            assert!(source.source_cursor.is_none());
+            assert!(source.cursor.is_none());
+            let wire = serde_json::to_value(source).unwrap();
+            for sensitive in ["cwd", "path", "exists", "source_cursor", "cursor"] {
+                assert!(wire.get(sensitive).is_none(), "leaked {sensitive}: {wire}");
+            }
+        }
+    }
+
+    #[test]
+    fn evidence_search_preserves_filters_and_reports_pool_truncation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("work.sqlite");
+        let writable = Store::open(&path).unwrap();
+        writable
+            .insert_record(&HistoryRecord {
+                id: Uuid::from_u128(77),
+                title: "evidence needle".to_owned(),
+                body: "bounded evidence search".to_owned(),
+                tags: vec![],
+                kind: "test".to_owned(),
+                workspace: Some("workspace".to_owned()),
+                created_at: fixed_time(),
+                updated_at: fixed_time(),
+            })
+            .unwrap();
+        writable
+            .insert_record(&HistoryRecord {
+                id: Uuid::from_u128(78),
+                title: "second evidence needle".to_owned(),
+                body: "bounded evidence search".to_owned(),
+                tags: vec![],
+                kind: "test".to_owned(),
+                workspace: Some("workspace".to_owned()),
+                created_at: fixed_time(),
+                updated_at: fixed_time(),
+            })
+            .unwrap();
+        writable.refresh_search_index().unwrap();
+        drop(writable);
+        let store = Store::open_read_only(&path).unwrap();
+        let options = PacketOptions::default();
+        let request = EvidenceSelectorRequest {
+            selector: EvidenceSelector::SearchPage {
+                query: "needle".to_owned(),
+                terms: vec!["needle".to_owned(), "needle".to_owned()],
+                options: Box::new(options),
+            },
+            limit: 1,
+            fields: FieldSet::Compact,
+            ..EvidenceSelectorRequest::default()
+        };
+        let page = QueryService::new(&store).select_evidence(request).unwrap();
+        assert_eq!(page.domain, "search_page");
+        assert_eq!(page.retained_pool_total, Some(2));
+        assert_eq!(page.corpus_count.as_ref().unwrap().kind, "exact");
+        assert!(!page.search_truncation.as_ref().unwrap().truncated);
+        let mut tampered = page.continuation.as_ref().unwrap().next_arguments.clone();
+        if let EvidenceSelector::SearchPage { options, .. } = &mut tampered.selector {
+            options.filters.primary_only = true;
+        }
+        assert!(matches!(
+            QueryService::new(&store).select_evidence(tampered),
+            Err(QueryError::ContinuationRequestMismatch)
+        ));
+        let serialized = serde_json::to_value(page).unwrap();
+        assert_eq!(serialized["domain"], "search_page");
+        assert!(serialized.to_string().contains("needle"));
+    }
+
+    #[test]
+    fn evidence_wire_is_strict_and_round_trips_each_domain() {
+        let session_id = Uuid::from_u128(501);
+        let event_id = Uuid::from_u128(502);
+        let search_options = PacketOptions {
+            filters: SearchFilters {
+                primary_only: true,
+                roles: vec![EventRole::User],
+                exclude_tool_names: vec!["ctx".to_owned()],
+                ..SearchFilters::default()
+            },
+            ..PacketOptions::default()
+        };
+        let requests = vec![
+            EvidenceSelectorRequest {
+                selector: EvidenceSelector::SessionPage {
+                    ctx_session_id: session_id,
+                    mode: TranscriptMode::Full,
+                },
+                limit: 3,
+                ..EvidenceSelectorRequest::default()
+            },
+            EvidenceSelectorRequest {
+                selector: EvidenceSelector::SearchPage {
+                    query: "needle".to_owned(),
+                    terms: vec!["term-a".to_owned(), "term-a".to_owned()],
+                    options: Box::new(search_options.clone()),
+                },
+                limit: 3,
+                ..EvidenceSelectorRequest::default()
+            },
+            EvidenceSelectorRequest {
+                selector: EvidenceSelector::EventIds {
+                    event_ids: vec![event_id],
+                },
+                limit: 1,
+                ..EvidenceSelectorRequest::default()
+            },
+        ];
+        for request in requests {
+            let wire = serde_json::to_value(&request).unwrap();
+            let round_trip: EvidenceSelectorRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(round_trip, request);
+        }
+
+        let session = serde_json::to_value(&requests_for_wire()[0]).unwrap();
+        let mut foreign = session.clone();
+        foreign["selector"]["query"] = json!("not-a-session-field");
+        assert!(serde_json::from_value::<EvidenceSelectorRequest>(foreign).is_err());
+
+        let mut union = session.clone();
+        union["selector"]["event_ids"] = json!([event_id]);
+        assert!(serde_json::from_value::<EvidenceSelectorRequest>(union).is_err());
+
+        let mut event_foreign = serde_json::to_value(&EvidenceSelectorRequest {
+            selector: EvidenceSelector::EventIds {
+                event_ids: vec![event_id],
+            },
+            limit: 1,
+            ..EvidenceSelectorRequest::default()
+        })
+        .unwrap();
+        event_foreign["selector"]["query"] = json!("not-an-event-field");
+        assert!(serde_json::from_value::<EvidenceSelectorRequest>(event_foreign).is_err());
+
+        let mut search_union = serde_json::to_value(&requests_for_wire()[1]).unwrap();
+        search_union["selector"]["event_ids"] = json!([event_id]);
+        assert!(serde_json::from_value::<EvidenceSelectorRequest>(search_union).is_err());
+
+        let mut unknown = session.clone();
+        unknown["unknown"] = json!(true);
+        assert!(serde_json::from_value::<EvidenceSelectorRequest>(unknown).is_err());
+
+        for mut domain in [
+            session.clone(),
+            serde_json::to_value(&requests_for_wire()[1]).unwrap(),
+            serde_json::to_value(&EvidenceSelectorRequest {
+                selector: EvidenceSelector::EventIds {
+                    event_ids: vec![event_id],
+                },
+                limit: 1,
+                ..EvidenceSelectorRequest::default()
+            })
+            .unwrap(),
+        ] {
+            domain["selector"]["unknown"] = json!(true);
+            assert!(serde_json::from_value::<EvidenceSelectorRequest>(domain).is_err());
+        }
+
+        let mut search = serde_json::to_value(&requests_for_wire()[1]).unwrap();
+        search["selector"]["ctx_session_id"] = json!(session_id);
+        assert!(serde_json::from_value::<EvidenceSelectorRequest>(search).is_err());
+
+        let mut nested_unknown = serde_json::to_value(&requests_for_wire()[1]).unwrap();
+        nested_unknown["selector"]["options"]["unknown"] = json!(true);
+        assert!(serde_json::from_value::<EvidenceSelectorRequest>(nested_unknown).is_err());
+
+        let mut primary_true = requests_for_wire()[1].clone();
+        let true_wire = serde_json::to_value(&primary_true).unwrap();
+        let true_options = true_wire["selector"]["options"]["filters"]["primary_only"].as_bool();
+        assert_eq!(true_options, Some(true));
+        if let EvidenceSelector::SearchPage { options, .. } = &mut primary_true.selector {
+            options.filters.primary_only = false;
+        }
+        let false_wire = serde_json::to_value(&primary_true).unwrap();
+        assert_eq!(
+            false_wire["selector"]["options"]["filters"]["primary_only"],
+            json!(false)
+        );
+        let false_round_trip: EvidenceSelectorRequest = serde_json::from_value(false_wire).unwrap();
+        assert!(!match false_round_trip.selector {
+            EvidenceSelector::SearchPage { options, .. } => options.filters.primary_only,
+            _ => unreachable!(),
+        });
+    }
+
+    fn requests_for_wire() -> Vec<EvidenceSelectorRequest> {
+        vec![
+            EvidenceSelectorRequest {
+                selector: EvidenceSelector::SessionPage {
+                    ctx_session_id: Uuid::from_u128(501),
+                    mode: TranscriptMode::Full,
+                },
+                limit: 3,
+                ..EvidenceSelectorRequest::default()
+            },
+            EvidenceSelectorRequest {
+                selector: EvidenceSelector::SearchPage {
+                    query: "needle".to_owned(),
+                    terms: vec!["term".to_owned()],
+                    options: Box::new(PacketOptions {
+                        filters: SearchFilters {
+                            primary_only: true,
+                            ..SearchFilters::default()
+                        },
+                        ..PacketOptions::default()
+                    }),
+                },
+                limit: 3,
+                ..EvidenceSelectorRequest::default()
+            },
+        ]
+    }
+
+    #[test]
+    fn evidence_search_binding_changes_for_every_effective_search_field() {
+        fn with_options(
+            mut request: EvidenceSelectorRequest,
+            mutate: impl FnOnce(&mut PacketOptions),
+        ) -> EvidenceSelectorRequest {
+            match &mut request.selector {
+                EvidenceSelector::SearchPage { options, .. } => mutate(options),
+                _ => unreachable!(),
+            }
+            request
+        }
+
+        let options = PacketOptions {
+            filters: SearchFilters {
+                roles: vec![EventRole::Assistant],
+                exclude_roles: vec![EventRole::Tool],
+                exclude_tool_names: vec!["sh".to_owned()],
+                ..SearchFilters::default()
+            },
+            ..PacketOptions::default()
+        };
+        let base = EvidenceSelectorRequest {
+            selector: EvidenceSelector::SearchPage {
+                query: "query".to_owned(),
+                terms: vec!["term".to_owned(), "term".to_owned()],
+                options: Box::new(options),
+            },
+            limit: 2,
+            fields: FieldSet::Full,
+            byte_policy: BytePolicy {
+                per_item_bytes: 100,
+                page_bytes: 1_000,
+            },
+            artifact_bytes: 2_000,
+            format: EvidenceFormat::Markdown,
+            ..EvidenceSelectorRequest::default()
+        };
+        let hash = |request: &EvidenceSelectorRequest| {
+            let canonical = request.canonicalized().unwrap();
+            evidence_request_hash(&canonical.without_continuation()).unwrap()
+        };
+        let base_hash = hash(&base);
+        let mut variants = Vec::new();
+
+        let mut query = base.clone();
+        if let EvidenceSelector::SearchPage { query, .. } = &mut query.selector {
+            *query = "other-query".to_owned();
+        }
+        variants.push(query);
+        let mut terms = base.clone();
+        if let EvidenceSelector::SearchPage { terms, .. } = &mut terms.selector {
+            terms.push("third-term".to_owned());
+        }
+        variants.push(terms);
+        variants.push(with_options(base.clone(), |options| {
+            options.snippet_chars += 1;
+        }));
+        variants.push(with_options(base.clone(), |options| {
+            options.result_mode = SearchResultMode::Events;
+        }));
+        variants.push(with_options(base.clone(), |options| {
+            options.match_mode = SearchMatchMode::Phrase;
+        }));
+
+        type FilterMutation = Box<dyn Fn(&mut SearchFilters)>;
+        let filter_variants: Vec<FilterMutation> = vec![
+            Box::new(|filters| filters.session = Some(Uuid::from_u128(1))),
+            Box::new(|filters| filters.provider = Some(CaptureProvider::Codex)),
+            Box::new(|filters| filters.history_source = Some("plugin/source".into())),
+            Box::new(|filters| filters.provider_key = Some("provider".into())),
+            Box::new(|filters| filters.source_id = Some("source".into())),
+            Box::new(|filters| filters.source_format = Some("jsonl".into())),
+            Box::new(|filters| filters.repo = Some("workspace".into())),
+            Box::new(|filters| filters.since = Some(fixed_time())),
+            Box::new(|filters| filters.primary_only = true),
+            Box::new(|filters| filters.include_subagents = true),
+            Box::new(|filters| filters.event_type = Some(EventType::Message)),
+            Box::new(|filters| filters.roles = vec![EventRole::User]),
+            Box::new(|filters| filters.exclude_roles = vec![EventRole::System]),
+            Box::new(|filters| filters.exclude_tool_noise = true),
+            Box::new(|filters| filters.exclude_tool_names = vec!["ctx".into()]),
+            Box::new(|filters| filters.file = Some("src/lib.rs".into())),
+            Box::new(|filters| {
+                filters.exclude_provider_session = Some(ProviderSessionFilter {
+                    provider: CaptureProvider::Codex,
+                    provider_session_id: "provider-session".into(),
+                    session_id: Some(Uuid::from_u128(2)),
+                })
+            }),
+        ];
+        for mutate in filter_variants {
+            variants.push(with_options(base.clone(), |options| {
+                mutate(&mut options.filters)
+            }));
+        }
+
+        let mut hashes = std::collections::HashSet::new();
+        hashes.insert(base_hash.clone());
+        for variant in variants {
+            let variant_hash = hash(&variant);
+            assert_ne!(variant_hash, base_hash);
+            assert!(hashes.insert(variant_hash));
+        }
     }
 
     fn search_projection_id(result: &SearchResultProjectionV1) -> Uuid {

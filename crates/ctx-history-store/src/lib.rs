@@ -1036,6 +1036,17 @@ pub enum SelectedEventMode {
     Log,
 }
 
+/// The outcome of looking up an explicitly requested event ID.  Evidence
+/// selection needs to distinguish an ID that was never indexed from one that
+/// was deliberately tombstoned; treating both as an empty page would make a
+/// replay silently change its meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventTargetStatus {
+    Live,
+    Deleted,
+    Missing,
+}
+
 /// The closed set of FTS5 search projection tables. `event_search` and
 /// `artifact_search` are optional (older stores may lack them); every
 /// maintenance entry point probes existence before touching a table.
@@ -3825,6 +3836,31 @@ impl Store {
             .ok_or(StoreError::NotFound(id))
     }
 
+    /// Return sessions which are currently eligible for live-only reads.
+    /// Missing and deleted sessions are intentionally both absent here; callers
+    /// which need the distinction can use `get_session` and inspect its sync
+    /// tombstone.
+    pub fn live_sessions_for_ids(&self, ids: &[Uuid]) -> Result<BTreeMap<Uuid, Session>> {
+        let mut sessions = BTreeMap::new();
+        for chunk in distinct_uuid_chunks(ids) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let sql = format!(
+                "{} WHERE id IN ({}) AND deleted_at_ms IS NULL ORDER BY id",
+                session_select_sql(""),
+                sql_placeholders(chunk.len())
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(uuid_values(&chunk), session_from_row)?;
+            for row in rows {
+                let session = row?;
+                sessions.insert(session.id, session);
+            }
+        }
+        Ok(sessions)
+    }
+
     pub fn resolve_session_by_id_prefix(
         &self,
         prefix: &CtxIdPrefix,
@@ -3948,7 +3984,7 @@ impl Store {
             ids,
             search_session_select_sql(""),
             "FROM sessions",
-            "sessions.history_record_id = requested.record_id",
+            "sessions.deleted_at_ms IS NULL AND sessions.history_record_id = requested.record_id",
             "sessions.started_at_ms, sessions.id",
             14,
             search_session_from_row,
@@ -4367,6 +4403,70 @@ impl Store {
             .ok_or(StoreError::NotFound(id))
     }
 
+    /// Classify a bounded explicit-ID set in one or a few SQLite statements.
+    /// The returned map contains every requested ID and never performs a
+    /// per-ID transcript fetch.
+    pub fn event_target_statuses(&self, ids: &[Uuid]) -> Result<BTreeMap<Uuid, EventTargetStatus>> {
+        let mut statuses = ids
+            .iter()
+            .copied()
+            .map(|id| (id, EventTargetStatus::Missing))
+            .collect::<BTreeMap<_, _>>();
+        for chunk in distinct_uuid_chunks(ids) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let sql = format!(
+                "SELECT id, deleted_at_ms FROM events WHERE id IN ({}) ORDER BY id",
+                sql_placeholders(chunk.len())
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(uuid_values(&chunk), |row| {
+                let id = parse_uuid(row.get::<_, String>(0)?)?;
+                let deleted_at_ms: Option<i64> = row.get(1)?;
+                Ok((id, deleted_at_ms.is_some()))
+            })?;
+            for row in rows {
+                let (id, deleted) = row?;
+                statuses.insert(
+                    id,
+                    if deleted {
+                        EventTargetStatus::Deleted
+                    } else {
+                        EventTargetStatus::Live
+                    },
+                );
+            }
+        }
+        Ok(statuses)
+    }
+
+    /// Read a finite explicit-ID set in canonical chronological order.  This
+    /// method is deliberately bounded by the caller's finite ID set and only
+    /// returns live rows; status classification is kept separate so the query
+    /// layer can fail closed for missing/deleted targets.  SQLite may use a
+    /// temporary b-tree for the chronological `ORDER BY`; because callers cap
+    /// the ID set at 256, that sort is bounded by the explicit selector rather
+    /// than by the history corpus.
+    pub fn live_events_for_ids(&self, ids: &[Uuid]) -> Result<Vec<Event>> {
+        let mut events = Vec::new();
+        for chunk in distinct_uuid_chunks(ids) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let sql = format!(
+                "{} WHERE id IN ({}) AND deleted_at_ms IS NULL ORDER BY occurred_at_ms, id",
+                event_select_sql(""),
+                sql_placeholders(chunk.len())
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(uuid_values(&chunk), event_from_row)?;
+            events.extend(collect_rows(rows)?);
+        }
+        events.sort_by_key(|event| (event.occurred_at, event.id));
+        Ok(events)
+    }
+
     pub fn resolve_event_by_id_prefix(
         &self,
         prefix: &CtxIdPrefix,
@@ -4623,7 +4723,7 @@ impl Store {
     ) -> Result<BTreeMap<Uuid, Vec<SearchEventRow>>> {
         #[cfg(feature = "test-utils")]
         self.increment_search_hydration_loader(true);
-        self.relations_for_records(ids, search_event_select_sql(""), "FROM events", "events.history_record_id = requested.record_id OR events.session_id IN (SELECT id FROM sessions WHERE history_record_id = requested.record_id) OR events.run_id IN (SELECT id FROM runs WHERE history_record_id = requested.record_id OR session_id IN (SELECT id FROM sessions WHERE history_record_id = requested.record_id))", "events.seq, events.occurred_at_ms", 12, search_event_from_row, &[])
+        self.relations_for_records(ids, search_event_select_sql(""), "FROM events", "events.deleted_at_ms IS NULL AND (events.history_record_id = requested.record_id OR events.session_id IN (SELECT id FROM sessions WHERE deleted_at_ms IS NULL AND history_record_id = requested.record_id) OR events.run_id IN (SELECT id FROM runs WHERE deleted_at_ms IS NULL AND (history_record_id = requested.record_id OR session_id IN (SELECT id FROM sessions WHERE deleted_at_ms IS NULL AND history_record_id = requested.record_id))))", "events.seq, events.occurred_at_ms", 12, search_event_from_row, &[])
     }
 
     fn list_events(&self) -> Result<Vec<Event>> {
@@ -5666,6 +5766,19 @@ impl Store {
         collect_rows(rows)
     }
 
+    fn list_live_records_page(&self, limit: usize, offset: usize) -> Result<Vec<HistoryRecord>> {
+        self.record_list_page_executions
+            .set(self.record_list_page_executions.get().saturating_add(1));
+        let mut stmt = self.conn.prepare(
+            record_select_sql(
+                "WHERE deleted_at_ms IS NULL ORDER BY created_at DESC, id LIMIT ?1 OFFSET ?2",
+            )
+            .as_str(),
+        )?;
+        let rows = stmt.query_map(params![limit as i64, offset as i64], record_from_row)?;
+        collect_rows(rows)
+    }
+
     /// Internal, non-contractual test instrumentation: number of record list
     /// page statements executed by this store handle. Tests assert on this
     /// counter to prove fallback scans stay page-bounded; production callers
@@ -5731,7 +5844,7 @@ impl Store {
         let page_size = limit.saturating_mul(20).max(100);
         loop {
             pages_scanned = pages_scanned.saturating_add(1);
-            let page = self.list_records_page(page_size, source_offset)?;
+            let page = self.list_live_records_page(page_size, source_offset)?;
             let page_len = page.len();
             for record in page {
                 if record_sections_match_plan(plan, &record) {
@@ -5773,7 +5886,7 @@ impl Store {
         let like = format!("%{}%", query);
         let mut stmt = self.conn.prepare(
             record_select_sql(
-                "WHERE title LIKE ?1 OR body LIKE ?1 OR tags_json LIKE ?1 ORDER BY created_at DESC, id LIMIT ?2 OFFSET ?3",
+                "WHERE deleted_at_ms IS NULL AND (title LIKE ?1 OR body LIKE ?1 OR tags_json LIKE ?1) ORDER BY created_at DESC, id LIMIT ?2 OFFSET ?3",
             )
             .as_str(),
         )?;
@@ -5821,27 +5934,37 @@ impl Store {
                 FROM ctx_history_search
                 WHERE ctx_history_search MATCH ?1
                 UNION ALL
-                SELECT history_record_id, bm25(event_search)
+                SELECT event_search.history_record_id, bm25(event_search)
                 FROM event_search
-                WHERE event_search MATCH ?1 AND history_record_id IS NOT NULL
+                JOIN events ON events.id = event_search.event_id
+                WHERE event_search MATCH ?1
+                  AND event_search.history_record_id IS NOT NULL
+                  AND events.deleted_at_ms IS NULL
                 UNION ALL
-                SELECT history_record_id, bm25(artifact_search)
+                SELECT artifact_search.history_record_id, bm25(artifact_search)
                 FROM artifact_search
-                WHERE artifact_search MATCH ?1 AND history_record_id IS NOT NULL
+                JOIN artifacts ON artifacts.id = artifact_search.artifact_id
+                WHERE artifact_search MATCH ?1
+                  AND artifact_search.history_record_id IS NOT NULL
+                  AND artifacts.deleted_at_ms IS NULL
             )
-            SELECT record_id, MIN(score) AS score
+            SELECT matches.record_id, MIN(matches.score) AS score
             FROM matches
-            WHERE record_id IS NOT NULL
-            GROUP BY record_id
-            ORDER BY score, record_id
+            JOIN history_records AS records ON records.id = matches.record_id
+            WHERE matches.record_id IS NOT NULL
+              AND records.deleted_at_ms IS NULL
+            GROUP BY matches.record_id
+            ORDER BY score, matches.record_id
             LIMIT ?2 OFFSET ?3
             "#
         } else {
             r#"
-            SELECT record_id, bm25(ctx_history_search) AS score
+            SELECT ctx_history_search.record_id, bm25(ctx_history_search) AS score
             FROM ctx_history_search
+            JOIN history_records AS records ON records.id = ctx_history_search.record_id
             WHERE ctx_history_search MATCH ?1
-            ORDER BY score, record_id
+              AND records.deleted_at_ms IS NULL
+            ORDER BY score, ctx_history_search.record_id
             LIMIT ?2 OFFSET ?3
             "#
         };
@@ -6390,8 +6513,9 @@ macro_rules! filtered_event_hits_page_sql {
         LEFT JOIN sessions rs ON rs.id = r.session_id
 "#,
             $provider_joins,
-            r#"        WHERE event_search MATCH ?1
-          AND (?4 IS NULL OR COALESCE(e.session_id, event_search.session_id, s.id, rs.id) = ?4)
+             r#"        WHERE event_search MATCH ?1
+          AND e.deleted_at_ms IS NULL
+           AND (?4 IS NULL OR COALESCE(e.session_id, event_search.session_id, s.id, rs.id) = ?4)
 "#,
             $provider_predicate,
             r#"          AND (?6 IS NULL OR e.occurred_at_ms >= ?6)
@@ -6428,9 +6552,9 @@ macro_rules! filtered_event_hits_page_sql {
 const SEARCH_EVENT_HITS_PAGE_SQL: &str = event_hits_page_sql!(
     r#"        SELECT event_search.rowid AS search_rowid,
                bm25(event_search) AS score
-        FROM event_search
-        JOIN events e ON e.id = event_search.event_id
-        WHERE event_search MATCH ?1
+         FROM event_search
+         JOIN events e ON e.id = event_search.event_id
+         WHERE event_search MATCH ?1 AND e.deleted_at_ms IS NULL
         ORDER BY bm25(event_search), e.occurred_at_ms DESC, e.seq DESC, event_search.event_id
         LIMIT ?2 OFFSET ?3"#
 );
@@ -10328,12 +10452,12 @@ fn event_select_sql(tail: &str) -> String {
 
 fn selected_event_predicate(mode: SelectedEventMode) -> &'static str {
     match mode {
-        SelectedEventMode::Log => "1 = 1",
+        SelectedEventMode::Log => "e.deleted_at_ms IS NULL",
         SelectedEventMode::Full => {
-            "e.event_type = 'message' AND e.role IN ('user', 'assistant', 'system')"
+            "e.deleted_at_ms IS NULL AND e.event_type = 'message' AND e.role IN ('user', 'assistant', 'system')"
         }
         SelectedEventMode::Lite => {
-            r#"e.event_type = 'message' AND (
+            r#"e.deleted_at_ms IS NULL AND e.event_type = 'message' AND (
                 e.role = 'user'
                 OR (
                     e.role = 'assistant'
@@ -10341,6 +10465,7 @@ fn selected_event_predicate(mode: SelectedEventMode) -> &'static str {
                         SELECT next.role
                         FROM events AS next
                         WHERE next.session_id = e.session_id
+                          AND next.deleted_at_ms IS NULL
                           AND next.event_type = 'message'
                           AND next.role IN ('user', 'assistant')
                           AND (next.seq, next.id) > (e.seq, e.id)

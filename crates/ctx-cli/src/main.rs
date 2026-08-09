@@ -4449,6 +4449,10 @@ fn query_error_kind(error: &QueryError) -> &'static str {
         QueryError::InvalidPageSize => "invalid_page_size",
         QueryError::Serialization(_) => "serialization_error",
         QueryError::ItemExceedsPageBudget { .. } => "item_exceeds_page_budget",
+        QueryError::InvalidEvidenceSelector(_) => "invalid_selector",
+        QueryError::UnsupportedEvidenceCombination(_) => "unsupported_combination",
+        QueryError::MissingEvidenceTarget { .. } => "missing_target",
+        QueryError::DeletedEvidenceTarget { .. } => "deleted_target",
     }
 }
 

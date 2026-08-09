@@ -15,7 +15,7 @@ use ctx_history_store::{
     SearchArtifactRow, SearchCaptureSourceRow, SearchEventRow, SearchFileTouchedRow, SearchRunRow,
     SearchSessionRow, SearchSummaryRow, SearchVcsChangeRow, Store,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -130,7 +130,8 @@ pub enum SearchError {
 
 pub type Result<T> = std::result::Result<T, SearchError>;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PacketOptions {
     pub limit: usize,
     pub snippet_chars: usize,
@@ -151,13 +152,15 @@ impl Default for PacketOptions {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SearchResultMode {
     Sessions,
     Events,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SearchFilters {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<Uuid>,
@@ -175,7 +178,7 @@ pub struct SearchFilters {
     pub repo: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub since: Option<chrono::DateTime<Utc>>,
-    #[serde(skip_serializing)]
+    #[serde(default, skip_serializing)]
     pub primary_only: bool,
     #[serde(default)]
     pub include_subagents: bool,
@@ -195,7 +198,8 @@ pub struct SearchFilters {
     pub exclude_provider_session: Option<ProviderSessionFilter>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderSessionFilter {
     pub provider: ctx_history_core::CaptureProvider,
     pub provider_session_id: String,

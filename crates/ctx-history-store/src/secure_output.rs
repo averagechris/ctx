@@ -92,6 +92,25 @@ fn open_dir_at(parent: &File, name: &std::ffi::OsStr) -> Result<File, SecureOutp
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
+#[cfg(target_os = "linux")]
+fn trusted_root_path() -> &'static Path {
+    Path::new("/tmp")
+}
+
+#[cfg(target_os = "macos")]
+fn trusted_root_path() -> &'static Path {
+    Path::new("/private/tmp")
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn trusted_root_path() -> &'static Path {
+    Path::new("")
+}
+
+fn is_trusted_root(path: &Path, mode: libc::mode_t, uid: libc::uid_t) -> bool {
+    path == trusted_root_path() && uid == 0 && mode == 0o1777
+}
+
 fn open_parent(path: &Path) -> Result<(File, CString), SecureOutputError> {
     #[cfg(target_os = "macos")]
     let normalized = super::archive::normalize_macos_trusted_root_alias(path);
@@ -164,13 +183,7 @@ fn open_parent(path: &Path) -> Result<(File, CString), SecureOutputError> {
     let uid = unsafe { libc::geteuid() };
     let mode = stat.st_mode as libc::mode_t;
     let owner_private = stat.st_uid == uid && mode & 0o022 == 0;
-    #[cfg(target_os = "linux")]
-    let trusted_tmp_path = parent_path == Path::new("/tmp");
-    #[cfg(target_os = "macos")]
-    let trusted_tmp_path = parent_path == Path::new("/private/tmp");
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let trusted_tmp_path = false;
-    let trusted_sticky = trusted_tmp_path && stat.st_uid == 0 && mode & 0o7777 == 0o1777;
+    let trusted_sticky = is_trusted_root(parent_path, mode & 0o7777, stat.st_uid);
     if !owner_private && !trusted_sticky {
         return Err(SecureOutputError::new(
             SecureOutputCode::UnsafeOutputPath,
@@ -266,10 +279,38 @@ mod tests {
                 .code,
             SecureOutputCode::UnsafeOutputPath
         );
+
+        let tmp_dir = File::open("/tmp").unwrap();
+        let mut tmp_stat: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::fstat(tmp_dir.as_raw_fd(), &mut tmp_stat) },
+            0
+        );
         let tmp_target = Path::new("/tmp").join(format!("ctx-secure-output-{}", Uuid::new_v4()));
-        write_secure_output(&tmp_target, b"tmp").unwrap();
-        assert_eq!(fs::read(&tmp_target).unwrap(), b"tmp");
-        fs::remove_file(tmp_target).unwrap();
+        if is_trusted_root(
+            trusted_root_path(),
+            tmp_stat.st_mode as libc::mode_t & 0o7777,
+            tmp_stat.st_uid,
+        ) {
+            write_secure_output(&tmp_target, b"tmp").unwrap();
+            assert_eq!(fs::read(&tmp_target).unwrap(), b"tmp");
+            fs::remove_file(tmp_target).unwrap();
+        } else {
+            assert_eq!(
+                write_secure_output(&tmp_target, b"tmp").unwrap_err().code,
+                SecureOutputCode::UnsafeOutputPath
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_root_requires_exact_path_mode_and_root_owner() {
+        let root = trusted_root_path();
+        assert!(is_trusted_root(root, 0o1777, 0));
+        assert!(!is_trusted_root(root, 0o1777, 1));
+        assert!(!is_trusted_root(root, 0o1777, 42));
+        assert!(!is_trusted_root(root, 0o0777, 0));
+        assert!(!is_trusted_root(&root.join("nested"), 0o1777, 0));
     }
 
     #[test]

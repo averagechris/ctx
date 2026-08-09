@@ -15,6 +15,74 @@ fn tempdir() -> TempDir {
     Builder::new().prefix("ctx-search-mvp-").tempdir().unwrap()
 }
 
+#[test]
+fn archive_create_has_json_and_human_contract_and_private_atomic_layout() {
+    let temp = tempdir();
+    json_output(ctx(&temp).args(["setup", "--catalog-only", "--progress", "none", "--json"]));
+
+    let target = temp.path().join("backup.ctxar");
+    let report =
+        json_output(ctx(&temp).args(["archive", "create", target.to_str().unwrap(), "--json"]));
+    assert_eq!(report["format"], "ctx-archive");
+    assert_eq!(report["format_version"], 1);
+    assert_eq!(report["verified"], true);
+    assert_eq!(report["entity_count"], 0);
+    assert_eq!(report["streams"].as_array().unwrap().len(), 15);
+    assert!(target.join("COMPLETE").is_file());
+    assert_eq!(
+        sorted_dir_entries(&target.join("streams")),
+        (1..=15)
+            .map(|index| format!(
+                "{index:02}-{}",
+                [
+                    "capture_sources.jsonl",
+                    "vcs_workspaces.jsonl",
+                    "history_records.jsonl",
+                    "artifacts.jsonl",
+                    "sessions.jsonl",
+                    "session_edges.jsonl",
+                    "runs.jsonl",
+                    "events.jsonl",
+                    "vcs_changes.jsonl",
+                    "summaries.jsonl",
+                    "files_touched.jsonl",
+                    "tags.jsonl",
+                    "history_record_tags.jsonl",
+                    "history_record_links.jsonl",
+                    "record_edges.jsonl",
+                ][index - 1]
+            ))
+            .collect::<Vec<_>>()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(target.join("manifest.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    let (_, stderr) = failure_output_code(
+        ctx(&temp).args(["archive", "create", target.to_str().unwrap(), "--json"]),
+        1,
+    );
+    assert!(stderr.contains("already exists"));
+
+    let human_target = temp.path().join("human.ctxar");
+    let (stdout, _) =
+        success_output(ctx(&temp).args(["archive", "create", human_target.to_str().unwrap()]));
+    assert!(stdout.contains("created archive"));
+}
+
 fn insert_ambiguous_ctx_ids(temp: &TempDir) {
     let conn = Connection::open(temp.path().join("work.sqlite")).unwrap();
     let now_ms = 1_788_768_000_000_i64;

@@ -327,7 +327,9 @@ version = "1.0.0"
 dependencies = [
  "chrono",
  "ctx-history-core",
+ "libc",
  "rusqlite",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",

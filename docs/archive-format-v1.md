@@ -1,12 +1,12 @@
 # ctx Archive Format v1 (`ctx-archive`, format_version 1)
 
-Status: **accepted design contract** for
+Status: **accepted design contract**, with the v1 writer shipped by
+`ctx archive create`; verification and restore remain follow-up commands, for
 [~averagechris/projects#185](https://todo.sr.ht/~averagechris/projects/185).
-No exporter, verifier, or restore implementation ships with this document;
-implementation is sliced into follow-up tickets (see
+The verifier and restore implementation are sliced into follow-up tickets (see
 [Implementation slicing](#implementation-slicing)). Until those land, ctx has
-no supported backup format, and the internal `SessionHistoryArchive` JSON
-structure must not be presented as one.
+a supported create-only backup format; the internal `SessionHistoryArchive`
+JSON structure must not be presented as one.
 
 This contract defines the smallest safe, portable, streaming, checksummed
 **logical content archive** of a ctx data root. It is a portable re-import
@@ -171,8 +171,9 @@ verifiers must reject any deviation.
    the string is valid UTF-8; they do not parse it.
 9. **Integers.** `seq`, `sync_version`, `byte_size`, counts, and sizes are
    non-negative JSON integers that fit in a signed 64-bit integer. Other
-   integer fields (`exit_code`, `line_count_delta`, `process_id`) fit their
-   storage type. No floats anywhere.
+   integer fields fit their logical storage type: `process_id` is in
+   `0..=u32::MAX`, `exit_code` is in `i32::MIN..=i32::MAX`, and
+   `line_count_delta` fits a signed 64-bit integer. No floats anywhere.
 10. **Booleans.** `is_primary` is a JSON boolean (the only boolean field in
     v1 streams).
 11. **Enums.** Closed vocabularies (below) are normative; out-of-vocabulary

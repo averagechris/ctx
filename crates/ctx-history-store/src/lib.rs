@@ -35,6 +35,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
+mod archive;
+pub use archive::{verify_archive_bundle, ArchiveOptions, ArchiveReport, ArchiveStreamReport};
 const BATCH_RECORD_ID_CHUNK_SIZE: usize = 500;
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -66,6 +68,8 @@ pub enum StoreError {
     ArchiveArtifactPathMismatch { id: Uuid },
     #[error("archive artifact {id} blob file is not a regular file: {path:?}")]
     ArchiveArtifactNonRegularFile { id: Uuid, path: PathBuf },
+    #[error("archive error: {0}")]
+    Archive(String),
     #[error("archive artifact {id} is missing matching blob content")]
     ArchiveArtifactMissingContent { id: Uuid },
     #[error("provider event conflict for {provider}/{external_session_id} at index {provider_index}: existing hash {existing_hash}, new hash {new_hash}")]

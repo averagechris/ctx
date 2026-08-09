@@ -59,11 +59,11 @@ use ctx_history_query::{
     DEFAULT_PAGE_BYTES, DEFAULT_SHOW_LIMIT, MAX_SHOW_LIMIT,
 };
 use ctx_history_store::{
-    CatalogSession, CatalogSourceIndexUpdate, IdPrefixResolution, RawSqlOptions, RawSqlResult,
-    RawSqlValue, SourceHealthClassification, SourceImportFile, SourceImportFileIndexUpdate, Store,
-    StoreError, CATALOG_IMPORT_OUTCOME_UNATTRIBUTED_CODE, RAW_SQL_DEFAULT_MAX_COLUMNS,
-    RAW_SQL_DEFAULT_MAX_ROWS, RAW_SQL_DEFAULT_MAX_SQL_BYTES, RAW_SQL_DEFAULT_MAX_VALUE_BYTES,
-    RAW_SQL_MAX_TIMEOUT, SOURCE_IMPORT_ZERO_YIELD_ANOMALY_CODE,
+    ArchiveOptions, CatalogSession, CatalogSourceIndexUpdate, IdPrefixResolution, RawSqlOptions,
+    RawSqlResult, RawSqlValue, SourceHealthClassification, SourceImportFile,
+    SourceImportFileIndexUpdate, Store, StoreError, CATALOG_IMPORT_OUTCOME_UNATTRIBUTED_CODE,
+    RAW_SQL_DEFAULT_MAX_COLUMNS, RAW_SQL_DEFAULT_MAX_ROWS, RAW_SQL_DEFAULT_MAX_SQL_BYTES,
+    RAW_SQL_DEFAULT_MAX_VALUE_BYTES, RAW_SQL_MAX_TIMEOUT, SOURCE_IMPORT_ZERO_YIELD_ANOMALY_CODE,
 };
 use history_source_plugins::{
     discover_history_source_plugins, discover_history_source_plugins_with_diagnostics,
@@ -109,6 +109,8 @@ enum CommandRoot {
     Mcp(mcp::McpArgs),
     #[command(about = "Check local ctx health")]
     Doctor(DoctorArgs),
+    #[command(about = "Create a private, checksummed logical archive")]
+    Archive(ArchiveArgs),
 }
 
 #[derive(Debug, Args)]
@@ -123,6 +125,26 @@ struct SetupArgs {
 
 #[derive(Debug, Args, Clone)]
 struct JsonArgs {
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ArchiveArgs {
+    #[command(subcommand)]
+    command: ArchiveCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ArchiveCommand {
+    #[command(about = "Stream the current data root into an atomic archive bundle")]
+    Create(ArchiveCreateArgs),
+}
+
+#[derive(Debug, Args)]
+struct ArchiveCreateArgs {
+    #[arg(help = "Absent destination directory, conventionally ending in .ctxar")]
+    target: PathBuf,
     #[arg(long)]
     json: bool,
 }
@@ -1744,7 +1766,59 @@ fn main_result() -> Result<()> {
         CommandRoot::Docs(args) => docs::run(args),
         CommandRoot::Mcp(args) => mcp::run(args, data_root.clone()),
         CommandRoot::Doctor(args) => run_doctor(args, data_root.clone()),
+        CommandRoot::Archive(args) => run_archive(args, data_root),
     }
+}
+
+fn run_archive(args: ArchiveArgs, data_root: PathBuf) -> Result<()> {
+    match args.command {
+        ArchiveCommand::Create(create) => run_archive_create(create, data_root),
+    }
+}
+
+fn run_archive_create(args: ArchiveCreateArgs, data_root: PathBuf) -> Result<()> {
+    let db_path = database_path(data_root);
+    let mut store = Store::open_read_only(&db_path)
+        .with_context(|| format!("open ctx store read-only: {}", db_path.display()))?;
+    let report = store.create_archive(&args.target, ArchiveOptions::default())?;
+    if args.json {
+        let streams = report
+            .streams
+            .iter()
+            .map(|stream| {
+                json!({
+                    "name": stream.name,
+                    "path": stream.path,
+                    "count": stream.count,
+                    "bytes": stream.bytes,
+                    "sha256": stream.sha256,
+                })
+            })
+            .collect::<Vec<_>>();
+        println!(
+            "{}",
+            serde_json::to_string(&json!({
+                "format": "ctx-archive",
+                "format_version": 1,
+                "archive_id": report.archive_id,
+                "created_at_ms": report.created_at_ms,
+                "path": report.path,
+                "verified": true,
+                "streams": streams,
+                "objects": {"count": report.object_count, "total_bytes": report.object_bytes},
+                "entity_count": report.entity_count,
+            }))?
+        );
+    } else {
+        println!(
+            "created archive {} ({} entities, {} objects): {}",
+            report.archive_id,
+            report.entity_count,
+            report.object_count,
+            report.path.display()
+        );
+    }
+    Ok(())
 }
 
 fn progress_mode_name(progress: ProgressArg) -> &'static str {

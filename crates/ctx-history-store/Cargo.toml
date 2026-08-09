@@ -16,10 +16,14 @@ test-utils = []
 chrono.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
+serde.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 ctx-history-core = { path = "../ctx-history-core" }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

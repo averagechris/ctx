@@ -50,6 +50,22 @@ keys. Core storage checks use the configured data root, and JSON stdout remains
 structured. This fork makes no network calls; there is no telemetry and no
 self-update. Update via Nix / SourceHut release tags.
 
+## Archive Create
+
+```bash
+ctx archive create /path/to/backup.ctxar
+ctx archive create /path/to/backup.ctxar --json
+```
+
+`archive create` writes the v1 private directory bundle described in
+[`archive-format-v1.md`](archive-format-v1.md). The destination must be absent;
+the writer streams all fifteen canonical entity files and referenced object
+bytes into a private sibling staging directory, self-checks the manifest and
+checksums, and atomically publishes only the completed bundle. Archive files
+contain verbatim history and artifact bytes, so treat them as secrets. The
+command is create-only in this release; verification and restore are separate
+follow-up commands.
+
 ## Sources
 
 ```bash

@@ -51,19 +51,21 @@ use ctx_history_core::{
     Event, EventRole, EventType, HistoryRecord, RedactionState, SearchMatchMode, Session,
 };
 use ctx_history_query::{
-    raw_sql_result_json, sources_json as query_sources_json, status_json as query_status_json,
-    status_snapshot as query_status_snapshot, BytePolicy, EventPageV1, EventProjectionV1, FieldSet,
+    raw_sql_result_json, render_evidence, sources_json as query_sources_json,
+    status_json as query_status_json, status_snapshot as query_status_snapshot, BytePolicy,
+    EventPageV1, EventProjectionV1, EvidenceError, EvidenceFormat, EvidenceRefresh,
+    EvidenceRenderError, EvidenceSelector, EvidenceSelectorRequest, FieldSet,
     HistorySourcePluginFailureProjection, HistorySourcePluginSourceProjection, QueryError,
     QueryService, SearchContextProjectionV1, SearchPageV1, SearchResultProjectionV1,
-    SessionProjectionV1, TranscriptMode as QueryTranscriptMode, DEFAULT_ITEM_BYTES,
-    DEFAULT_PAGE_BYTES, DEFAULT_SHOW_LIMIT, MAX_SHOW_LIMIT,
+    SessionProjectionV1, TranscriptMode as QueryTranscriptMode, DEFAULT_ARTIFACT_BYTES,
+    DEFAULT_ITEM_BYTES, DEFAULT_PAGE_BYTES, DEFAULT_SHOW_LIMIT, MAX_SHOW_LIMIT,
 };
 use ctx_history_store::{
     archive_verification_error_code, restore_archive_bundle, verify_archive_bundle_with_options,
-    ArchiveOptions, ArchiveVerifyOptions, CatalogSession, CatalogSourceIndexUpdate,
-    IdPrefixResolution, RawSqlOptions, RawSqlResult, RawSqlValue, SourceHealthClassification,
-    SourceImportFile, SourceImportFileIndexUpdate, Store, StoreError, ARCHIVE_MAX_ENTITIES,
-    ARCHIVE_MAX_OBJECTS, ARCHIVE_MAX_OBJECT_BYTES, ARCHIVE_MAX_TOTAL_BYTES,
+    write_secure_output, ArchiveOptions, ArchiveVerifyOptions, CatalogSession,
+    CatalogSourceIndexUpdate, IdPrefixResolution, RawSqlOptions, RawSqlResult, RawSqlValue,
+    SourceHealthClassification, SourceImportFile, SourceImportFileIndexUpdate, Store, StoreError,
+    ARCHIVE_MAX_ENTITIES, ARCHIVE_MAX_OBJECTS, ARCHIVE_MAX_OBJECT_BYTES, ARCHIVE_MAX_TOTAL_BYTES,
     CATALOG_IMPORT_OUTCOME_UNATTRIBUTED_CODE, RAW_SQL_DEFAULT_MAX_COLUMNS,
     RAW_SQL_DEFAULT_MAX_ROWS, RAW_SQL_DEFAULT_MAX_SQL_BYTES, RAW_SQL_DEFAULT_MAX_VALUE_BYTES,
     RAW_SQL_MAX_TIMEOUT, SOURCE_IMPORT_ZERO_YIELD_ANOMALY_CODE,
@@ -114,6 +116,126 @@ enum CommandRoot {
     Doctor(DoctorArgs),
     #[command(about = "Create a private, checksummed logical archive")]
     Archive(ArchiveArgs),
+    #[command(about = "Export a bounded private evidence bundle")]
+    Evidence(EvidenceArgs),
+}
+
+#[derive(Debug, Args)]
+struct EvidenceArgs {
+    #[command(subcommand)]
+    command: EvidenceCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum EvidenceCommand {
+    #[command(about = "Export an indexed session page")]
+    Session(EvidenceSessionArgs),
+    #[command(about = "Export an indexed evidence search page")]
+    Search(Box<EvidenceSearchArgs>),
+    #[command(about = "Export a finite set of indexed events")]
+    Events(EvidenceEventsArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct EvidenceCommonArgs {
+    #[arg(long, value_enum, default_value_t = EvidenceFormatArg::Jsonl)]
+    format: EvidenceFormatArg,
+    #[arg(long, value_enum, default_value_t = FieldArg::Full)]
+    fields: FieldArg,
+    #[arg(long, default_value_t = DEFAULT_ITEM_BYTES)]
+    max_item_bytes: usize,
+    #[arg(long, default_value_t = DEFAULT_PAGE_BYTES)]
+    max_page_bytes: usize,
+    #[arg(long, default_value_t = DEFAULT_ARTIFACT_BYTES)]
+    max_artifact_bytes: usize,
+    #[arg(long = "continue")]
+    continuation: Option<String>,
+    #[arg(long)]
+    out: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum EvidenceFormatArg {
+    Jsonl,
+    Markdown,
+}
+impl From<EvidenceFormatArg> for EvidenceFormat {
+    fn from(v: EvidenceFormatArg) -> Self {
+        match v {
+            EvidenceFormatArg::Jsonl => Self::Jsonl,
+            EvidenceFormatArg::Markdown => Self::Markdown,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct EvidenceSessionArgs {
+    #[arg(help = "ctx session UUID or unambiguous 8+ hex UUID prefix")]
+    id: String,
+    #[arg(long, value_enum, default_value_t = TranscriptMode::Lite)]
+    mode: TranscriptMode,
+    #[arg(long, default_value_t = 100, value_parser = parse_show_limit)]
+    limit: usize,
+    #[command(flatten)]
+    common: EvidenceCommonArgs,
+}
+
+#[derive(Debug, Args)]
+struct EvidenceEventsArgs {
+    #[arg(required = true, num_args = 1.., help = "ctx event UUIDs or unambiguous 8+ hex UUID prefixes")]
+    ids: Vec<String>,
+    #[arg(long, default_value_t = 200, value_parser = parse_search_limit)]
+    limit: usize,
+    #[command(flatten)]
+    common: EvidenceCommonArgs,
+}
+
+#[derive(Debug, Args)]
+struct EvidenceSearchArgs {
+    #[arg()]
+    query: Option<String>,
+    #[arg(long)]
+    term: Vec<String>,
+    #[arg(long, value_enum, default_value_t = SearchMatchArg::All)]
+    r#match: SearchMatchArg,
+    #[arg(long, default_value_t = 20, value_parser = parse_search_limit)]
+    limit: usize,
+    #[arg(long)]
+    provider: Option<ProviderArg>,
+    #[arg(long = "history-source")]
+    history_source: Option<String>,
+    #[arg(long = "provider-key")]
+    provider_key: Option<String>,
+    #[arg(long = "source-id")]
+    source_id: Option<String>,
+    #[arg(long = "source-format")]
+    source_format: Option<String>,
+    #[arg(long)]
+    workspace: Option<String>,
+    #[arg(long)]
+    since: Option<String>,
+    #[arg(long, hide = true)]
+    primary_only: bool,
+    #[arg(long)]
+    include_subagents: bool,
+    #[arg(long)]
+    event_type: Option<String>,
+    #[arg(long = "role")]
+    role: Vec<String>,
+    #[arg(long = "exclude-role")]
+    exclude_role: Vec<String>,
+    #[arg(long)]
+    exclude_tool_noise: bool,
+    #[arg(long = "exclude-tool")]
+    exclude_tool_name: Vec<String>,
+    #[arg(long)]
+    file: Option<PathBuf>,
+    #[arg(long)]
+    session: Option<String>,
+    #[arg(long)]
+    events: bool,
+    #[command(flatten)]
+    common: EvidenceCommonArgs,
 }
 
 #[derive(Debug, Args)]
@@ -1811,7 +1933,350 @@ fn main_result() -> Result<()> {
         CommandRoot::Mcp(args) => mcp::run(args, data_root.clone()),
         CommandRoot::Doctor(args) => run_doctor(args, data_root.clone()),
         CommandRoot::Archive(args) => run_archive(args, data_root),
+        CommandRoot::Evidence(args) => run_evidence(args, data_root),
     }
+}
+
+fn run_evidence(args: EvidenceArgs, data_root: PathBuf) -> Result<()> {
+    let db_path = database_path(data_root);
+    let store = open_existing_store_read_only(&db_path, "ctx evidence")?;
+    let (selector, limit, common) = match args.command {
+        EvidenceCommand::Session(args) => {
+            let id = match resolve_evidence_id(&store, &args.id, true) {
+                Ok(id) => id,
+                Err(e) => return evidence_id_failure(&args.common, e),
+            };
+            (
+                EvidenceSelector::SessionPage {
+                    ctx_session_id: id,
+                    mode: args.mode.into(),
+                },
+                args.limit,
+                args.common,
+            )
+        }
+        EvidenceCommand::Events(args) => {
+            if args.ids.len() > 256 {
+                return evidence_failure(
+                    &args.common,
+                    "too_many_event_ids",
+                    "at most 256 event IDs are allowed",
+                );
+            }
+            let mut ids = Vec::with_capacity(args.ids.len());
+            for value in &args.ids {
+                let id = match resolve_evidence_id(&store, value, false) {
+                    Ok(id) => id,
+                    Err(e) => return evidence_id_failure(&args.common, e),
+                };
+                if ids.contains(&id) {
+                    return evidence_request_failure(
+                        &args.common,
+                        "invalid_id_set",
+                        anyhow!("event IDs must be unique"),
+                    );
+                }
+                ids.push(id);
+            }
+            (
+                EvidenceSelector::EventIds { event_ids: ids },
+                args.limit,
+                args.common,
+            )
+        }
+        EvidenceCommand::Search(args) => {
+            if !search_has_intent(SearchIntentInput {
+                query: args.query.as_deref(),
+                terms: &args.term,
+                file: args.file.as_deref(),
+            }) {
+                return evidence_request_failure(
+                    &args.common,
+                    "invalid_selector",
+                    missing_search_intent_error(),
+                );
+            }
+            let query = args.query.clone().unwrap_or_default();
+            if let Err(error) = ctx_history_search::validate_query_request(&query, &args.term) {
+                return evidence_request_failure(&args.common, "invalid_selector", error.into());
+            }
+            let filters = match search_filters(
+                SearchFilterInput {
+                    session: args.session.clone(),
+                    provider: args.provider,
+                    source_identity: SourceIdentityFilterArgs {
+                        history_source: args.history_source.clone(),
+                        provider_key: args.provider_key.clone(),
+                        source_id: args.source_id.clone(),
+                        source_format: args.source_format.clone(),
+                    },
+                    workspace: args.workspace.clone(),
+                    since: args.since.clone(),
+                    primary_only: args.primary_only,
+                    include_subagents: args.include_subagents,
+                    event_type: args.event_type.clone(),
+                    role: args.role.clone(),
+                    exclude_role: args.exclude_role.clone(),
+                    exclude_tool_noise: args.exclude_tool_noise,
+                    exclude_tool_name: args.exclude_tool_name.clone(),
+                    file: args.file.clone(),
+                    include_current_session: true,
+                },
+                Some(&store),
+            ) {
+                Ok(filters) => filters,
+                Err(e) => {
+                    return evidence_request_failure(&args.common, "unsupported_combination", e)
+                }
+            };
+            let options = ctx_history_search::PacketOptions {
+                limit: args.limit,
+                filters,
+                result_mode: if args.events || args.session.is_some() {
+                    ctx_history_search::SearchResultMode::Events
+                } else {
+                    ctx_history_search::SearchResultMode::Sessions
+                },
+                match_mode: args.r#match.into(),
+                ..Default::default()
+            };
+            (
+                EvidenceSelector::SearchPage {
+                    query,
+                    terms: args.term.clone(),
+                    options: Box::new(options),
+                },
+                args.limit,
+                args.common.clone(),
+            )
+        }
+    };
+    let request = EvidenceSelectorRequest {
+        selector,
+        limit,
+        fields: common.fields.into(),
+        byte_policy: BytePolicy {
+            per_item_bytes: common.max_item_bytes,
+            page_bytes: common.max_page_bytes,
+        },
+        artifact_bytes: common.max_artifact_bytes,
+        format: common.format.into(),
+        refresh: EvidenceRefresh::Off,
+        include_current_session: true,
+        continuation: common.continuation.clone(),
+    };
+    let page = match QueryService::new(&store).evidence(request) {
+        Ok(page) => page,
+        Err(error) => return evidence_query_failure(&common, error),
+    };
+    // Rendering and complete byte preflight must finish before the secure
+    // writer creates a temporary sibling or target parent.
+    let rendered = match render_evidence(&page) {
+        Ok(bytes) => bytes,
+        Err(error) => return evidence_render_failure(&common, error),
+    };
+    if let Some(path) = &common.out {
+        match write_secure_output(path, &rendered) {
+            Ok(()) => {
+                eprintln!(
+                    "ctx evidence: wrote {} bytes to {}",
+                    rendered.len(),
+                    path.display()
+                );
+                Ok(())
+            }
+            Err(error) => {
+                eprintln!("ctx evidence: {}: {}", error.code.as_str(), error.context);
+                Err(SilentExit { code: 1 }.into())
+            }
+        }
+    } else {
+        let stdout = std::io::stdout();
+        let mut writer = stdout.lock();
+        match writer.write_all(&rendered).and_then(|_| writer.flush()) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+fn evidence_request_failure<T>(
+    common: &EvidenceCommonArgs,
+    code: &'static str,
+    error: anyhow::Error,
+) -> Result<T> {
+    evidence_failure(common, code, &error.to_string())
+}
+
+enum EvidenceIdError {
+    Invalid,
+    Ambiguous,
+    Missing,
+    Store,
+}
+
+fn resolve_evidence_id(
+    store: &Store,
+    value: &str,
+    session: bool,
+) -> std::result::Result<Uuid, EvidenceIdError> {
+    let prefix = CtxIdPrefix::parse(value).map_err(|_| EvidenceIdError::Invalid)?;
+    if let Some(id) = prefix.full_uuid() {
+        return Ok(id);
+    }
+    let resolution = if session {
+        store
+            .resolve_session_by_id_prefix(&prefix)
+            .map(|value| match value {
+                IdPrefixResolution::Found(value) => IdPrefixResolution::Found(value.id),
+                IdPrefixResolution::NotFound => IdPrefixResolution::NotFound,
+                IdPrefixResolution::Ambiguous(value) => IdPrefixResolution::Ambiguous(value),
+            })
+    } else {
+        store
+            .resolve_event_by_id_prefix(&prefix)
+            .map(|value| match value {
+                IdPrefixResolution::Found(value) => IdPrefixResolution::Found(value.id),
+                IdPrefixResolution::NotFound => IdPrefixResolution::NotFound,
+                IdPrefixResolution::Ambiguous(value) => IdPrefixResolution::Ambiguous(value),
+            })
+    }
+    .map_err(|_| EvidenceIdError::Store)?;
+    match resolution {
+        IdPrefixResolution::Found(id) => Ok(id),
+        IdPrefixResolution::NotFound => Err(EvidenceIdError::Missing),
+        IdPrefixResolution::Ambiguous(_) => Err(EvidenceIdError::Ambiguous),
+    }
+}
+
+fn evidence_id_failure<T>(common: &EvidenceCommonArgs, error: EvidenceIdError) -> Result<T> {
+    let code = evidence_id_error_kind(&error);
+    let message = match error {
+        EvidenceIdError::Invalid => ("invalid_id_set", "evidence ID is malformed"),
+        EvidenceIdError::Ambiguous => ("invalid_selector", "evidence ID prefix is ambiguous"),
+        EvidenceIdError::Missing => ("missing_target", "evidence target is missing"),
+        EvidenceIdError::Store => ("store_error", "local evidence store read failed"),
+    }
+    .1;
+    evidence_failure(common, code, message)
+}
+
+fn evidence_id_error_kind(error: &EvidenceIdError) -> &'static str {
+    match error {
+        EvidenceIdError::Invalid => "invalid_id_set",
+        EvidenceIdError::Ambiguous => "invalid_selector",
+        EvidenceIdError::Missing => "missing_target",
+        EvidenceIdError::Store => "store_error",
+    }
+}
+
+fn evidence_query_failure<T>(common: &EvidenceCommonArgs, error: QueryError) -> Result<T> {
+    let (code, message) = match &error {
+        QueryError::InvalidBytePolicy { .. } => {
+            ("invalid_selector", "evidence byte policy is invalid")
+        }
+        QueryError::InvalidContinuation(_) => {
+            ("invalid_continuation", "evidence continuation is invalid")
+        }
+        QueryError::ContinuationRequestMismatch => (
+            "continuation_request_mismatch",
+            "continuation does not match this request",
+        ),
+        QueryError::ContinuationKind { .. } => (
+            "continuation_kind_mismatch",
+            "continuation belongs to another query kind",
+        ),
+        QueryError::StaleContinuation => ("stale_continuation", "continuation is stale"),
+        QueryError::SnapshotChanged => ("snapshot_changed", "store snapshot changed while reading"),
+        QueryError::Store(_) => ("store_error", "local evidence store read failed"),
+        QueryError::Search(_) => ("invalid_selector", "evidence search request failed"),
+        QueryError::ArithmeticOverflow => ("serialization", "evidence accounting failed"),
+        QueryError::InvalidPageSize => ("invalid_selector", "evidence page size is invalid"),
+        QueryError::Serialization(_) => ("serialization", "evidence serialization failed"),
+        QueryError::ItemExceedsPageBudget { .. } => (
+            "item_exceeds_page_budget",
+            "first evidence item exceeds the page budget",
+        ),
+        QueryError::InvalidEvidenceSelector(_) => {
+            ("invalid_selector", "evidence selector is invalid")
+        }
+        QueryError::UnsupportedEvidenceCombination(_) => (
+            "unsupported_combination",
+            "evidence options cannot be combined",
+        ),
+        QueryError::MissingEvidenceTarget { .. } => {
+            ("missing_target", "evidence target is missing")
+        }
+        QueryError::DeletedEvidenceTarget { .. } => {
+            ("deleted_target", "evidence target is deleted")
+        }
+        QueryError::Evidence(error) => evidence_normalization_error(error),
+    };
+    evidence_failure(common, code, message)
+}
+
+fn evidence_normalization_error(error: &EvidenceError) -> (&'static str, &'static str) {
+    match error {
+        EvidenceError::StringLimit => ("string_limit", "evidence string exceeds its limit"),
+        EvidenceError::ArrayLimit => ("array_limit", "evidence array exceeds its limit"),
+        EvidenceError::RecordLimit => ("record_limit", "evidence record exceeds its limit"),
+        EvidenceError::Serialization => ("serialization", "evidence serialization failed"),
+        EvidenceError::NextArgumentsLimit => (
+            "next_arguments_limit",
+            "continuation arguments exceed their limit",
+        ),
+        EvidenceError::ArithmeticOverflow => ("serialization", "evidence accounting failed"),
+    }
+}
+
+fn evidence_render_failure<T>(
+    common: &EvidenceCommonArgs,
+    error: EvidenceRenderError,
+) -> Result<T> {
+    let code = match error {
+        EvidenceRenderError::ArtifactLimit => "artifact_limit",
+        EvidenceRenderError::InvalidArtifactPolicy => "artifact_budget_too_small",
+        EvidenceRenderError::ManifestLimit => "manifest_limit",
+        EvidenceRenderError::CompletionLimit
+        | EvidenceRenderError::RecordLimit
+        | EvidenceRenderError::RecordCountLimit => "record_limit",
+        EvidenceRenderError::NextArgumentsLimit => "next_arguments_limit",
+        EvidenceRenderError::MarkdownScalarLimit => "markdown_scalar_limit",
+        EvidenceRenderError::Serialization => "serialization",
+        EvidenceRenderError::OutputIo => "output_io",
+        EvidenceRenderError::PageAccounting
+        | EvidenceRenderError::ArithmeticOverflow
+        | EvidenceRenderError::SchemaVersion
+        | EvidenceRenderError::Invariant => "serialization",
+    };
+    evidence_failure(common, code, &error.to_string())
+}
+
+fn evidence_failure<T>(common: &EvidenceCommonArgs, code: &str, message: &str) -> Result<T> {
+    let message = if message.len() <= 4096 {
+        message
+    } else {
+        "evidence operation failed with bounded diagnostic omitted"
+    };
+    if common.out.is_none() && common.format == EvidenceFormatArg::Jsonl {
+        let value = json!({
+            "schema_version": "ctx-evidence-bundle-jsonl-v1", "record_type": "error",
+            "private": true, "share_safe": false, "code": code, "message": message,
+        });
+        let mut stdout = std::io::stdout().lock();
+        if let Err(error) =
+            write_json_record(&mut stdout, &value).and_then(|_| stdout.flush().map_err(Into::into))
+        {
+            if is_broken_pipe(&error) {
+                return Err(SilentExit { code: 0 }.into());
+            }
+            return Err(error);
+        }
+    } else {
+        eprintln!("ctx evidence: {code}: {message}");
+    }
+    Err(SilentExit { code: 1 }.into())
 }
 
 fn run_archive(args: ArchiveArgs, data_root: PathBuf) -> Result<()> {
@@ -7402,15 +7867,29 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        catalog_import_checkpoint_matches, classify_import_health,
-        history_source_plugin_cursor_only, persist_source_health, sha256_file_prefix_hex,
-        shell_quote_arg, write_json_record, ImportHealth, ImportHealthClassification, ImportReport,
-        ImportSourceReport, ImportTotals, SourceStats,
+        catalog_import_checkpoint_matches, classify_import_health, evidence_id_error_kind,
+        history_source_plugin_cursor_only, persist_source_health, query_error_kind,
+        sha256_file_prefix_hex, shell_quote_arg, write_json_record, ImportHealth,
+        ImportHealthClassification, ImportReport, ImportSourceReport, ImportTotals, SourceStats,
     };
     use ctx_history_capture::ProviderImportSummary;
-    use ctx_history_store::{SourceHealthClassification, Store};
+    use ctx_history_store::{SourceHealthClassification, Store, StoreError};
     use std::{fs, io::Write};
     use tempfile::tempdir;
+
+    #[test]
+    fn evidence_store_failures_use_store_error_code() {
+        assert_eq!(
+            evidence_id_error_kind(&super::EvidenceIdError::Store),
+            "store_error"
+        );
+        assert_eq!(
+            query_error_kind(&super::QueryError::Store(
+                StoreError::UnsupportedSchemaVersion(1)
+            )),
+            "store_error"
+        );
+    }
 
     #[test]
     fn shell_quote_arg_uses_single_quotes_for_shell_metacharacters() {

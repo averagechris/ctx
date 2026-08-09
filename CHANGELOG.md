@@ -4,6 +4,10 @@
 
 ### Added
 
+- `ctx evidence session|search|events` exports deterministic private JSONL or
+  Markdown bundles to stdout or to a create-only `0600` file. File publication
+  uses descriptor-anchored traversal, verified private staging, and the native
+  macOS/Linux atomic no-replace primitive (#280).
 - A closed deterministic evidence normalization boundary with fail-closed
   content proof, bounded provenance and citations, exact normalized byte
   accounting, and no raw payload, path, cursor, clock, filesystem, or ambient

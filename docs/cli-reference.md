@@ -50,6 +50,37 @@ keys. Core storage checks use the configured data root, and JSON stdout remains
 structured. This fork makes no network calls; there is no telemetry and no
 self-update. Update via Nix / SourceHut release tags.
 
+## Evidence Bundles
+
+```bash
+ctx evidence session SESSION_ID --mode lite --limit 100
+ctx evidence search "atomic publish" --events --since 30d --format markdown
+ctx evidence events EVENT_ID EVENT_ID --out ./evidence.jsonl
+```
+
+`evidence session`, `evidence search`, and `evidence events` select exactly one
+domain and delegate to the evidence-safe query projection. Common flags are
+`--limit`, `--fields full|compact`, `--max-item-bytes`, `--max-page-bytes`,
+`--max-artifact-bytes`, `--format jsonl|markdown`, `--continue`, and `--out`.
+Session adds `--mode full|lite|log`; search supports the ordinary search
+filters and `--events`; events accepts 1–256 unique IDs. Interactive IDs may
+be unambiguous 8+ hex prefixes, but bundles and continuation requests contain
+only canonical full IDs. Search always uses refresh off, includes the current
+session explicitly rather than through ambient exclusion, and freezes relative
+`--since` windows to an absolute timestamp in continuation state.
+
+Without `--out`, the complete preflighted artifact is written to stdout and a
+broken pipe is success. With `--out`, stdout remains empty and success or a
+typed bounded error is reported on stderr. The destination must be absent. The
+writer never opens or replaces it: it traverses parents without following
+symlinks, optionally creates only the final parent as `0700`, stages a verified
+`0600` sibling, and publishes with macOS/Linux atomic no-replace semantics.
+The parent must be caller-owned without group/other write permission, or an
+  root-owned, exact `01777` system `/tmp` directory (normalized to `/private/tmp`
+on macOS); nested sticky directories are not trusted. Evidence export does not
+refresh/import, use the network, or add an MCP method. See
+[`evidence-bundle-v1.md`](evidence-bundle-v1.md) for the normative contract.
+
 ## Archive Create
 
 ```bash

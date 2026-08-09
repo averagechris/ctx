@@ -195,7 +195,7 @@ unsafe fn errno_location() -> *mut libc::c_int {
 }
 
 #[cfg(target_os = "macos")]
-fn normalize_macos_trusted_root_alias(path: &Path) -> PathBuf {
+pub(super) fn normalize_macos_trusted_root_alias(path: &Path) -> PathBuf {
     for (public, private) in [
         (Path::new("/tmp"), Path::new("/private/tmp")),
         (Path::new("/var"), Path::new("/private/var")),

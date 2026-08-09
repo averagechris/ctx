@@ -38,6 +38,10 @@ use uuid::Uuid;
 mod archive;
 #[cfg(unix)]
 mod restore;
+#[cfg(unix)]
+mod secure_output;
+#[cfg(not(unix))]
+mod secure_output_nonunix;
 pub use archive::{
     archive_verification_error_code, verify_archive_bundle, verify_archive_bundle_with_options,
     ArchiveOptions, ArchiveReport, ArchiveStreamReport, ArchiveVerificationCode,
@@ -46,6 +50,10 @@ pub use archive::{
 };
 #[cfg(unix)]
 pub use restore::{restore_archive_bundle, ArchiveRestoreReport};
+#[cfg(unix)]
+pub use secure_output::{write_secure_output, SecureOutputCode, SecureOutputError};
+#[cfg(not(unix))]
+pub use secure_output_nonunix::{write_secure_output, SecureOutputCode, SecureOutputError};
 #[cfg(not(unix))]
 #[derive(Debug, Clone)]
 pub struct ArchiveRestoreReport {

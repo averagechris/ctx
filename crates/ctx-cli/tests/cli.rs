@@ -470,6 +470,114 @@ fn ctx(temp: &TempDir) -> Command {
     command
 }
 
+#[test]
+fn evidence_search_stdout_and_secure_file_are_deterministic_and_channel_separated() {
+    let temp = TempDir::new().unwrap();
+    import_match_fixture(&temp);
+    let stdout = ctx(&temp)
+        .args(["evidence", "search", "alpha", "--events"])
+        .assert()
+        .success()
+        .stderr("")
+        .get_output()
+        .stdout
+        .clone();
+    let records: Vec<Value> = std::str::from_utf8(&stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records.first().unwrap()["record_type"], "manifest");
+    assert_eq!(records.last().unwrap()["record_type"], "completion");
+    assert!(records
+        .iter()
+        .all(|record| record["private"] == true && record["share_safe"] == false));
+
+    let out = temp.path().join("exports").join("bundle.jsonl");
+    let result = ctx(&temp)
+        .args([
+            "evidence",
+            "search",
+            "alpha",
+            "--events",
+            "--out",
+            out.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    result
+        .stdout("")
+        .stderr(predicates::str::contains("ctx evidence: wrote"));
+    assert_eq!(fs::read(&out).unwrap(), stdout);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&out).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(out.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+    ctx(&temp)
+        .args([
+            "evidence",
+            "search",
+            "alpha",
+            "--out",
+            out.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stdout("")
+        .stderr(predicates::str::contains("output_exists"));
+}
+
+#[test]
+fn evidence_jsonl_failures_are_terminal_records_and_markdown_is_stderr_only() {
+    let temp = TempDir::new().unwrap();
+    json_output(ctx(&temp).args(["setup", "--catalog-only", "--json", "--progress", "none"]));
+    let output = ctx(&temp)
+        .args(["evidence", "events", "not-an-id"])
+        .assert()
+        .failure()
+        .stderr("")
+        .get_output()
+        .stdout
+        .clone();
+    let error: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(error["schema_version"], "ctx-evidence-bundle-jsonl-v1");
+    assert_eq!(error["record_type"], "error");
+    assert_eq!(error["code"], "invalid_id_set");
+    ctx(&temp)
+        .args(["evidence", "events", "not-an-id", "--format", "markdown"])
+        .assert()
+        .failure()
+        .stdout("")
+        .stderr(predicates::str::contains("ctx evidence: invalid_id_set"));
+
+    let mut command = ctx(&temp);
+    command.args(["evidence", "events"]);
+    for index in 0..257 {
+        command.arg(format!("00000000-0000-7000-8000-{index:012}"));
+    }
+    let output = command
+        .assert()
+        .failure()
+        .stderr("")
+        .get_output()
+        .stdout
+        .clone();
+    let error: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(error["code"], "too_many_event_ids");
+}
+
 fn provider_history_fixture(name: &str) -> String {
     materialized_fixture("provider-history", name)
 }
@@ -1405,7 +1513,6 @@ fn help_exposes_session_retrieval_commands() {
     for forbidden in [
         "dashboard",
         "shim",
-        "evidence",
         "publish",
         "link-pr",
         "record",
@@ -1452,7 +1559,6 @@ fn removed_commands_are_rejected() {
     for command in [
         "dashboard",
         "shim",
-        "evidence",
         "publish",
         "link-pr",
         "record",

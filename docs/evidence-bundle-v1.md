@@ -774,9 +774,12 @@ rename APIs cannot make the temporary source name immune to that same-UID
 attacker. V1 must not claim protection against that actor. It must:
 
 1. walk the parent directory descriptor-relatively without following symlinks;
-   create a missing final parent only with mode `0700`, and require an existing
-   parent to be owned by the caller, a directory, and free of group/other
-   permission bits. A symlink or unsafe component fails with
+   create a missing final parent only with mode `0700`, and require the final
+   parent to be either caller-owned with no group/other write bits or the
+    a root-owned, positionally allowlisted system temporary directory (`/tmp` on
+   Linux or normalized `/private/tmp` on macOS) with exact mode `01777`.
+   Arbitrary nested `01777` directories are not trusted. Read/execute bits on a
+   caller-owned parent are not authority to mutate entries. A symlink or unsafe component fails with
    `unsafe_output_path`;
 2. reject an existing output immediately as `output_exists`, regardless of
    whether it is a regular file, symlink, directory, or hard link. It must not
@@ -792,8 +795,11 @@ attacker. V1 must not claim protection against that actor. It must:
    atomically succeeds only when the destination is absent. If the primitive
    is unavailable, unsupported, or returns an ambiguous result, fail closed
    with `atomic_create_unavailable`/`atomic_create_failed` and leave the
-   target untouched;
-5. `fsync` the parent directory after successful publication. A competitor
+   target untouched. Platforms other than Linux and macOS fail closed;
+   ordinary rename is never a fallback;
+5. `fsync` the parent directory after successful publication. Failure here is
+   reported as published-but-not-durable and must never unlink the published
+   complete target. A competitor
    that creates the target before the conditional operation causes
    `output_exists`; a competitor cannot cause the writer to overwrite a target,
    symlink, or hard link. The temporary file is cleaned on all failures.
@@ -931,6 +937,6 @@ They are intentionally limited to four implementation slices:
 | `200.3` | `feature`, `points:5` | Render bounded evidence-bundle JSONL and Markdown v1 | `200.2` | Versioned manifest/items/completion/error records; complete artifact preflight; private marker; deterministic UTF-8, escaping, fences, timestamps, counts, and long-content tests. |
 | `200.4` | `security`, `points:5` | Add atomic absent-target output and thin CLI adapter | `200.3` | 0700/0600 owner-only output, descriptor-relative checks, conditional no-replace primitive or fail-closed error, existing-target refusal, stderr `--out` errors, and temp-home macOS/Linux coverage; MCP deferred. |
 
-Completion of these children would implement #200. This document itself is
-only the bounded scope decision and does not claim that implementation or
-ticket closure has happened.
+The four implementation slices are now represented by the query selector,
+normalization, renderer, and CLI/secure-writer APIs. This document remains the
+normative v1 contract; MCP export remains deferred.

@@ -1,4 +1,6 @@
 use assert_cmd::Command;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use ctx_history_store::verify_archive_bundle;
 use predicates::prelude::*;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
@@ -81,6 +83,22 @@ fn archive_create_has_json_and_human_contract_and_private_atomic_layout() {
     let (stdout, _) =
         success_output(ctx(&temp).args(["archive", "create", human_target.to_str().unwrap()]));
     assert!(stdout.contains("created archive"));
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn archive_cli_create_and_verify_work_under_system_tmp() {
+    let temp = Builder::new()
+        .prefix("ctx-archive-cli-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    json_output(ctx(&temp).args(["setup", "--catalog-only", "--progress", "none", "--json"]));
+
+    let target = temp.path().join("archive.ctxar");
+    let report =
+        json_output(ctx(&temp).args(["archive", "create", target.to_str().unwrap(), "--json"]));
+    assert_eq!(report["verified"], true);
+    verify_archive_bundle(&target).unwrap();
 }
 
 fn insert_ambiguous_ctx_ids(temp: &TempDir) {

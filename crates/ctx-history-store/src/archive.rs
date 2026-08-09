@@ -129,22 +129,22 @@ impl AnchoredDir {
             Path::new(".")
         };
         let mut dir = open_read_nofollow(start, true)?;
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let mut normal_component = 0;
         for component in path.components() {
             match component {
                 Component::RootDir | Component::CurDir => {}
                 Component::Normal(name) => {
-                    #[cfg(target_os = "macos")]
-                    let next = if path.starts_with("/private/tmp") && normal_component == 1 {
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    let next = if is_trusted_tmp_component(path, normal_component) {
                         openat_trusted_tmp(&dir, name)?
                     } else {
                         openat(&dir, name, true)?
                     };
-                    #[cfg(not(target_os = "macos"))]
+                    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                     let next = openat(&dir, name, true)?;
                     dir = next;
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
                     {
                         normal_component += 1;
                     }
@@ -206,7 +206,19 @@ fn openat(parent: &File, name: &std::ffi::OsStr, directory: bool) -> Result<File
     openat_checked(parent, name, directory, false)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn is_trusted_tmp_component(path: &Path, normal_component: usize) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        path.starts_with("/tmp") && normal_component == 0
+    }
+    #[cfg(target_os = "macos")]
+    {
+        path.starts_with("/private/tmp") && normal_component == 1
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn openat_trusted_tmp(parent: &File, name: &std::ffi::OsStr) -> Result<File> {
     openat_checked(parent, name, true, true)
 }
@@ -245,14 +257,14 @@ fn validate_open_file(file: &File, directory: bool, allow_sticky_tmp: bool) -> R
     } else if !metadata.is_file() || metadata.nlink() > 1 {
         return Err(archive_error("expected a regular non-hard-linked file"));
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let _ = allow_sticky_tmp;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     if allow_sticky_tmp {
         use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o1777 != 0o1777 {
+        if metadata.permissions().mode() & 0o7777 != 0o1777 {
             return Err(archive_error(
-                "trusted macOS temporary root has an unexpected mode",
+                "trusted temporary root has an unexpected mode",
             ));
         }
         return Ok(());
@@ -3349,9 +3361,9 @@ mod tests {
         assert!(verify_archive_bundle(link.join("real.ctxar")).is_err());
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn archive_round_trip_works_under_tmp_alias() {
+    fn archive_round_trip_works_under_trusted_tmp_root() {
         let temp = tempfile::Builder::new()
             .prefix("ctx-archive-")
             .tempdir_in("/tmp")
@@ -3363,6 +3375,18 @@ mod tests {
             .create_archive(&target, ArchiveOptions::default())
             .unwrap();
         verify_archive_bundle(&target).unwrap();
+
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o702)).unwrap();
+        assert!(verify_archive_bundle(&target).is_err());
+
+        let untrusted = temp.path().join("world-writable");
+        fs::create_dir(&untrusted).unwrap();
+        fs::set_permissions(&untrusted, fs::Permissions::from_mode(0o777)).unwrap();
+        let untrusted_target = untrusted.join("archive.ctxar");
+        assert!(store
+            .create_archive(&untrusted_target, ArchiveOptions::default())
+            .is_err());
+        assert!(!untrusted_target.exists());
     }
 
     #[cfg(target_os = "macos")]

@@ -55,6 +55,17 @@ already generated corpus. Their artifact objects contain the ordered sample
 array, sample count, p50, p95, minimum, and maximum; the existing singular
 `*_ms` fields remain as the first sample for artifact consumers.
 
+Each ordinary and filtered sample also records non-overlapping search phases,
+their p50/p95 values, path (`fast_event` or `fallback_ranked_fts`), and available
+statement/candidate/hydration counters. The execution phase deliberately combines
+ranked FTS/candidate paging with base-row/context hydration because the fast-event
+store cursor hydrates each row while stepping the ranked statement; separating
+those costs would claim precision the current architecture does not expose.
+Assembly includes snippets, citations, clustering, sorting, and projection.
+Explicit unattributed overhead makes every sample reconcile to its end-to-end
+duration. The artifact also records the reproducible command assembled from the
+effective harness configuration.
+
 Debug builds are refused. `CTX_LARGE_PROFILE_OUTPUT` must be explicit, absolute,
 must not resolve into `~/.ctx`, and must either not exist or contain the harness
 ownership marker `.ctx-large-profile-owned` containing the marker version and

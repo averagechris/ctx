@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "profile": "ctx-large-index-profile",
+  "mode": "smoke",
+  "requested": {"baseline_events": 1, "min_footprint_bytes": 0, "min_footprint_override_env": null},
+  "achieved": {"baseline_events": 1, "baseline_records": 1, "incremental_events": 1, "incremental_records": 1},
+  "config": {"seed": 390, "events_per_record": 1, "batch_records": 1, "batch_event_bound": 1, "measurement_repeats": 1},
+  "environment": {"os": "macos", "arch": "aarch64", "jj_change": null, "jj_commit": null, "cache_state": "warm followed by reopen; true cold cache requires operator OS cache-drop steps"},
+  "sqlite": {"version": "3.46.0", "journal_mode": "wal", "synchronous": 1, "page_size": 4096, "foreign_keys": 1, "user_version": 1001},
+  "paths": {"db": "/tmp/profile.sqlite", "wal": "/tmp/profile.sqlite-wal", "shm": "/tmp/profile.sqlite-shm", "artifact": "/tmp/ctx-large-index-profile-v1.json"},
+  "storage": {
+    "pre_checkpoint": {
+      "db": {"path": "/tmp/profile.sqlite", "bytes": 1, "error": null, "present": true},
+      "wal": {"path": "/tmp/profile.sqlite-wal", "bytes": 0, "error": null, "present": true},
+      "shm": {"path": "/tmp/profile.sqlite-shm", "bytes": 1, "error": null, "present": true},
+      "total_present_bytes": 2
+    },
+    "post_checkpoint": {
+      "db": {"path": "/tmp/profile.sqlite", "bytes": 1, "error": null, "present": true},
+      "wal": {"path": "/tmp/profile.sqlite-wal", "bytes": 0, "error": null, "present": true},
+      "shm": {"path": "/tmp/profile.sqlite-shm", "bytes": 1, "error": null, "present": true},
+      "total_present_bytes": 2
+    }
+  },
+  "counts": {"records": 2, "capture_sources": 2, "sessions": 2, "runs": 2, "events": 2, "summaries": 2, "files_touched": 2, "record_fts": 2, "event_fts": 2, "artifact_fts": 0},
+  "generation": {"max_batch_events": 1, "bounded_by_batch_size": true},
+  "measurements": {
+    "initial_import_ms": 1.0,
+    "noop_import_ms": 1.0,
+    "incremental_import_ms": 1.0,
+    "warm_search_ms": 1.0,
+    "filtered_search_ms": 1.0,
+    "noop_replay": {"sample_count": 1, "samples_ms": [1.0], "p50_ms": 1.0, "p95_ms": 1.0, "min_ms": 1.0, "max_ms": 1.0},
+    "warm_search": {"sample_count": 1, "samples_ms": [1.0], "p50_ms": 1.0, "p95_ms": 1.0, "min_ms": 1.0, "max_ms": 1.0},
+    "filtered_search": {"sample_count": 1, "samples_ms": [1.0], "p50_ms": 1.0, "p95_ms": 1.0, "min_ms": 1.0, "max_ms": 1.0},
+    "noop_counts_unchanged": true
+  },
+  "search": {
+    "ordinary_result_count": 10,
+    "filtered_result_count": 10,
+    "ordered_result_ids": ["018f45d0-7600-7000-8000-0000007de42d", "018f45d0-7600-7000-8000-0000007de414", "018f45d0-7600-7000-8000-0000007de3fb", "018f45d0-7600-7000-8000-0000007de3e2", "018f45d0-7600-7000-8000-0000007de3c9", "018f45d0-7600-7000-8000-0000007de3b0", "018f45d0-7600-7000-8000-0000007de397", "018f45d0-7600-7000-8000-0000007de37e", "018f45d0-7600-7000-8000-0000007de365", "018f45d0-7600-7000-8000-0000007de34c"],
+    "result_digest": "5c40b70008119159",
+    "filtered_ordered_result_ids": ["018f45d0-7600-7000-8000-0000007de42e", "018f45d0-7600-7000-8000-0000007de415", "018f45d0-7600-7000-8000-0000007de3fc", "018f45d0-7600-7000-8000-0000007de3e3", "018f45d0-7600-7000-8000-0000007de3ca", "018f45d0-7600-7000-8000-0000007de3b1", "018f45d0-7600-7000-8000-0000007de398", "018f45d0-7600-7000-8000-0000007de37f", "018f45d0-7600-7000-8000-0000007de366", "018f45d0-7600-7000-8000-0000007de34d"],
+    "filtered_result_digest": "a7f685e4f28d2dd4"
+  },
+  "event_window": {"target_event_id": "018f45d0-7600-7000-8000-0000003ef2ce", "ids": ["018f45d0-7600-7000-8000-0000003ef2ce"], "count": 1, "bound": 3, "contains_target": true, "duration_ms": 1.0},
+  "checkpoint": {
+    "duration_ms": 1.0,
+    "pre": {"db": {"path": "/tmp/profile.sqlite", "bytes": 1, "error": null, "present": true}, "wal": {"path": "/tmp/profile.sqlite-wal", "bytes": 0, "error": null, "present": true}, "shm": {"path": "/tmp/profile.sqlite-shm", "bytes": 1, "error": null, "present": true}, "total_present_bytes": 2},
+    "post": {"db": {"path": "/tmp/profile.sqlite", "bytes": 1, "error": null, "present": true}, "wal": {"path": "/tmp/profile.sqlite-wal", "bytes": 0, "error": null, "present": true}, "shm": {"path": "/tmp/profile.sqlite-shm", "bytes": 1, "error": null, "present": true}, "total_present_bytes": 2}
+  },
+  "reopen": {"cache_state": "reopen_not_cold", "ordered_result_ids": ["018f45d0-7600-7000-8000-0000007de42d", "018f45d0-7600-7000-8000-0000007de414", "018f45d0-7600-7000-8000-0000007de3fb", "018f45d0-7600-7000-8000-0000007de3e2", "018f45d0-7600-7000-8000-0000007de3c9", "018f45d0-7600-7000-8000-0000007de3b0", "018f45d0-7600-7000-8000-0000007de397", "018f45d0-7600-7000-8000-0000007de37e", "018f45d0-7600-7000-8000-0000007de365", "018f45d0-7600-7000-8000-0000007de34c"], "result_digest": "5c40b70008119159", "reopen_ms": 1.0},
+  "rss": {"peak_bytes": 1, "source": "fixture", "semantics": "fixture"},
+  "privacy": "synthetic deterministic corpus only; no real home, no network, no private data"
+}

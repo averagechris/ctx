@@ -24,6 +24,62 @@ thread_local! {
     static DISABLE_FILE_SCOPE_PUSHDOWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static RESIDUAL_COUNTS: std::cell::Cell<[u64; 3]> = const { std::cell::Cell::new([0; 3]) };
     static USE_PAGED_RANKED_REFERENCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SEARCH_PHASES: std::cell::Cell<Option<SearchPhaseCapture>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SearchPhaseCapture {
+    active: bool,
+    path: SearchProfilePath,
+    preparation_ns: u64,
+    execution_hydration_ns: u64,
+    assembly_ns: u64,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SearchProfilePath {
+    #[default]
+    Unknown,
+    FastEvent,
+    FallbackRanked,
+}
+
+#[cfg(test)]
+fn capture_search_phases<T>(run: impl FnOnce() -> T) -> (T, SearchPhaseCapture) {
+    struct Reset(Option<SearchPhaseCapture>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SEARCH_PHASES.set(self.0);
+        }
+    }
+    let previous = SEARCH_PHASES.replace(Some(SearchPhaseCapture {
+        active: true,
+        ..SearchPhaseCapture::default()
+    }));
+    let reset = Reset(previous);
+    let value = run();
+    let capture = SEARCH_PHASES.get().unwrap_or_default();
+    drop(reset);
+    (value, capture)
+}
+
+#[cfg(test)]
+fn update_search_phases(update: impl FnOnce(&mut SearchPhaseCapture)) {
+    SEARCH_PHASES.with(|slot| {
+        if let Some(mut capture) = slot.get() {
+            if capture.active {
+                update(&mut capture);
+                slot.set(Some(capture));
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+fn duration_ns(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -336,6 +392,8 @@ fn search_packet_plan(
     options: &PacketOptions,
     hydration: HydrationIntent,
 ) -> Result<SearchPacket> {
+    #[cfg(test)]
+    let phase_started = std::time::Instant::now();
     let options = normalized_options(options);
     if let Some(provider) = options.filters.provider {
         if !store.has_provider_data(provider)? {
@@ -346,15 +404,32 @@ fn search_packet_plan(
     if file_scope.as_ref().is_some_and(FileTouchScope::is_empty) {
         return Ok(empty_search_packet(display_query, plan, &options));
     }
+    #[cfg(test)]
+    update_search_phases(|capture| {
+        capture.preparation_ns = duration_ns(phase_started.elapsed());
+    });
     if let Some(packet) =
         fast_event_search_packet(store, &plan, display_query, &options, file_scope.as_ref())?
     {
         return Ok(packet);
     }
+    #[cfg(test)]
+    update_search_phases(|capture| {
+        capture.path = SearchProfilePath::FallbackRanked;
+        capture.preparation_ns = duration_ns(phase_started.elapsed());
+    });
+    #[cfg(test)]
+    let ranked_started = std::time::Instant::now();
     let CandidateSearch {
         candidates,
         scan_budget_exhausted,
     } = ranked_candidates(store, Some(&plan), &options, file_scope.as_ref(), hydration)?;
+    #[cfg(test)]
+    update_search_phases(|capture| {
+        capture.execution_hydration_ns = duration_ns(ranked_started.elapsed());
+    });
+    #[cfg(test)]
+    let assembly_started = std::time::Instant::now();
     let mut truncation = ContextTruncation::default();
     let mut results = Vec::new();
 
@@ -373,7 +448,7 @@ fn search_packet_plan(
     }
 
     let cursor_offset = results.len();
-    Ok(SearchPacket {
+    let packet = SearchPacket {
         schema_version: SEARCH_PACKET_SCHEMA_VERSION,
         query: display_query.to_owned(),
         query_plan: plan,
@@ -382,7 +457,12 @@ fn search_packet_plan(
         results,
         pagination: pagination(Some(cursor_offset), has_more),
         truncation,
-    })
+    };
+    #[cfg(test)]
+    update_search_phases(|capture| {
+        capture.assembly_ns = duration_ns(assembly_started.elapsed());
+    });
+    Ok(packet)
 }
 
 pub fn search_packet_terms(
@@ -748,6 +828,8 @@ fn fast_event_search_packet(
     options: &PacketOptions,
     file_scope: Option<&FileTouchScope>,
 ) -> Result<Option<SearchPacket>> {
+    #[cfg(test)]
+    let fast_started = std::time::Instant::now();
     if plan.is_empty() {
         return Ok(None);
     }
@@ -797,6 +879,18 @@ fn fast_event_search_packet(
     let mut pages_scanned = 0_usize;
     let mut scan_budget_exhausted = false;
 
+    #[cfg(test)]
+    update_search_phases(|capture| {
+        capture.path = SearchProfilePath::FastEvent;
+        capture.preparation_ns = capture
+            .preparation_ns
+            .saturating_add(duration_ns(fast_started.elapsed()));
+    });
+    #[cfg(test)]
+    let execution_started = std::time::Instant::now();
+    #[cfg(test)]
+    let mut callback_ns = 0_u64;
+
     scan_event_hit_batches(
         store,
         plan,
@@ -805,6 +899,8 @@ fn fast_event_search_packet(
         &sql_filters,
         clustered || residual_filtered,
         |hits| {
+            #[cfg(test)]
+            let callback_started = std::time::Instant::now();
             pages_scanned = pages_scanned.saturating_add(1);
             let page_len = hits.len();
 
@@ -884,15 +980,38 @@ fn fast_event_search_packet(
                 results.len() >= collection_target
             };
             if enough_results || page_len < page_size {
+                #[cfg(test)]
+                {
+                    callback_ns =
+                        callback_ns.saturating_add(duration_ns(callback_started.elapsed()));
+                }
                 return false;
             }
             if pages_scanned >= FILTERED_SEARCH_MAX_PAGES {
                 scan_budget_exhausted = true;
+                #[cfg(test)]
+                {
+                    callback_ns =
+                        callback_ns.saturating_add(duration_ns(callback_started.elapsed()));
+                }
                 return false;
+            }
+            #[cfg(test)]
+            {
+                callback_ns = callback_ns.saturating_add(duration_ns(callback_started.elapsed()));
             }
             true
         },
     )?;
+
+    #[cfg(test)]
+    update_search_phases(|capture| {
+        capture.execution_hydration_ns =
+            duration_ns(execution_started.elapsed()).saturating_sub(callback_ns);
+        capture.assembly_ns = callback_ns;
+    });
+    #[cfg(test)]
+    let final_assembly_started = std::time::Instant::now();
 
     if clustered {
         results = clustered_results;
@@ -926,7 +1045,7 @@ fn fast_event_search_packet(
     };
 
     let cursor_offset = results.len();
-    Ok(Some(SearchPacket {
+    let packet = SearchPacket {
         schema_version: SEARCH_PACKET_SCHEMA_VERSION,
         query: display_query.to_owned(),
         query_plan: plan.clone(),
@@ -935,7 +1054,14 @@ fn fast_event_search_packet(
         results,
         pagination: pagination(Some(cursor_offset), has_more),
         truncation,
-    }))
+    };
+    #[cfg(test)]
+    update_search_phases(|capture| {
+        capture.assembly_ns = capture
+            .assembly_ns
+            .saturating_add(duration_ns(final_assembly_started.elapsed()));
+    });
+    Ok(Some(packet))
 }
 
 /// Residual-filtered and clustered searches consume one bounded SQLite
@@ -7175,6 +7301,78 @@ mod tests {
             assert!(artifact["measurements"][name]["p50_ms"].is_number());
             assert!(artifact["measurements"][name]["p95_ms"].is_number());
         }
+        for name in ["ordinary_search_phases", "filtered_search_phases"] {
+            assert_eq!(
+                artifact["measurements"][name]["samples"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                5
+            );
+            assert!(artifact["measurements"][name]["p50_ms"]
+                ["execution_candidate_paging_and_base_context_hydration_ms"]
+                .is_number());
+            for sample in artifact["measurements"][name]["samples"]
+                .as_array()
+                .unwrap()
+            {
+                let accounted = sample["filter_source_preparation_ms"].as_f64().unwrap()
+                    + sample["execution_candidate_paging_and_base_context_hydration_ms"]
+                        .as_f64()
+                        .unwrap()
+                    + sample["result_assembly_clustering_sorting_projection_ms"]
+                        .as_f64()
+                        .unwrap()
+                    + sample["unattributed_overhead_ms"].as_f64().unwrap();
+                assert!((accounted - sample["end_to_end_ms"].as_f64().unwrap()).abs() < 0.002);
+            }
+        }
+    }
+
+    #[test]
+    fn phase_capture_preserves_search_output() {
+        let temp = tempdir();
+        let store = ctx_history_store::Store::open(temp.path().join("phases.sqlite")).unwrap();
+        let archive = synthetic_perf_archive_batch(0, 1_200, 1, 1_200, 0x186).unwrap();
+        write_synthetic_batch(&store, &archive).unwrap();
+        let options = PacketOptions {
+            limit: 10,
+            ..PacketOptions::default()
+        };
+        let plain = search_packet(&store, "perfneedle", &options).unwrap();
+        let measured = measured_profile_search(&store, "perfneedle", &options).unwrap();
+        assert_eq!(result_ids(&plain), result_ids(&measured.packet));
+        assert_eq!(
+            digest_strings(&result_ids(&plain)),
+            digest_strings(&result_ids(&measured.packet))
+        );
+        assert_eq!(measured.phases.path, "fast_event");
+        assert!(measured.phases.reconciles());
+    }
+
+    #[test]
+    fn search_phase_percentiles_use_all_samples() {
+        let samples = [1.0, 5.0, 3.0, 2.0, 4.0]
+            .into_iter()
+            .map(|value| SearchPhaseEvidence {
+                path: "fast_event".into(),
+                filter_source_preparation_ms: value,
+                execution_candidate_paging_and_base_context_hydration_ms: value,
+                result_assembly_clustering_sorting_projection_ms: value,
+                unattributed_overhead_ms: value,
+                end_to_end_ms: value * 4.0,
+                event_search_statements: 1,
+                candidate_rows_hydrated: 1,
+                candidates_examined: 1,
+                candidates_rejected: 0,
+                candidates_accepted: 1,
+                relation_hydration_statements: 0,
+                hydration_loader_statements: [0; 2],
+            })
+            .collect();
+        let stats = search_phase_stats(samples);
+        assert_eq!(stats.p50_ms.filter_source_preparation_ms, 3.0);
+        assert_eq!(stats.p95_ms.filter_source_preparation_ms, 5.0);
     }
 
     #[test]
@@ -7203,11 +7401,31 @@ mod tests {
         assert!(parse_artifact_v1(wrong_profile)
             .unwrap_err()
             .contains("profile"));
-        let mut inconsistent = valid;
+        let mut inconsistent = valid.clone();
         inconsistent["counts"]["events"] = serde_json::json!(999);
         assert!(parse_artifact_v1(inconsistent)
             .unwrap_err()
             .contains("counts"));
+
+        let mut incomplete_current = valid;
+        incomplete_current["measurements"]
+            .as_object_mut()
+            .unwrap()
+            .remove("filtered_search_phases");
+        assert!(parse_artifact_v1(incomplete_current)
+            .unwrap_err()
+            .contains("incomplete current search phase evidence"));
+    }
+
+    #[test]
+    fn pre_phase_v1_artifact_fixture_remains_compatible() {
+        let value: serde_json::Value =
+            serde_json::from_str(include_str!("../fixtures/large-profile-v1-pre-phases.json"))
+                .unwrap();
+        let artifact = parse_artifact_v1(value).unwrap();
+        assert!(artifact.environment.command.is_none());
+        assert!(artifact.measurements.ordinary_search_phases.is_none());
+        assert!(artifact.measurements.filtered_search_phases.is_none());
     }
 
     #[test]
@@ -7546,12 +7764,15 @@ mod tests {
         };
         let mut warm_samples = Vec::with_capacity(cfg.measurement_repeats);
         let mut filtered_samples = Vec::with_capacity(cfg.measurement_repeats);
+        let mut warm_phase_samples = Vec::with_capacity(cfg.measurement_repeats);
+        let mut filtered_phase_samples = Vec::with_capacity(cfg.measurement_repeats);
         let mut warm = None;
         let mut filt = None;
         for _ in 0..cfg.measurement_repeats {
-            let started = std::time::Instant::now();
-            let current = search_packet(&store, "perfneedle", &opts).map_err(|e| e.to_string())?;
-            warm_samples.push(elapsed_ms(started.elapsed()));
+            let measured = measured_profile_search(&store, "perfneedle", &opts)?;
+            let current = measured.packet;
+            warm_samples.push(measured.phases.end_to_end_ms);
+            warm_phase_samples.push(measured.phases);
             if current.results.is_empty() {
                 return Err("ordinary search results must be nonempty".into());
             }
@@ -7563,10 +7784,10 @@ mod tests {
                 warm = Some(current);
             }
 
-            let started = std::time::Instant::now();
-            let current =
-                search_packet(&store, "perfneedle", &filtered_opts).map_err(|e| e.to_string())?;
-            filtered_samples.push(elapsed_ms(started.elapsed()));
+            let measured = measured_profile_search(&store, "perfneedle", &filtered_opts)?;
+            let current = measured.packet;
+            filtered_samples.push(measured.phases.end_to_end_ms);
+            filtered_phase_samples.push(measured.phases);
             if current.results.is_empty() {
                 return Err("filtered search results must be nonempty".into());
             }
@@ -7582,6 +7803,8 @@ mod tests {
         let filt = filt.unwrap();
         let warm_stats = timing_stats(&warm_samples);
         let filt_stats = timing_stats(&filtered_samples);
+        let warm_phase_stats = search_phase_stats(warm_phase_samples);
+        let filtered_phase_stats = search_phase_stats(filtered_phase_samples);
         let middle_id = synthetic_event_id(imported / 2, cfg.seed)?;
         let window_started = std::time::Instant::now();
         let window = bounded_event_window(&store, middle_id, 1, 1)?;
@@ -7617,13 +7840,13 @@ mod tests {
             "requested": {"baseline_events": cfg.total_events, "min_footprint_bytes": cfg.min_footprint_bytes, "min_footprint_override_env": std::env::var("CTX_LARGE_PROFILE_MIN_FOOTPRINT_BYTES").ok()},
             "achieved": {"baseline_events": imported, "baseline_records": records, "incremental_events": inc.events.len(), "incremental_records": inc.records.len()},
             "config": {"seed": cfg.seed, "events_per_record": cfg.events_per_record, "batch_records": cfg.batch_records, "batch_event_bound": batch_event_bound, "measurement_repeats": cfg.measurement_repeats},
-            "environment": {"os": std::env::consts::OS, "arch": std::env::consts::ARCH, "jj_change": local_jj_id("change"), "jj_commit": local_jj_id("commit"), "cache_state": "warm followed by reopen; true cold cache requires operator OS cache-drop steps"},
+            "environment": {"os": std::env::consts::OS, "arch": std::env::consts::ARCH, "jj_change": local_jj_id("change"), "jj_commit": local_jj_id("commit"), "cache_state": "warm followed by reopen; true cold cache requires operator OS cache-drop steps", "command": profile_command(cfg)},
             "sqlite": sqlite,
             "paths": {"db": canonical_display(&db), "wal": canonical_display(&db.with_extension("sqlite-wal")), "shm": canonical_display(&db.with_extension("sqlite-shm")), "artifact": artifact_path.display().to_string()},
             "storage": {"pre_checkpoint": pre_checkpoint.to_json(), "post_checkpoint": post_checkpoint.to_json()},
             "counts": counts.to_json(),
             "generation": {"max_batch_events": max_batch_events, "bounded_by_batch_size": true},
-            "measurements": {"initial_import_ms": initial_ms, "noop_import_ms": noop_stats.samples_ms[0], "incremental_import_ms": inc_ms, "warm_search_ms": warm_stats.samples_ms[0], "filtered_search_ms": filt_stats.samples_ms[0], "noop_replay": noop_stats.to_json(), "warm_search": warm_stats.to_json(), "filtered_search": filt_stats.to_json(), "noop_counts_unchanged": true},
+            "measurements": {"initial_import_ms": initial_ms, "noop_import_ms": noop_stats.samples_ms[0], "incremental_import_ms": inc_ms, "warm_search_ms": warm_stats.samples_ms[0], "filtered_search_ms": filt_stats.samples_ms[0], "noop_replay": noop_stats.to_json(), "warm_search": warm_stats.to_json(), "filtered_search": filt_stats.to_json(), "ordinary_search_phases": warm_phase_stats, "filtered_search_phases": filtered_phase_stats, "noop_counts_unchanged": true},
             "search": {"ordinary_result_count": warm.results.len(), "filtered_result_count": filt.results.len(), "ordered_result_ids": warm_ids, "result_digest": warm_digest, "filtered_ordered_result_ids": result_ids(&filt), "filtered_result_digest": digest_strings(&result_ids(&filt))},
             "event_window": {"target_event_id": middle_id.to_string(), "ids": window.iter().map(|e| e.id.to_string()).collect::<Vec<_>>(), "count": window.len(), "bound": 3, "contains_target": window.iter().any(|e| e.id == middle_id), "duration_ms": window_ms},
             "checkpoint": {"duration_ms": checkpoint_ms, "pre": pre_checkpoint.to_json(), "post": post_checkpoint.to_json()},
@@ -7760,6 +7983,8 @@ mod tests {
         jj_change: Option<String>,
         jj_commit: Option<String>,
         cache_state: String,
+        #[serde(default)]
+        command: Option<String>,
     }
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -7818,7 +8043,47 @@ mod tests {
         noop_replay: ProfileTimingEvidence,
         warm_search: ProfileTimingEvidence,
         filtered_search: ProfileTimingEvidence,
+        #[serde(default)]
+        ordinary_search_phases: Option<SearchPhaseStats>,
+        #[serde(default)]
+        filtered_search_phases: Option<SearchPhaseStats>,
         noop_counts_unchanged: bool,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct SearchPhaseStats {
+        samples: Vec<SearchPhaseEvidence>,
+        p50_ms: SearchPhasePercentiles,
+        p95_ms: SearchPhasePercentiles,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct SearchPhasePercentiles {
+        filter_source_preparation_ms: f64,
+        execution_candidate_paging_and_base_context_hydration_ms: f64,
+        result_assembly_clustering_sorting_projection_ms: f64,
+        unattributed_overhead_ms: f64,
+        end_to_end_ms: f64,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct SearchPhaseEvidence {
+        path: String,
+        filter_source_preparation_ms: f64,
+        execution_candidate_paging_and_base_context_hydration_ms: f64,
+        result_assembly_clustering_sorting_projection_ms: f64,
+        unattributed_overhead_ms: f64,
+        end_to_end_ms: f64,
+        event_search_statements: u64,
+        candidate_rows_hydrated: u64,
+        candidates_examined: u64,
+        candidates_rejected: u64,
+        candidates_accepted: u64,
+        relation_hydration_statements: u64,
+        hydration_loader_statements: [u64; 2],
     }
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -7959,6 +8224,24 @@ mod tests {
                     || timing.samples_ms.len() != self.config.measurement_repeats
                 {
                     return Err("measurement repeat count mismatch".into());
+                }
+            }
+            let phase_sets = match (
+                self.measurements.ordinary_search_phases.as_ref(),
+                self.measurements.filtered_search_phases.as_ref(),
+            ) {
+                (Some(ordinary), Some(filtered)) => Some([ordinary, filtered]),
+                (None, None) if self.environment.command.is_none() => None,
+                _ => return Err("incomplete current search phase evidence".into()),
+            };
+            for phases in phase_sets.into_iter().flatten() {
+                if phases.samples.len() != self.config.measurement_repeats
+                    || phases.samples.iter().any(|sample| {
+                        !sample.reconciles()
+                            || !matches!(sample.path.as_str(), "fast_event" | "fallback_ranked_fts")
+                    })
+                {
+                    return Err("search phase evidence mismatch".into());
                 }
             }
             if self.event_window.count != self.event_window.ids.len()
@@ -9890,6 +10173,121 @@ mod tests {
 
     fn elapsed_ms(duration: std::time::Duration) -> f64 {
         rounded(duration.as_secs_f64() * 1000.0)
+    }
+
+    struct MeasuredProfileSearch {
+        packet: SearchPacket,
+        phases: SearchPhaseEvidence,
+    }
+
+    fn measured_profile_search(
+        store: &Store,
+        query: &str,
+        options: &PacketOptions,
+    ) -> std::result::Result<MeasuredProfileSearch, String> {
+        let event_statements = store.event_search_page_executions();
+        let rows = store.event_search_rows_hydrated();
+        let relations = store.relation_batch_executions();
+        let loaders = store.search_hydration_loader_executions();
+        let residual = RESIDUAL_COUNTS.get();
+        let started = std::time::Instant::now();
+        let (packet, capture) = capture_search_phases(|| search_packet(store, query, options));
+        let total_ns = duration_ns(started.elapsed());
+        let packet = packet.map_err(|error| error.to_string())?;
+        let accounted_ns = capture
+            .preparation_ns
+            .saturating_add(capture.execution_hydration_ns)
+            .saturating_add(capture.assembly_ns);
+        let residual_after = RESIDUAL_COUNTS.get();
+        let loaders_after = store.search_hydration_loader_executions();
+        let phases = SearchPhaseEvidence {
+            path: match capture.path {
+                SearchProfilePath::FastEvent => "fast_event",
+                SearchProfilePath::FallbackRanked => "fallback_ranked_fts",
+                SearchProfilePath::Unknown => "unknown",
+            }
+            .to_owned(),
+            filter_source_preparation_ms: ns_ms(capture.preparation_ns),
+            execution_candidate_paging_and_base_context_hydration_ms: ns_ms(
+                capture.execution_hydration_ns,
+            ),
+            result_assembly_clustering_sorting_projection_ms: ns_ms(capture.assembly_ns),
+            unattributed_overhead_ms: ns_ms(total_ns.saturating_sub(accounted_ns)),
+            end_to_end_ms: ns_ms(total_ns),
+            event_search_statements: store
+                .event_search_page_executions()
+                .saturating_sub(event_statements),
+            candidate_rows_hydrated: store.event_search_rows_hydrated().saturating_sub(rows),
+            candidates_examined: residual_after[0].saturating_sub(residual[0]),
+            candidates_rejected: residual_after[1].saturating_sub(residual[1]),
+            candidates_accepted: residual_after[2].saturating_sub(residual[2]),
+            relation_hydration_statements: store
+                .relation_batch_executions()
+                .saturating_sub(relations),
+            hydration_loader_statements: [
+                loaders_after[0].saturating_sub(loaders[0]),
+                loaders_after[1].saturating_sub(loaders[1]),
+            ],
+        };
+        Ok(MeasuredProfileSearch { packet, phases })
+    }
+
+    fn ns_ms(ns: u64) -> f64 {
+        rounded(ns as f64 / 1_000_000.0)
+    }
+
+    impl SearchPhaseEvidence {
+        fn reconciles(&self) -> bool {
+            let sum = self.filter_source_preparation_ms
+                + self.execution_candidate_paging_and_base_context_hydration_ms
+                + self.result_assembly_clustering_sorting_projection_ms
+                + self.unattributed_overhead_ms;
+            (sum - self.end_to_end_ms).abs() < 0.002
+        }
+    }
+
+    fn search_phase_stats(samples: Vec<SearchPhaseEvidence>) -> SearchPhaseStats {
+        let calculate = |select: fn(&SearchPhaseEvidence) -> f64, percentile: f64| {
+            let mut values = samples.iter().map(select).collect::<Vec<_>>();
+            values.sort_by(f64::total_cmp);
+            percentile_sorted(&values, percentile)
+        };
+        let at = |percentile: f64| SearchPhasePercentiles {
+            filter_source_preparation_ms: calculate(
+                |sample| sample.filter_source_preparation_ms,
+                percentile,
+            ),
+            execution_candidate_paging_and_base_context_hydration_ms: calculate(
+                |sample| sample.execution_candidate_paging_and_base_context_hydration_ms,
+                percentile,
+            ),
+            result_assembly_clustering_sorting_projection_ms: calculate(
+                |sample| sample.result_assembly_clustering_sorting_projection_ms,
+                percentile,
+            ),
+            unattributed_overhead_ms: calculate(
+                |sample| sample.unattributed_overhead_ms,
+                percentile,
+            ),
+            end_to_end_ms: calculate(|sample| sample.end_to_end_ms, percentile),
+        };
+        SearchPhaseStats {
+            p50_ms: at(50.0),
+            p95_ms: at(95.0),
+            samples,
+        }
+    }
+
+    fn profile_command(cfg: &LargeProfileConfig) -> String {
+        format!(
+            "CTX_LARGE_PROFILE_EVENTS={} CTX_LARGE_PROFILE_EVENTS_PER_RECORD={} CTX_LARGE_PROFILE_BATCH_RECORDS={} CTX_LARGE_PROFILE_SEED=0x{:x} CTX_LARGE_PROFILE_MEASUREMENT_REPEATS={} CTX_LARGE_PROFILE_OUTPUT={} cargo test --release -p ctx-history-search streaming_large_profile_manual_release -- --ignored --nocapture",
+            cfg.total_events,
+            cfg.events_per_record,
+            cfg.batch_records,
+            cfg.seed,
+            cfg.measurement_repeats,
+            cfg.output_dir.as_ref().map_or("<unset>".into(), |path| path.display().to_string()),
+        )
     }
 
     fn timing_stats(samples: &[f64]) -> PerfTimingStats {

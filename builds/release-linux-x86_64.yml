@@ -1,6 +1,6 @@
 image: nixos/unstable
 arch: x86_64
-oauth: git.sr.ht/OBJECTS:RW git.sr.ht/REPOSITORIES:RO git.sr.ht/PROFILE:RO builds.sr.ht/JOBS:RW builds.sr.ht/SECRETS:RO meta.sr.ht/PROFILE:RO pages.sr.ht/PAGES:RW
+oauth: git.sr.ht/OBJECTS:RW git.sr.ht/REPOSITORIES:RO git.sr.ht/PROFILE:RO builds.sr.ht/JOBS:RW builds.sr.ht/SECRETS:RO builds.sr.ht/PROFILE:RO meta.sr.ht/PROFILE:RO pages.sr.ht/PAGES:RW
 environment:
   GIT_CONFIG_COUNT: "1"
   GIT_CONFIG_KEY_0: http.userAgent

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Changed
+
+- Adopted the fleet's fail-closed, resumable release workflow, including a
+  documented readiness check and a Nix contract check that prevents the release
+  CLI and operator instructions from drifting.
 
 ## v1.1.0 - 2026-08-09
 

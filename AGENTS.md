@@ -76,31 +76,30 @@ This is a hard fork of [ctxrs/ctx](https://github.com/ctxrs/ctx) maintained at
 
 ## Release flow
 
-- Standard interface (no hand-editing manifests, no host jj aliases — the old
-  host-level `jj tag-push` is superseded by `nix run .#release-tag`):
-  - `nix run .#prepare-release -- --version X.Y.Z` bumps
-    `crates/ctx-cli/Cargo.toml` + `Cargo.lock`, converts the CHANGELOG.md
-    `## Unreleased` section into a dated `## vX.Y.Z` entry (generating bullets
-    from conventional commits if it is empty), and rewrites the artifact
-    filenames in `builds/release-linux-x86_64.yml`.
-  - `nix run .#release-tag` creates `vX.Y.Z` from the Cargo.toml version via
-    `jj tag set` and pushes it to origin.
-  - `nix run .#release -- --version X.Y.Z [--publish-pages]
-    [--submit-linux-build] [--skip-validate|--skip-tag|--skip-artifact|--skip-pages]`
-    orchestrates the whole flow: prepare → validate (`ci-fmt`, `ci-clippy`,
-    `ci-test`, `ci-docs`) → tag + move the `main` bookmark → build the local
-    `release-artifact` into `dist/downloads/` → `build-pages` (pages publish
-    and Linux build submission are opt-in flags).
+- The routine release interface is exactly these two commands; Tiny should run
+  the readiness check first and proceed only when it succeeds:
+
+    nix run .#release -- --version X.Y.Z --check
+    nix run .#release -- --version X.Y.Z [--submit-linux-build]
+
+  The non-mutating check fails fast on a dirty/stale/diverged checkout, missing
+  origin or SourceHut authentication, an invalid/downgrade version, and local or
+  remote tag conflicts. The release then prepares the versioned tree; validates
+  that prepared tree with fmt, clippy, tests, and docs; builds and verifies the
+  artifact and checksum; and atomically publishes `main` plus an annotated tag
+  with a lease. Artifact uploads and the downloads-site refresh are idempotent;
+  Linux submission is also idempotent when requested. If publication succeeded
+  but a later step failed, rerun the exact same command: only an exact matching
+  version, tag, and main state resumes, while mismatches fail closed. Successful
+  publication leaves a new empty `@` above `main`.
 - `builds/release-linux-x86_64.yml` builds the Linux `release-artifact` and
-  publishes the downloads page (https://averagechris.srht.site/ctx/) via
-  `build-pages` + `publish-pages`. It lives in `builds/` (not `.builds/`) so
-  it does not auto-run on every push; submit it explicitly with
-  `nix run .#release -- --submit-linux-build` or
-  `srht builds submit --secrets builds/release-linux-x86_64.yml`.
-- The darwin artifact is built/published locally by the orchestrator, or by
-  hand: `nix build .#release-artifact`, copy the outputs into
-  `dist/downloads/`, then `nix run .#build-pages -- --include-existing-downloads`
-  and `nix run .#publish-pages`.
+  uploads it and requests a downloads-site refresh. It lives in `builds/` (not
+  `.builds/`) so it does not auto-run on every push; request it through the
+  routine release command's optional argument.
+- `prepare-release`, `release-tag`, `build-pages`, and `publish-pages` are
+  lower-level recovery tools only. Do not compose them into the
+  normal release path; inspect their help and release state before using one
+  during manual recovery.
 
 ## Upstream review memory
 

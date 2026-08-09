@@ -31,6 +31,7 @@
           # CLI tests spawn python3 history-source plugin helpers; the nixos
           # CI image has no system python3.
           ciExtraInputs = [pkgs.python3];
+          releaseValidationApps = ["ci-docs"];
         };
 
         ctx = pkgs.rustPlatform.buildRustPackage {
@@ -573,6 +574,31 @@
 
         checks = {
           build = ctx;
+          release-contract =
+            pkgs.runCommand "ctx-release-contract" {
+              nativeBuildInputs = [pkgs.gnugrep];
+            } ''
+              help="$(${fleetApps.apps.release.program} --help)"
+              printf '%s\n' "$help" | grep -Fqx \
+                'usage: release --version X.Y.Z [--check] [--allow-downgrade] [--submit-linux-build]'
+              printf '%s\n' "$help" | grep -Fq -- \
+                '--check               verify release readiness without editing files or publishing refs'
+              printf '%s\n' "$help" | grep -Fq -- \
+                '--submit-linux-build  submit the Linux release build after publication'
+
+              grep -Fqx '    nix run .#release -- --version X.Y.Z --check' ${./AGENTS.md}
+              grep -Fqx '    nix run .#release -- --version X.Y.Z [--submit-linux-build]' ${./AGENTS.md}
+
+              if printf '%s\n' "$help" | grep -Eq -- '--(skip-(validate|tag|artifact|pages)|publish-pages)'; then
+                printf '%s\n' 'release help exposes an obsolete skip/page flag' >&2
+                exit 1
+              fi
+              if grep -Eq -- '--(skip-(validate|tag|artifact|pages)|publish-pages)' ${./AGENTS.md}; then
+                printf '%s\n' 'AGENTS.md documents an obsolete skip/page flag' >&2
+                exit 1
+              fi
+              touch "$out"
+            '';
         };
 
         devShells.default = pkgs.mkShell {

@@ -59,13 +59,14 @@ use ctx_history_query::{
     DEFAULT_PAGE_BYTES, DEFAULT_SHOW_LIMIT, MAX_SHOW_LIMIT,
 };
 use ctx_history_store::{
-    archive_verification_error_code, verify_archive_bundle_with_options, ArchiveOptions,
-    ArchiveVerifyOptions, CatalogSession, CatalogSourceIndexUpdate, IdPrefixResolution,
-    RawSqlOptions, RawSqlResult, RawSqlValue, SourceHealthClassification, SourceImportFile,
-    SourceImportFileIndexUpdate, Store, StoreError, ARCHIVE_MAX_ENTITIES, ARCHIVE_MAX_OBJECTS,
-    ARCHIVE_MAX_OBJECT_BYTES, ARCHIVE_MAX_TOTAL_BYTES, CATALOG_IMPORT_OUTCOME_UNATTRIBUTED_CODE,
-    RAW_SQL_DEFAULT_MAX_COLUMNS, RAW_SQL_DEFAULT_MAX_ROWS, RAW_SQL_DEFAULT_MAX_SQL_BYTES,
-    RAW_SQL_DEFAULT_MAX_VALUE_BYTES, RAW_SQL_MAX_TIMEOUT, SOURCE_IMPORT_ZERO_YIELD_ANOMALY_CODE,
+    archive_verification_error_code, restore_archive_bundle, verify_archive_bundle_with_options,
+    ArchiveOptions, ArchiveVerifyOptions, CatalogSession, CatalogSourceIndexUpdate,
+    IdPrefixResolution, RawSqlOptions, RawSqlResult, RawSqlValue, SourceHealthClassification,
+    SourceImportFile, SourceImportFileIndexUpdate, Store, StoreError, ARCHIVE_MAX_ENTITIES,
+    ARCHIVE_MAX_OBJECTS, ARCHIVE_MAX_OBJECT_BYTES, ARCHIVE_MAX_TOTAL_BYTES,
+    CATALOG_IMPORT_OUTCOME_UNATTRIBUTED_CODE, RAW_SQL_DEFAULT_MAX_COLUMNS,
+    RAW_SQL_DEFAULT_MAX_ROWS, RAW_SQL_DEFAULT_MAX_SQL_BYTES, RAW_SQL_DEFAULT_MAX_VALUE_BYTES,
+    RAW_SQL_MAX_TIMEOUT, SOURCE_IMPORT_ZERO_YIELD_ANOMALY_CODE,
 };
 use history_source_plugins::{
     discover_history_source_plugins, discover_history_source_plugins_with_diagnostics,
@@ -143,6 +144,8 @@ enum ArchiveCommand {
     Create(ArchiveCreateArgs),
     #[command(about = "Verify a complete archive bundle without modifying it")]
     Verify(ArchiveVerifyArgs),
+    #[command(about = "Restore a verified archive into a strictly absent data root")]
+    Restore(ArchiveRestoreArgs),
 }
 
 #[derive(Debug, Args)]
@@ -158,6 +161,27 @@ struct ArchiveVerifyArgs {
     #[arg(help = "Published archive bundle directory")]
     bundle: PathBuf,
     #[arg(long)]
+    json: bool,
+    #[arg(long, default_value_t = ARCHIVE_MAX_ENTITIES)]
+    max_entities: u64,
+    #[arg(long, default_value_t = ARCHIVE_MAX_OBJECTS)]
+    max_objects: u64,
+    #[arg(long, default_value_t = ARCHIVE_MAX_OBJECT_BYTES)]
+    max_object_bytes: u64,
+    #[arg(long, default_value_t = ARCHIVE_MAX_TOTAL_BYTES)]
+    max_bytes: u64,
+}
+
+#[derive(Debug, Args)]
+struct ArchiveRestoreArgs {
+    #[arg(help = "Published archive bundle directory")]
+    bundle: PathBuf,
+    #[arg(help = "Strictly absent destination data-root directory")]
+    target: PathBuf,
+    #[arg(
+        long,
+        help = "Emit JSON on success and typed verifier rejection envelopes; destination and restore failures remain ordinary errors"
+    )]
     json: bool,
     #[arg(long, default_value_t = ARCHIVE_MAX_ENTITIES)]
     max_entities: u64,
@@ -1794,6 +1818,61 @@ fn run_archive(args: ArchiveArgs, data_root: PathBuf) -> Result<()> {
     match args.command {
         ArchiveCommand::Create(create) => run_archive_create(create, data_root),
         ArchiveCommand::Verify(verify) => run_archive_verify(verify),
+        ArchiveCommand::Restore(restore) => run_archive_restore(restore),
+    }
+}
+
+fn run_archive_restore(args: ArchiveRestoreArgs) -> Result<()> {
+    let options = ArchiveVerifyOptions {
+        max_entities: args.max_entities,
+        max_objects: args.max_objects,
+        max_object_bytes: args.max_object_bytes,
+        max_total_bytes: args.max_bytes,
+    };
+    match restore_archive_bundle(&args.bundle, &args.target, options) {
+        Ok(report) => {
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&json!({
+                        "format": "ctx-archive", "format_version": 1,
+                        "archive_id": report.archive_id, "source_schema_version": report.source_schema_version,
+                        "path": report.path, "restored": true, "entity_count": report.entity_count,
+                        "objects": {"count": report.object_count, "total_bytes": report.object_bytes},
+                    }))?
+                );
+            } else {
+                println!(
+                    "restored archive {} ({} entities, {} objects): {}",
+                    report.archive_id,
+                    report.entity_count,
+                    report.object_count,
+                    report.path.display()
+                );
+            }
+            Ok(())
+        }
+        Err(error) => {
+            if let Some(code) = archive_verification_error_code(&error) {
+                let message = archive_verification_message(code);
+                if args.json {
+                    eprintln!(
+                        "{}",
+                        serde_json::to_string(
+                            &json!({"error":{"code":code,"message":message,"path":args.bundle}})
+                        )?
+                    );
+                } else {
+                    eprintln!(
+                        "archive verification failed [{code}] for {}: {message}",
+                        args.bundle.display()
+                    );
+                }
+                Err(anyhow::Error::new(SilentExit { code: 1 }))
+            } else {
+                Err(error.into())
+            }
+        }
     }
 }
 

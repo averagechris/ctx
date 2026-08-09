@@ -36,12 +36,36 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 mod archive;
+#[cfg(unix)]
+mod restore;
 pub use archive::{
     archive_verification_error_code, verify_archive_bundle, verify_archive_bundle_with_options,
     ArchiveOptions, ArchiveReport, ArchiveStreamReport, ArchiveVerificationCode,
     ArchiveVerificationReport, ArchiveVerifyOptions, ARCHIVE_MAX_ENTITIES, ARCHIVE_MAX_OBJECTS,
     ARCHIVE_MAX_OBJECT_BYTES, ARCHIVE_MAX_TOTAL_BYTES,
 };
+#[cfg(unix)]
+pub use restore::{restore_archive_bundle, ArchiveRestoreReport};
+#[cfg(not(unix))]
+#[derive(Debug, Clone)]
+pub struct ArchiveRestoreReport {
+    pub path: PathBuf,
+    pub archive_id: Uuid,
+    pub source_schema_version: i64,
+    pub entity_count: u64,
+    pub object_count: u64,
+    pub object_bytes: u64,
+}
+#[cfg(not(unix))]
+pub fn restore_archive_bundle(
+    _bundle: &Path,
+    _target: &Path,
+    _options: ArchiveVerifyOptions,
+) -> Result<ArchiveRestoreReport> {
+    Err(StoreError::Archive(
+        "archive restore requires descriptor-relative Unix filesystem APIs".into(),
+    ))
+}
 const BATCH_RECORD_ID_CHUNK_SIZE: usize = 500;
 #[derive(Debug, Error)]
 pub enum StoreError {

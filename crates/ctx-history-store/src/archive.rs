@@ -71,7 +71,7 @@ const PROVIDERS: [&str; 19] = [
 ];
 
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
-const MAX_JSONL_LINE_BYTES: usize = 32 * 1024 * 1024;
+pub(super) const MAX_JSONL_LINE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_COMPLETE_BYTES: usize = 4 * 1024;
 /// Fixed v1 verifier ceilings.  An invocation may lower these ceilings, but
@@ -172,7 +172,7 @@ impl std::fmt::Display for ArchiveVerificationCode {
 }
 
 #[cfg(unix)]
-struct AnchoredDir(File);
+pub(super) struct AnchoredDir(pub(super) File);
 
 #[cfg(unix)]
 struct DirStream(*mut libc::DIR);
@@ -212,7 +212,7 @@ fn normalize_macos_trusted_root_alias(path: &Path) -> PathBuf {
 
 #[cfg(unix)]
 impl AnchoredDir {
-    fn open_path(path: &Path) -> Result<Self> {
+    pub(super) fn open_path(path: &Path) -> Result<Self> {
         use std::path::Component;
         #[cfg(target_os = "macos")]
         let normalized = normalize_macos_trusted_root_alias(path);
@@ -254,11 +254,11 @@ impl AnchoredDir {
         Ok(Self(dir))
     }
 
-    fn dir(&self, name: &str) -> Result<Self> {
+    pub(super) fn dir(&self, name: &str) -> Result<Self> {
         Ok(Self(openat(&self.0, std::ffi::OsStr::new(name), true)?))
     }
 
-    fn file(&self, name: &str) -> Result<File> {
+    pub(super) fn file(&self, name: &str) -> Result<File> {
         openat(&self.0, std::ffi::OsStr::new(name), false)
     }
 
@@ -1331,6 +1331,25 @@ pub fn verify_archive_bundle_with_options(
     path: impl AsRef<Path>,
     options: ArchiveVerifyOptions,
 ) -> Result<ArchiveVerificationReport> {
+    #[cfg(unix)]
+    return verify_archive_bundle_internal(path.as_ref(), options).map(|verified| verified.report);
+    #[cfg(not(unix))]
+    {
+        validate_verifier_options(options)?;
+        verify_v1_bundle(path.as_ref(), options, true).map(|verified| verified.report)
+    }
+}
+
+#[cfg(unix)]
+pub(super) fn verify_archive_bundle_internal(
+    path: &Path,
+    options: ArchiveVerifyOptions,
+) -> Result<VerifiedArchive> {
+    validate_verifier_options(options)?;
+    verify_v1_bundle(path, options, true)
+}
+
+fn validate_verifier_options(options: ArchiveVerifyOptions) -> Result<()> {
     let fixed = ArchiveVerifyOptions::default();
     if options.max_entities > fixed.max_entities
         || options.max_objects > fixed.max_objects
@@ -1342,7 +1361,7 @@ pub fn verify_archive_bundle_with_options(
             "archive verification cap exceeds the v1 bound",
         ));
     }
-    verify_v1_bundle(path.as_ref(), options, true)
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -2119,20 +2138,22 @@ fn validate_record(stream: usize, object: &OrderedObject) -> Result<()> {
 }
 
 #[derive(Debug, Clone)]
-struct StreamMeta {
-    name: String,
-    path: String,
-    count: u64,
-    bytes: u64,
-    sha256: String,
+pub(super) struct StreamMeta {
+    pub(super) name: String,
+    pub(super) path: String,
+    pub(super) count: u64,
+    pub(super) bytes: u64,
+    pub(super) sha256: String,
 }
 
 #[derive(Debug)]
-struct ManifestInfo {
-    entity_count: u64,
-    object_count: u64,
-    object_bytes: u64,
-    streams: Vec<StreamMeta>,
+pub(super) struct ManifestInfo {
+    pub(super) archive_id: Uuid,
+    pub(super) source_schema_version: i64,
+    pub(super) entity_count: u64,
+    pub(super) object_count: u64,
+    pub(super) object_bytes: u64,
+    pub(super) streams: Vec<StreamMeta>,
 }
 
 fn named_schema(name: &str) -> Vec<FieldSpec> {
@@ -2244,7 +2265,7 @@ fn parse_manifest(bytes: &[u8], options: ArchiveVerifyOptions) -> Result<Manifes
         ));
     }
     required_i64(&object, "created_at_ms")?;
-    required_i64(&object, "source_schema_version")?;
+    let source_schema_version = required_i64(&object, "source_schema_version")?;
     optional_string(&object, "origin_device_id")?;
     let generator = as_object(object_value(&object, "generator")?, "manifest generator")?;
     validate_field_order(generator, &named_schema("generator"))?;
@@ -2328,6 +2349,8 @@ fn parse_manifest(bytes: &[u8], options: ArchiveVerifyOptions) -> Result<Manifes
         ));
     }
     Ok(ManifestInfo {
+        archive_id,
+        source_schema_version,
         entity_count,
         object_count,
         object_bytes,
@@ -2394,7 +2417,7 @@ fn read_bounded_file(mut file: File, maximum: usize, label: &str) -> Result<Vec<
     Ok(bytes)
 }
 
-fn read_capped_line<R: BufRead>(reader: &mut R, line: &mut Vec<u8>) -> Result<usize> {
+pub(super) fn read_capped_line<R: BufRead>(reader: &mut R, line: &mut Vec<u8>) -> Result<usize> {
     line.clear();
     loop {
         let available = reader.fill_buf()?;
@@ -2476,11 +2499,18 @@ fn open_read_nofollow(path: &Path, directory: bool) -> Result<File> {
     Ok(file)
 }
 
+pub(super) struct VerifiedArchive {
+    pub(super) report: ArchiveVerificationReport,
+    pub(super) manifest: ManifestInfo,
+    #[cfg(unix)]
+    pub(super) root: AnchoredDir,
+}
+
 fn verify_v1_bundle(
     stage: &Path,
     options: ArchiveVerifyOptions,
     reject_staging_path: bool,
-) -> Result<ArchiveVerificationReport> {
+) -> Result<VerifiedArchive> {
     if reject_staging_path
         && stage
             .file_name()
@@ -2629,11 +2659,16 @@ fn verify_v1_bundle(
             "manifest object totals mismatch",
         ));
     }
-    Ok(ArchiveVerificationReport {
-        path: stage.to_path_buf(),
-        entity_count: entities,
-        object_count,
-        object_bytes,
+    Ok(VerifiedArchive {
+        report: ArchiveVerificationReport {
+            path: stage.to_path_buf(),
+            entity_count: entities,
+            object_count,
+            object_bytes,
+        },
+        manifest,
+        #[cfg(unix)]
+        root,
     })
 }
 
@@ -4227,6 +4262,83 @@ mod tests {
             bytes
         );
         assert_eq!(report.object_count, 1);
+
+        let restored_root = temp.path().join("restored-root");
+        crate::restore_archive_bundle(&first, &restored_root, ArchiveVerifyOptions::default())
+            .unwrap();
+        let restored_db = restored_root.join("work.sqlite");
+        let mut restored = Store::open(&restored_db).unwrap();
+        let restored_path: String = restored
+            .conn
+            .query_row(
+                "SELECT blob_path FROM artifacts WHERE id = ?1",
+                [ids[3]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(restored_path, crate::object_relative_path(&hash));
+        let session_refs: (String, String) = restored
+            .conn
+            .query_row(
+                "SELECT parent_session_id, root_session_id FROM sessions WHERE id = ?1",
+                [ids[4]],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(session_refs, (ids[4].into(), ids[4].into()));
+        let projection_counts: (i64, i64, i64, i64) = restored.conn.query_row(
+            "SELECT (SELECT count(*) FROM ctx_history_search), (SELECT count(*) FROM record_search_rowids), (SELECT count(*) FROM event_search), (SELECT count(*) FROM event_search_rowids)",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).unwrap();
+        assert_eq!(projection_counts.0, projection_counts.1);
+        assert_eq!(projection_counts.2, projection_counts.3);
+        assert!(projection_counts.0 > 0 && projection_counts.2 > 0);
+        assert_eq!(
+            restored
+                .conn
+                .query_row::<i64, _, _>("SELECT count(*) FROM source_import_files", [], |row| {
+                    row.get(0)
+                })
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            restored
+                .conn
+                .query_row::<i64, _, _>("SELECT count(*) FROM source_health", [], |row| row.get(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            restored
+                .conn
+                .query_row::<i64, _, _>("SELECT count(*) FROM source_health_key", [], |row| row
+                    .get(0))
+                .unwrap(),
+            1
+        );
+        let reexport = temp.path().join("restored-export.ctxar");
+        restored
+            .create_archive(
+                &reexport,
+                ArchiveOptions {
+                    archive_id: Some(Uuid::from_u128(0x11111111111171118111111111111111)),
+                    created_at_ms: Some(9),
+                    generator_version: "test".into(),
+                },
+            )
+            .unwrap();
+        for (_, file, _) in STREAMS {
+            assert_eq!(
+                fs::read(first.join("streams").join(file)).unwrap(),
+                fs::read(reexport.join("streams").join(file)).unwrap(),
+                "stream {file}"
+            );
+        }
+        assert_eq!(
+            fs::read(first.join("objects").join(&hash[..2]).join(&hash)).unwrap(),
+            fs::read(reexport.join("objects").join(&hash[..2]).join(&hash)).unwrap()
+        );
     }
 
     #[cfg(unix)]

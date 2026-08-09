@@ -86,6 +86,80 @@ fn archive_create_has_json_and_human_contract_and_private_atomic_layout() {
     assert!(stdout.contains("created archive"));
 }
 
+#[test]
+fn archive_restore_cli_restores_fresh_root_and_rejects_existing_target() {
+    let temp = tempdir();
+    json_output(ctx(&temp).args(["setup", "--catalog-only", "--progress", "none", "--json"]));
+    let bundle = temp.path().join("backup.ctxar");
+    json_output(ctx(&temp).args(["archive", "create", bundle.to_str().unwrap(), "--json"]));
+    let target = temp.path().join("restored-root");
+    let report = json_output(ctx(&temp).args([
+        "archive",
+        "restore",
+        bundle.to_str().unwrap(),
+        target.to_str().unwrap(),
+        "--json",
+    ]));
+    assert_eq!(report["restored"], true);
+    assert_eq!(report["entity_count"], 0);
+    assert!(target.join("work.sqlite").is_file());
+    assert!(!target.join("work.sqlite-wal").exists());
+    assert!(!target.join("work.sqlite-shm").exists());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(target.join("work.sqlite"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    let (_, stderr) = failure_output_code(
+        ctx(&temp).args([
+            "archive",
+            "restore",
+            bundle.to_str().unwrap(),
+            target.to_str().unwrap(),
+        ]),
+        1,
+    );
+    assert!(stderr.contains("already exists"));
+
+    let nested = bundle.join("nested-root");
+    let (_, stderr) = failure_output_code(
+        ctx(&temp).args([
+            "archive",
+            "restore",
+            bundle.to_str().unwrap(),
+            nested.to_str().unwrap(),
+        ]),
+        1,
+    );
+    assert!(stderr.contains("must not contain one another"));
+    verify_archive_bundle(&bundle).unwrap();
+
+    let inverse = bundle.parent().unwrap();
+    let (_, stderr) = failure_output_code(
+        ctx(&temp).args([
+            "archive",
+            "restore",
+            bundle.to_str().unwrap(),
+            inverse.to_str().unwrap(),
+            "--json",
+        ]),
+        1,
+    );
+    assert!(!stderr.contains("\"error\":{"));
+    verify_archive_bundle(&bundle).unwrap();
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn archive_cli_create_and_verify_work_under_system_tmp() {

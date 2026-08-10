@@ -61,11 +61,12 @@ This is a hard fork of [ctxrs/ctx](https://github.com/ctxrs/ctx) maintained at
   v1000 (durable FTS rowid map tables, no rebuild or backfill at migration)
   and continued with v1001 (bounded-pagination covering indexes, reconciled
   from #195; no map or FTS rebuild), v1002 (keyed, path-free advisory
-  source-health ledger), then v1003 (path-free automatic-refresh state and
-  leases; no backfill or search changes). Writable opens migrate ≤v15 and
-  v1000–v1002 stores; versions 16–999 and >1003 fail closed without mutation,
-  and read-only opens require exactly v1003. Future fork migrations continue
-  from 1004. The open-time gate is load-bearing for the map invariants; do
+  source-health ledger), v1003 (path-free automatic-refresh state and leases),
+  then v1004 (bounded path-free OpenCode incremental state; no backfill or
+  search changes). Writable opens migrate ≤v15 and v1000–v1003 stores;
+  versions 16–999 and >1004 fail closed without mutation, and read-only opens
+  require exactly v1004. Future fork migrations continue from 1005. The
+  open-time gate is load-bearing for the map invariants; do
   not weaken it (it cannot evict pre-upgrade processes that already hold a
   connection; restart long-lived ctx processes such as `ctx mcp` after
   upgrading). New provider strings require a

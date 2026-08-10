@@ -4424,10 +4424,10 @@ fn read_only_commands_direct_old_schemas_to_a_writable_migration() {
 
 #[test]
 fn read_only_commands_reject_foreign_schemas_without_impossible_migration_advice() {
-    // 16 sits in the unreviewed upstream gap; 1004 is newer than this
+    // 16 sits in the unreviewed upstream gap; 1005 is newer than this
     // binary. Neither can be migrated by it, so the guidance must say
     // upgrade/restore rather than suggesting a migration command.
-    for version in [16i64, 1004] {
+    for version in [16i64, 1005] {
         let temp = tempdir();
         let db_path = write_bare_store_with_user_version(&temp, version);
         let before = fs::read(&db_path).unwrap();
@@ -4461,7 +4461,7 @@ fn read_only_commands_reject_foreign_schemas_without_impossible_migration_advice
 #[test]
 fn mcp_status_reports_version_guidance_for_foreign_schema() {
     let temp = tempdir();
-    write_bare_store_with_user_version(&temp, 1004);
+    write_bare_store_with_user_version(&temp, 1005);
     let responses = mcp_roundtrip(
         &temp,
         &[
@@ -4493,7 +4493,7 @@ fn mcp_status_reports_version_guidance_for_foreign_schema() {
     assert_eq!(result["isError"], true);
     let error = result["structuredContent"]["error"].as_str().unwrap();
     assert!(
-        error.contains("schema version 1004 is newer than or incompatible with this ctx binary"),
+        error.contains("schema version 1005 is newer than or incompatible with this ctx binary"),
         "{error}"
     );
     assert!(error.contains("upgrade ctx"), "{error}");
@@ -4502,7 +4502,7 @@ fn mcp_status_reports_version_guidance_for_foreign_schema() {
 
 #[test]
 fn mcp_non_status_tools_report_version_guidance_without_mutating() {
-    for version in [15i64, 16, 1004] {
+    for version in [15i64, 16, 1005] {
         let temp = tempdir();
         let db_path = write_bare_store_with_user_version(&temp, version);
         let bytes_before = fs::read(&db_path).unwrap();
@@ -7583,6 +7583,7 @@ fn search_refresh_crash_releases_process_lock_and_fences_reclaimed_lease() {
             "",
             &old_token,
             &[9; 32],
+            None,
         )
         .unwrap());
     assert!(!stale_store
@@ -9075,6 +9076,58 @@ fn opencode_old_cursor_triggers_rescan_that_imports_message_part_history() {
     assert_eq!(third["totals"]["failed"], 0);
     assert_eq!(third["totals"]["imported_events"], 0);
     assert_eq!(third["totals"]["skipped"], 0);
+}
+
+#[test]
+fn opencode_incremental_fallback_reason_is_reported_once() {
+    let temp = tempdir();
+    let query = "opencode-periodic-reconciliation-oracle";
+    let path = write_native_opencode_fixture(&temp, query);
+    let discovered = temp.path().join(".local/share/opencode/opencode.db");
+    fs::create_dir_all(discovered.parent().unwrap()).unwrap();
+    fs::copy(&path, &discovered).unwrap();
+
+    let first = json_output(ctx(&temp).args([
+        "search",
+        query,
+        "--provider",
+        "opencode",
+        "--refresh",
+        "strict",
+        "--json",
+    ]));
+    assert_eq!(first["freshness"]["status"], "completed");
+
+    // Change the source so the next refresh performs a deterministic baseline
+    // fallback without changing refresh semantics.
+    let db = temp.path().join("work.sqlite");
+    let conn = Connection::open(&db).unwrap();
+    drop(conn);
+    let source_conn = Connection::open(&discovered).unwrap();
+    source_conn
+        .execute_batch("CREATE TABLE refresh_test_marker(value TEXT);")
+        .unwrap();
+    drop(source_conn);
+
+    let second = json_output(ctx(&temp).args([
+        "search",
+        query,
+        "--provider",
+        "opencode",
+        "--refresh",
+        "strict",
+        "--json",
+    ]));
+    assert_eq!(second["freshness"]["status"], "completed");
+    assert_eq!(
+        second["freshness"]["totals"]["opencode_scan"]["fallback_reasons"],
+        json!({"schema_not_capable": 1})
+    );
+    assert_eq!(second["freshness"]["totals"]["opencode_scan"]["full"], 1);
+    assert_eq!(
+        second["freshness"]["totals"]["opencode_scan"]["incremental"],
+        0
+    );
 }
 
 #[test]

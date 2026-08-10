@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     env, fs,
     fs::OpenOptions,
     io::{Cursor, IsTerminal, Read, Write},
@@ -34,18 +35,19 @@ use ctx_history_capture::{
     import_cursor_native_history, import_custom_history_jsonl_v1,
     import_custom_history_jsonl_v1_reader, import_factory_ai_droid_sessions,
     import_gemini_cli_history, import_hermes_sqlite, import_nanoclaw_project,
-    import_openclaw_history, import_opencode_sqlite, import_pi_session_jsonl,
-    observe_opencode_sqlite, provider_source_for_path, provider_source_spec, stable_capture_uuid,
-    validate_custom_history_jsonl_v1, validate_custom_history_jsonl_v1_reader,
-    AntigravityCliImportOptions, AstrBotSqliteImportOptions, CaptureError, CatalogSummary,
-    ClaudeProjectsImportOptions, CodexEventImportMode, CodexHistoryImportOptions,
-    CodexSessionCatalogOptions, CodexSessionImportOptions, CodexSessionImportProgress,
-    CodexSessionImportProgressCallback, CodexToolOutputMode, CopilotCliImportOptions,
-    CursorNativeImportOptions, CustomHistoryJsonlV1ImportOptions, FactoryAiDroidImportOptions,
-    GeminiCliImportOptions, HermesSqliteImportOptions, NanoClawImportOptions,
-    OpenClawImportOptions, OpenCodeSqliteImportOptions, PiSessionImportOptions,
-    ProviderImportSummary, ProviderImportSupport, ProviderImportTiming, ProviderSource,
-    ProviderSourceStatus, OPENCODE_CURSOR_V2_PREFIX,
+    import_openclaw_history, import_opencode_sqlite, import_opencode_sqlite_incremental,
+    import_pi_session_jsonl, observe_opencode_sqlite, provider_source_for_path,
+    provider_source_spec, stable_capture_uuid, validate_custom_history_jsonl_v1,
+    validate_custom_history_jsonl_v1_reader, AntigravityCliImportOptions,
+    AstrBotSqliteImportOptions, CaptureError, CatalogSummary, ClaudeProjectsImportOptions,
+    CodexEventImportMode, CodexHistoryImportOptions, CodexSessionCatalogOptions,
+    CodexSessionImportOptions, CodexSessionImportProgress, CodexSessionImportProgressCallback,
+    CodexToolOutputMode, CopilotCliImportOptions, CursorNativeImportOptions,
+    CustomHistoryJsonlV1ImportOptions, FactoryAiDroidImportOptions, GeminiCliImportOptions,
+    HermesSqliteImportOptions, NanoClawImportOptions, OpenClawImportOptions,
+    OpenCodeSqliteImportOptions, PiSessionImportOptions, ProviderImportSummary,
+    ProviderImportSupport, ProviderImportTiming, ProviderSource, ProviderSourceStatus,
+    OPENCODE_CURSOR_V2_PREFIX,
 };
 use ctx_history_core::{
     database_path, default_data_root, utc_now, CaptureProvider, CtxHistoryJsonlRecord, CtxIdPrefix,
@@ -1246,6 +1248,13 @@ struct ImportTotals {
     unchanged_sources: usize,
     refresh_in_progress_sources: usize,
     retry_backoff_sources: usize,
+    opencode_full_scans: usize,
+    opencode_incremental_scans: usize,
+    opencode_session_rows_scanned: u64,
+    opencode_message_rows_scanned: u64,
+    opencode_part_rows_scanned: u64,
+    opencode_journal_rows_scanned: u64,
+    opencode_fallback_reasons: BTreeMap<&'static str, usize>,
     zero_yield_anomaly_sources: usize,
     health_persistence_failures: usize,
     phase_timings: SearchRefreshPhaseTimings,
@@ -3678,6 +3687,17 @@ fn import_totals_json(totals: &ImportTotals) -> Value {
         "retry_backoff_sources": totals.retry_backoff_sources,
         "zero_yield_anomaly_sources": totals.zero_yield_anomaly_sources,
         "health_persistence_failed": totals.health_persistence_failures,
+        "opencode_scan": {
+            "full": totals.opencode_full_scans,
+            "incremental": totals.opencode_incremental_scans,
+            "rows_scanned": {
+                "session": totals.opencode_session_rows_scanned,
+                "message": totals.opencode_message_rows_scanned,
+                "part": totals.opencode_part_rows_scanned,
+                "journal": totals.opencode_journal_rows_scanned,
+            },
+            "fallback_reasons": totals.opencode_fallback_reasons,
+        },
     })
 }
 
@@ -6261,10 +6281,48 @@ fn refresh_sources_for_search(
 
         let mut attempt_observation = observed;
         let mut retried_changed_source = false;
-        let summary = loop {
-            match import_one_source_without_search_refresh(&mut refresh_store, &source, None, false)
+        let prior_cursor = refresh_store.source_refresh_cursor(
+            source.provider.as_str(),
+            source.source_format,
+            &source.path,
+            "",
+        )?;
+        let record = import_record_for_source(&source);
+        let record_id = record.id;
+        refresh_store.upsert_record(&record)?;
+        let (summary, next_cursor) = loop {
+            match import_opencode_sqlite_incremental(
+                &source.path,
+                &mut refresh_store,
+                OpenCodeSqliteImportOptions {
+                    source_path: Some(source.path.clone()),
+                    history_record_id: Some(record_id),
+                    allow_partial_failures: true,
+                    ..OpenCodeSqliteImportOptions::default()
+                },
+                prior_cursor.as_deref(),
+            )
+            .map_err(anyhow::Error::from)
             {
-                Ok(summary) => break summary,
+                Ok(outcome) => {
+                    if let Some(reason) = outcome.fallback_reason {
+                        *totals.opencode_fallback_reasons.entry(reason).or_default() += 1;
+                    }
+                    let next_cursor = outcome.cursor_json;
+                    match outcome.mode {
+                        ctx_history_capture::OpenCodeRefreshScanMode::Full => {
+                            totals.opencode_full_scans += 1
+                        }
+                        ctx_history_capture::OpenCodeRefreshScanMode::Incremental => {
+                            totals.opencode_incremental_scans += 1
+                        }
+                    }
+                    totals.opencode_session_rows_scanned += outcome.session_rows_scanned;
+                    totals.opencode_message_rows_scanned += outcome.message_rows_scanned;
+                    totals.opencode_part_rows_scanned += outcome.part_rows_scanned;
+                    totals.opencode_journal_rows_scanned += outcome.journal_rows_scanned;
+                    break (outcome.summary, next_cursor);
+                }
                 Err(err)
                     if !retried_changed_source && error_is_source_changed_during_read(&err) =>
                 {
@@ -6274,6 +6332,8 @@ fn refresh_sources_for_search(
                 Err(err) => {
                     let code = if error_is_source_changed_during_read(&err) {
                         SourceRefreshErrorCode::SourceChangedDuringRead
+                    } else if error_is_unsupported_incremental_mutation(&err) {
+                        SourceRefreshErrorCode::UnsupportedIncrementalMutation
                     } else {
                         SourceRefreshErrorCode::ProviderReadFailed
                     };
@@ -6297,6 +6357,7 @@ fn refresh_sources_for_search(
             "",
             &token,
             attempt_observation.digest(),
+            next_cursor.as_deref(),
         )? {
             return Err(anyhow!(
                 "OpenCode refresh lease was reclaimed before completion"
@@ -6486,6 +6547,17 @@ fn error_is_source_changed_during_read(error: &anyhow::Error) -> bool {
         cause
             .downcast_ref::<CaptureError>()
             .is_some_and(|capture| matches!(capture, CaptureError::SourceChangedDuringRead))
+    })
+}
+
+fn error_is_unsupported_incremental_mutation(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<CaptureError>().is_some_and(|capture| {
+            matches!(
+                capture,
+                CaptureError::UnsupportedOpenCodeIncrementalMutation(_)
+            )
+        })
     })
 }
 

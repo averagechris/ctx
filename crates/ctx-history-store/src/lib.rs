@@ -978,7 +978,7 @@ impl IdPrefixAmbiguity {
 /// open connection can keep writing until it restarts, which is why release
 /// guidance says to restart long-lived ctx processes after upgrading and
 /// why map entries are verified before every point delete.
-const SCHEMA_VERSION: i64 = 1003;
+const SCHEMA_VERSION: i64 = 1004;
 /// First schema version of this fork's migration chain (the v1000 rowid-map
 /// migration). Writable opens migrate every reviewed version at or above
 /// this up to [`SCHEMA_VERSION`]; the fork chain has no gaps.
@@ -2798,6 +2798,9 @@ impl Store {
         if user_version < 1003 {
             migrate_to_v1003(&self.conn)?;
         }
+        if user_version < 1004 {
+            migrate_to_v1004(&self.conn)?;
+        }
         create_fts_tables_if_supported(&self.conn)?;
         // Recreate dropped rowid map tables empty on open; an empty map is
         // always safe (writes degrade to the legacy full-scan path and each
@@ -3799,6 +3802,7 @@ impl Store {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn complete_source_refresh(
         &self,
         provider: &str,
@@ -3807,13 +3811,33 @@ impl Store {
         logical_id: &str,
         token: &str,
         successful_observation: &[u8; 32],
+        incremental_cursor: Option<&str>,
     ) -> Result<bool> {
         let source_key = self.source_identity_key(provider, format, logical_path, logical_id)?;
         let changed = self.conn.execute(
-            "UPDATE source_refresh_state SET successful_signature=?3, observed_signature=?3, success_count=success_count+1, last_success_at_ms=?4, failure_count=0, next_retry_at_ms=NULL, last_error_code=NULL, lease_token=NULL, lease_expires_at_ms=NULL WHERE source_key=?1 AND lease_token=?2",
-            params![source_key, token, successful_observation.as_slice(), utc_now().timestamp_millis()],
+            "UPDATE source_refresh_state SET successful_signature=?3, observed_signature=?3, success_count=success_count+1, last_success_at_ms=?4, incremental_cursor=?5, failure_count=0, next_retry_at_ms=NULL, last_error_code=NULL, lease_token=NULL, lease_expires_at_ms=NULL WHERE source_key=?1 AND lease_token=?2",
+            params![source_key, token, successful_observation.as_slice(), utc_now().timestamp_millis(), incremental_cursor],
         )?;
         Ok(changed == 1)
+    }
+
+    pub fn source_refresh_cursor(
+        &self,
+        provider: &str,
+        format: &str,
+        logical_path: &Path,
+        logical_id: &str,
+    ) -> Result<Option<String>> {
+        let source_key = self.source_identity_key(provider, format, logical_path, logical_id)?;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT incremental_cursor FROM source_refresh_state WHERE source_key=?1",
+                [source_key],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -8401,6 +8425,29 @@ fn migrate_to_v1003(conn: &Connection) -> Result<()> {
     }
 }
 
+/// Adds only compact provider state. No content, projection, or rowid-map
+/// table is read or changed by this atomic migration.
+fn migrate_to_v1004(conn: &Connection) -> Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let migration = conn.execute_batch(
+        r#"
+        ALTER TABLE source_refresh_state ADD COLUMN incremental_cursor TEXT
+          CHECK (incremental_cursor IS NULL OR length(CAST(incremental_cursor AS BLOB)) <= 4096);
+        PRAGMA user_version = 1004;
+    "#,
+    );
+    match migration {
+        Ok(()) => {
+            conn.execute_batch("COMMIT;")?;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(StoreError::Sql(err))
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceRefreshClaim {
     Acquired { token: String },
@@ -8413,6 +8460,7 @@ pub enum SourceRefreshClaim {
 pub enum SourceRefreshErrorCode {
     SourceChangedDuringRead,
     ProviderReadFailed,
+    UnsupportedIncrementalMutation,
 }
 
 impl SourceRefreshErrorCode {
@@ -8420,6 +8468,7 @@ impl SourceRefreshErrorCode {
         match self {
             Self::SourceChangedDuringRead => "source_changed_during_read",
             Self::ProviderReadFailed => "provider_read_failed",
+            Self::UnsupportedIncrementalMutation => "unsupported_incremental_mutation",
         }
     }
 }
@@ -15428,7 +15477,7 @@ mod search_rowid_map_tests {
         );
 
         let store = Store::open(&path).unwrap();
-        assert_eq!(user_version(&store), 1003);
+        assert_eq!(user_version(&store), 1004);
         assert_eq!(user_version(&store), SCHEMA_VERSION);
 
         // The maps exist and start empty: no backfill.
@@ -15483,7 +15532,7 @@ mod search_rowid_map_tests {
         let temp = tempdir();
         let store = Store::open(temp.path().join("work.sqlite")).unwrap();
         assert_eq!(user_version(&store), SCHEMA_VERSION);
-        assert_eq!(user_version(&store), 1003);
+        assert_eq!(user_version(&store), 1004);
         // The upstream chain ran first: its v13+ stable views exist.
         assert_eq!(
             count(
@@ -15537,15 +15586,15 @@ mod search_rowid_map_tests {
         drop(Store::open(&future_path).unwrap());
         Connection::open(&future_path)
             .unwrap()
-            .execute_batch("PRAGMA user_version = 1004;")
+            .execute_batch("PRAGMA user_version = 1005;")
             .unwrap();
         assert!(matches!(
             Store::open(&future_path),
-            Err(StoreError::UnsupportedSchemaVersion(1004))
+            Err(StoreError::UnsupportedSchemaVersion(1005))
         ));
         assert!(matches!(
             Store::open_read_only(&future_path),
-            Err(StoreError::UnsupportedSchemaVersion(1004))
+            Err(StoreError::UnsupportedSchemaVersion(1005))
         ));
 
         // Read-only open also requires the exact current version for fork
@@ -15596,7 +15645,7 @@ mod search_rowid_map_tests {
         // persistent PRAGMA (journal_mode = WAL) applied before the version
         // gate would show up as mutated bytes, a changed journal mode, or
         // WAL sidecar files.
-        for version in [16i64, 999, 1004] {
+        for version in [16i64, 999, 1005] {
             let path = temp.path().join(format!("foreign-{version}.sqlite"));
             {
                 let conn = Connection::open(&path).unwrap();
@@ -15712,7 +15761,7 @@ mod search_rowid_map_tests {
         // v1001 pagination indexes): data intact, maps recreated empty,
         // lazy healing resumes.
         let store = Store::open(&path).unwrap();
-        assert_eq!(user_version(&store), 1003);
+        assert_eq!(user_version(&store), 1004);
         assert_eq!(
             count(&store, "SELECT COUNT(*) FROM record_search_rowids"),
             0
@@ -15854,7 +15903,7 @@ mod search_rowid_map_tests {
 
         // A writable open migrates v1000 → v1001 in place.
         let store = Store::open(&path).unwrap();
-        assert_eq!(user_version(&store), 1003);
+        assert_eq!(user_version(&store), 1004);
         for index in [
             "idx_sessions_provider_external_session_started",
             "idx_events_session_seq_id",
@@ -16687,6 +16736,181 @@ mod catalog_tests {
         }
     }
 
+    fn migration_record(id: Uuid) -> HistoryRecord {
+        let mut record = HistoryRecord::new(
+            "Migration record title",
+            "migration record needle body",
+            vec!["migration".into()],
+            "task",
+            None,
+        );
+        record.id = id;
+        record.created_at = fixed_time();
+        record.updated_at = fixed_time();
+        record
+    }
+
+    fn migration_event(id: Uuid, history_record_id: Uuid) -> Event {
+        Event {
+            id,
+            seq: 1,
+            history_record_id: Some(history_record_id),
+            session_id: None,
+            run_id: None,
+            event_type: EventType::Message,
+            role: Some(EventRole::User),
+            occurred_at: fixed_time(),
+            capture_source_id: None,
+            payload: serde_json::json!({"text": "migration event needle body"}),
+            payload_blob_id: None,
+            dedupe_key: None,
+            redaction_state: RedactionState::SafePreview,
+            sync: sync_metadata(),
+        }
+    }
+
+    fn seed_migration_search_rows(store: &Store) {
+        let record_id = new_id();
+        let event_id = new_id();
+        store.insert_record(&migration_record(record_id)).unwrap();
+        assert!(store
+            .insert_event_if_absent(&migration_event(event_id, record_id))
+            .unwrap());
+        assert_eq!(
+            store
+                .search_records("migration record needle", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .search_event_hits("migration event needle", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    type RecordFtsRow = (i64, String, String, String, String, String, String, String);
+    type EventFtsRow = (
+        i64,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+        String,
+    );
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct MigrationSnapshot {
+        user_version: i64,
+        history_records: Vec<Vec<SqlValue>>,
+        events: Vec<Vec<SqlValue>>,
+        record_fts: Vec<RecordFtsRow>,
+        event_fts: Vec<EventFtsRow>,
+        record_search_rowids: Vec<(String, i64)>,
+        event_search_rowids: Vec<(String, i64)>,
+    }
+
+    fn all_rows(conn: &Connection, table: &str) -> Vec<Vec<SqlValue>> {
+        let mut stmt = conn
+            .prepare(&format!("SELECT * FROM {table} ORDER BY id"))
+            .unwrap();
+        let column_count = stmt.column_count();
+        stmt.query_map([], |row| {
+            (0..column_count)
+                .map(|index| row.get(index))
+                .collect::<rusqlite::Result<Vec<SqlValue>>>()
+        })
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect()
+    }
+
+    fn record_fts_rows(conn: &Connection) -> Vec<RecordFtsRow> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT rowid, record_id, title, summary, primary_user_text, decision_text,
+                        context_text, tag_text
+                   FROM ctx_history_search ORDER BY rowid",
+            )
+            .unwrap();
+        stmt.query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+            ))
+        })
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect()
+    }
+
+    fn event_fts_rows(conn: &Connection) -> Vec<EventFtsRow> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT rowid, event_id, history_record_id, session_id, role,
+                        safe_preview_text, rank_bucket
+                   FROM event_search ORDER BY rowid",
+            )
+            .unwrap();
+        stmt.query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ))
+        })
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect()
+    }
+
+    fn search_rowid_map(conn: &Connection, table: &str) -> Vec<(String, i64)> {
+        let mut stmt = conn
+            .prepare(&format!("SELECT * FROM {table} ORDER BY search_rowid"))
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect()
+    }
+
+    fn migration_snapshot(conn: &Connection) -> MigrationSnapshot {
+        MigrationSnapshot {
+            user_version: conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap(),
+            history_records: all_rows(conn, "history_records"),
+            events: all_rows(conn, "events"),
+            record_fts: record_fts_rows(conn),
+            event_fts: event_fts_rows(conn),
+            record_search_rowids: search_rowid_map(conn, "record_search_rowids"),
+            event_search_rowids: search_rowid_map(conn, "event_search_rowids"),
+        }
+    }
+
+    fn assert_migration_content_unchanged(before: &MigrationSnapshot, after: &MigrationSnapshot) {
+        assert_eq!(after.history_records, before.history_records);
+        assert_eq!(after.events, before.events);
+        assert_eq!(after.record_fts, before.record_fts);
+        assert_eq!(after.event_fts, before.event_fts);
+        assert_eq!(after.record_search_rowids, before.record_search_rowids);
+        assert_eq!(after.event_search_rowids, before.event_search_rowids);
+    }
+
     #[test]
     fn schema_v1001_adds_pagination_indexes_and_read_only_rejects_v15() {
         let temp = tempdir();
@@ -16696,7 +16920,7 @@ mod catalog_tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(user_version, 1003);
+        assert_eq!(user_version, 1004);
         let event_plan = store
             .conn
             .prepare("EXPLAIN QUERY PLAN SELECT id FROM events WHERE session_id = ?1 AND (seq, id) > (?2, ?3) ORDER BY seq, id LIMIT ?4")
@@ -16757,7 +16981,7 @@ mod catalog_tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(migrated_version, 1003);
+        assert_eq!(migrated_version, 1004);
         for index in [
             "idx_events_session_seq_id",
             "idx_sessions_provider_external_session_started",
@@ -16812,7 +17036,8 @@ mod catalog_tests {
                 &path,
                 "",
                 "stale-token",
-                &first
+                &first,
+                None,
             )
             .unwrap());
         assert!(store
@@ -16883,6 +17108,7 @@ mod catalog_tests {
                 "",
                 &stale_token,
                 &changed,
+                None,
             )
             .unwrap());
         let dump: String = store.conn.query_row(
@@ -16923,7 +17149,8 @@ mod catalog_tests {
                 &source,
                 "",
                 &token,
-                &successful
+                &successful,
+                None,
             )
             .unwrap());
         let changed = [4_u8; 32];
@@ -16986,8 +17213,79 @@ mod catalog_tests {
     }
 
     #[test]
+    fn schema_v1003_to_v1004_only_adds_bounded_incremental_state() {
+        let temp = tempdir();
+        let path = temp.path().join("v1003.sqlite");
+        let store = Store::open(&path).unwrap();
+        seed_migration_search_rows(&store);
+        store
+            .conn
+            .execute_batch(
+                "ALTER TABLE source_refresh_state DROP COLUMN incremental_cursor;
+                 PRAGMA user_version = 1003;",
+            )
+            .unwrap();
+        let before = migration_snapshot(&store.conn);
+        assert_eq!(before.user_version, 1003);
+        assert!(!before.history_records.is_empty());
+        assert!(!before.events.is_empty());
+        assert!(!before.record_fts.is_empty());
+        assert!(!before.event_fts.is_empty());
+        assert!(!before.record_search_rowids.is_empty());
+        assert!(!before.event_search_rowids.is_empty());
+        drop(store);
+        let migrated = Store::open(&path).unwrap();
+        let after = migration_snapshot(&migrated.conn);
+        assert_eq!(after.user_version, 1004);
+        assert_migration_content_unchanged(&before, &after);
+        let sql: String = migrated
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                 WHERE type = 'table' AND name = 'source_refresh_state'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(sql.contains("length(CAST(incremental_cursor AS BLOB)) <= 4096"));
+    }
+
+    #[test]
+    fn schema_v1004_column_collision_rolls_back_without_projection_changes() {
+        let temp = tempdir();
+        let path = temp.path().join("v1004-collision.sqlite");
+        let store = Store::open(&path).unwrap();
+        seed_migration_search_rows(&store);
+        store
+            .conn
+            .execute_batch("PRAGMA user_version = 1003;")
+            .unwrap();
+        let before = migration_snapshot(&store.conn);
+        assert_eq!(before.user_version, 1003);
+        assert!(!before.history_records.is_empty());
+        assert!(!before.events.is_empty());
+        assert!(!before.record_fts.is_empty());
+        assert!(!before.event_fts.is_empty());
+        assert!(!before.record_search_rowids.is_empty());
+        assert!(!before.event_search_rowids.is_empty());
+        drop(store);
+        let err = match Store::open(&path) {
+            Ok(_) => panic!("column collision unexpectedly migrated"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("duplicate column name: incremental_cursor"),
+            "{err}"
+        );
+        let conn = Connection::open(&path).unwrap();
+        let after = migration_snapshot(&conn);
+        assert_eq!(after, before);
+    }
+
+    #[test]
     fn writable_open_rejects_in_between_fork_schema_versions_without_mutation() {
-        for version in [16_i64, 999, 1004] {
+        for version in [16_i64, 999, 1005] {
             let temp = tempdir();
             let db = temp.path().join(format!("v{version}.sqlite"));
             let conn = Connection::open(&db).unwrap();

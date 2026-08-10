@@ -80,8 +80,9 @@ shipped.
   changes can stale a token even when logical content appears unchanged.
 - Writable opens migrate known v0-v15 stores through the fork chain (v1000
   rowid maps, v1001 pagination indexes, v1002 path-free source health, then
-  v1003 path-free refresh coordination) and existing v1000–v1002 stores to
-  v1003, each step atomic; versions 16-999 and above 1003 fail closed. Read-only commands require exactly v1003 and never
+  v1003 path-free refresh coordination, then v1004 bounded OpenCode incremental
+  state) and existing v1000–v1003 stores to v1004, each step atomic; versions
+  16-999 and above 1004 fail closed. Read-only commands require exactly v1004 and never
   migrate/write.
 
 ## Operations

@@ -25,7 +25,7 @@ use ctx_history_core::{
     CTX_HISTORY_JSONL_V1_SCHEMA_VERSION, PROVIDER_CAPTURE_ENVELOPE_SCHEMA_VERSION,
 };
 use ctx_history_store::{CatalogSession, Store, StoreError};
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -65,6 +65,8 @@ pub enum CaptureError {
     InvalidProviderTranscriptPath { path: PathBuf, reason: &'static str },
     #[error("source_changed_during_read")]
     SourceChangedDuringRead,
+    #[error("unsupported_opencode_incremental_mutation:{0}")]
+    UnsupportedOpenCodeIncrementalMutation(&'static str),
     #[error("spool writer is already closed")]
     WriterClosed,
     #[error("line {line} in {path:?} is not a valid capture envelope: {source}")]
@@ -539,6 +541,53 @@ impl Default for OpenCodeSqliteImportOptions {
 pub struct OpenCodeSqliteSourceObservation {
     serialized_signature: String,
     digest: [u8; 32],
+}
+
+const OPENCODE_INCREMENTAL_CURSOR_VERSION: u32 = 2;
+const OPENCODE_RECONCILE_RUNS: u32 = 32;
+const OPENCODE_RECONCILE_MS: i64 = 24 * 60 * 60 * 1_000;
+const OPENCODE_EVENT_DELTA_CAP: usize = 4096;
+const OPENCODE_AFFECTED_SESSION_CAP: usize = 512;
+const OPENCODE_CLOSURE_ROW_CAP: usize = 20_000;
+
+/// Compact path-free state used only by automatic OpenCode refresh.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenCodeIncrementalCursor {
+    version: u32,
+    schema_fingerprint: String,
+    event: OpenCodeRowWatermark,
+    session: OpenCodeRowWatermark,
+    message: OpenCodeRowWatermark,
+    part: OpenCodeRowWatermark,
+    source_observation: String,
+    successful_incremental_count: u32,
+    last_full_reconciliation_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpenCodeRowWatermark {
+    max_id: Option<String>,
+    anchor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenCodeRefreshScanMode {
+    Full,
+    Incremental,
+}
+
+#[derive(Debug, Clone)]
+pub struct OpenCodeIncrementalImportResult {
+    pub summary: ProviderImportSummary,
+    pub cursor_json: Option<String>,
+    pub mode: OpenCodeRefreshScanMode,
+    pub fallback_reason: Option<&'static str>,
+    pub session_rows_scanned: u64,
+    pub message_rows_scanned: u64,
+    pub part_rows_scanned: u64,
+    pub journal_rows_scanned: u64,
 }
 
 impl OpenCodeSqliteSourceObservation {
@@ -3502,6 +3551,642 @@ pub fn import_opencode_sqlite(
     import_opencode_sqlite_inner(path.as_ref(), store, options, None)
 }
 
+/// Imports a changed OpenCode source using append high-waters when the exact
+/// current schema and the durable cursor are both trustworthy. Every doubt is
+/// a full scan; a failed call returns no cursor for the caller to persist.
+pub fn import_opencode_sqlite_incremental(
+    path: impl AsRef<Path>,
+    store: &mut Store,
+    options: OpenCodeSqliteImportOptions,
+    cursor_json: Option<&str>,
+) -> Result<OpenCodeIncrementalImportResult> {
+    let path = path.as_ref();
+    let before = observe_opencode_sqlite(path)?;
+    let conn = open_provider_sqlite_readonly(path)?;
+    let snapshot = match opencode_journal_snapshot(&conn, &before) {
+        Ok(snapshot) => snapshot,
+        Err(_) => {
+            drop(conn);
+            let summary = import_opencode_sqlite_inner(path, store, options, None)?;
+            return Ok(OpenCodeIncrementalImportResult {
+                summary,
+                cursor_json: None,
+                mode: OpenCodeRefreshScanMode::Full,
+                fallback_reason: Some("schema_not_capable"),
+                session_rows_scanned: 0,
+                message_rows_scanned: 0,
+                part_rows_scanned: 0,
+                journal_rows_scanned: 0,
+            });
+        }
+    };
+    let now = options.imported_at.timestamp_millis();
+    let mut fallback = None;
+    let mut plan = None;
+    let previous =
+        cursor_json.and_then(|raw| serde_json::from_str::<OpenCodeIncrementalCursor>(raw).ok());
+    if cursor_json.is_some() && previous.is_none() {
+        fallback = Some("malformed_cursor");
+    }
+    if let Some(old) = previous.as_ref() {
+        if snapshot.event.max_id < old.event.max_id {
+            return Err(CaptureError::UnsupportedOpenCodeIncrementalMutation(
+                "journal_regressed_or_was_removed",
+            ));
+        }
+        fallback = opencode_journal_fallback(old, &snapshot, now);
+        if fallback.is_none() {
+            match opencode_journal_plan(&conn, old)? {
+                OpenCodeJournalPlan::Incremental(value) => plan = Some(value),
+                OpenCodeJournalPlan::Full(reason) => fallback = Some(reason),
+                OpenCodeJournalPlan::Unsupported(reason) => {
+                    return Err(CaptureError::UnsupportedOpenCodeIncrementalMutation(reason));
+                }
+            }
+        }
+    } else if fallback.is_none() {
+        fallback = Some("baseline_required");
+    }
+    let selected = plan.as_ref().map(|value| &value.sessions);
+    drop(conn);
+
+    let context = ProviderAdapterContext {
+        machine_id: options.machine_id,
+        source_path: Some(
+            options
+                .source_path
+                .clone()
+                .unwrap_or_else(|| path.to_path_buf()),
+        ),
+        imported_at: options.imported_at,
+        tool_output_mode: CodexToolOutputMode::Full,
+        event_mode: CodexEventImportMode::Rich,
+        include_notices: true,
+    };
+    let started = Instant::now();
+    let mut normalization = normalize_opencode_sqlite_with_hook(path, &context, None, selected)?;
+    normalization.summary.timing.record_normalization(started);
+    let after = observe_opencode_sqlite(path)?;
+    if !before.matches(&after) {
+        return Err(CaptureError::SourceChangedDuringRead);
+    }
+    if normalization.summary.failed > 0 || !normalization.summary.failures.is_empty() {
+        return Err(CaptureError::InvalidPayload(
+            "OpenCode normalization was partial; incremental cursor was not advanced".into(),
+        ));
+    }
+    let summary = import_normalized_provider_captures(
+        store,
+        normalization,
+        NormalizedProviderImportOptions {
+            history_record_id: options.history_record_id,
+            allow_partial_failures: options.allow_partial_failures,
+            persist_cursors: true,
+            wrap_transaction: true,
+            fast_event_inserts: true,
+        },
+    )?;
+    if summary.failed > 0 || !summary.failures.is_empty() {
+        return Err(CaptureError::InvalidPayload(
+            "OpenCode import was partial; incremental cursor was not advanced".into(),
+        ));
+    }
+    let incremental = plan.is_some();
+    let mut next = snapshot;
+    if incremental {
+        next.successful_incremental_count = previous
+            .as_ref()
+            .unwrap()
+            .successful_incremental_count
+            .saturating_add(1);
+        next.last_full_reconciliation_ms = previous.as_ref().unwrap().last_full_reconciliation_ms;
+    }
+    let scanned = plan.as_ref().map_or((0, 0, 0, 0), |value| value.scanned);
+    Ok(OpenCodeIncrementalImportResult {
+        summary,
+        cursor_json: Some(serde_json::to_string(&next)?),
+        mode: if incremental {
+            OpenCodeRefreshScanMode::Incremental
+        } else {
+            OpenCodeRefreshScanMode::Full
+        },
+        fallback_reason: fallback,
+        session_rows_scanned: scanned.0,
+        message_rows_scanned: scanned.1,
+        part_rows_scanned: scanned.2,
+        journal_rows_scanned: scanned.3,
+    })
+}
+
+fn opencode_journal_fallback(
+    old: &OpenCodeIncrementalCursor,
+    new: &OpenCodeIncrementalCursor,
+    now: i64,
+) -> Option<&'static str> {
+    if old.version != OPENCODE_INCREMENTAL_CURSOR_VERSION {
+        return Some("cursor_version");
+    }
+    if old.schema_fingerprint != new.schema_fingerprint {
+        return Some("schema_changed");
+    }
+    if old.successful_incremental_count >= OPENCODE_RECONCILE_RUNS
+        || now.saturating_sub(old.last_full_reconciliation_ms) >= OPENCODE_RECONCILE_MS
+    {
+        return Some("periodic_reconciliation");
+    }
+    for (before, after) in [
+        (&old.event, &new.event),
+        (&old.session, &new.session),
+        (&old.message, &new.message),
+        (&old.part, &new.part),
+    ] {
+        if before.max_id == after.max_id && before.anchor != after.anchor {
+            return Some("anchor_changed");
+        }
+    }
+    None
+}
+
+#[derive(Debug)]
+struct OpenCodeIncrementalPlan {
+    sessions: BTreeSet<String>,
+    scanned: (u64, u64, u64, u64),
+}
+
+enum OpenCodeJournalPlan {
+    Incremental(OpenCodeIncrementalPlan),
+    Full(&'static str),
+    Unsupported(&'static str),
+}
+
+fn opencode_journal_plan(
+    conn: &Connection,
+    old: &OpenCodeIncrementalCursor,
+) -> Result<OpenCodeJournalPlan> {
+    let Some(high) = old.event.max_id.as_deref() else {
+        return Ok(OpenCodeJournalPlan::Full("journal_baseline_empty"));
+    };
+    if opencode_row_anchor(conn, "event", high)?.as_ref() != old.event.anchor.as_ref() {
+        return Ok(OpenCodeJournalPlan::Unsupported(
+            "journal_anchor_missing_or_changed",
+        ));
+    }
+    let detail = conn.prepare("explain query plan select id,aggregate_id,seq,type,data from event where id>?1 order by id limit ?2")?
+        .query_map(params![high, OPENCODE_EVENT_DELTA_CAP as i64 + 1], |r| r.get::<_, String>(3))?
+        .collect::<std::result::Result<Vec<_>, _>>()?.join(" ").to_ascii_lowercase();
+    if !detail.contains("index") && !detail.contains("sqlite_autoindex_event_1") {
+        return Ok(OpenCodeJournalPlan::Full("journal_query_not_indexed"));
+    }
+    let mut stmt = conn.prepare(
+        "select id,aggregate_id,seq,type,data from event where id>?1 order by id limit ?2",
+    )?;
+    let rows = stmt
+        .query_map(params![high, OPENCODE_EVENT_DELTA_CAP as i64 + 1], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if rows.len() > OPENCODE_EVENT_DELTA_CAP {
+        return Ok(OpenCodeJournalPlan::Unsupported("journal_delta_cap"));
+    }
+    if rows.is_empty() {
+        return Ok(OpenCodeJournalPlan::Unsupported(
+            "changed_without_journal_append",
+        ));
+    }
+    let mut sessions = BTreeSet::new();
+    for (id, aggregate, seq, event_type, data) in &rows {
+        if !opencode_id_shape("event", id) || *seq < 0 || !opencode_id_shape("session", aggregate) {
+            return Ok(OpenCodeJournalPlan::Unsupported("malformed_journal_row"));
+        }
+        if !opencode_known_durable_event(event_type) {
+            let reason = if event_type.contains("removed")
+                || event_type.contains("deleted")
+                || event_type.contains("reset")
+            {
+                "journal_deletion_or_reset"
+            } else {
+                "unknown_journal_event"
+            };
+            return Ok(OpenCodeJournalPlan::Unsupported(reason));
+        }
+        let value: Value = match serde_json::from_str(data) {
+            Ok(value) => value,
+            Err(_) => return Ok(OpenCodeJournalPlan::Unsupported("malformed_journal_data")),
+        };
+        if value.get("sessionID").and_then(Value::as_str) != Some(aggregate.as_str()) {
+            return Ok(OpenCodeJournalPlan::Unsupported(
+                "journal_aggregate_mismatch",
+            ));
+        }
+        for key in ["messageID", "assistantMessageID"] {
+            if let Some(message) = value.get(key).and_then(Value::as_str) {
+                if !opencode_id_shape("message", message) {
+                    return Ok(OpenCodeJournalPlan::Full("malformed_projected_id"));
+                }
+                if old
+                    .message
+                    .max_id
+                    .as_deref()
+                    .is_some_and(|max| message <= max)
+                {
+                    return Ok(OpenCodeJournalPlan::Unsupported(
+                        "journal_updates_prebaseline_row",
+                    ));
+                }
+            }
+        }
+        for key in ["textID", "reasoningID"] {
+            if let Some(part) = value
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|id| id.starts_with("prt_"))
+            {
+                if !opencode_id_shape("part", part) {
+                    return Ok(OpenCodeJournalPlan::Full("malformed_projected_id"));
+                }
+                if old.part.max_id.as_deref().is_some_and(|max| part <= max) {
+                    return Ok(OpenCodeJournalPlan::Unsupported(
+                        "journal_updates_prebaseline_row",
+                    ));
+                }
+            }
+        }
+        sessions.insert(aggregate.clone());
+        if sessions.len() > OPENCODE_AFFECTED_SESSION_CAP {
+            return Ok(OpenCodeJournalPlan::Full("affected_session_cap"));
+        }
+    }
+    let list = sql_string_list(&sessions);
+    let session_ids = bounded_string_query(
+        conn,
+        &format!("select id from session where id in ({list}) order by id"),
+        OPENCODE_CLOSURE_ROW_CAP,
+    )?;
+    if session_ids.len() != sessions.len()
+        || session_ids
+            .iter()
+            .any(|id| !opencode_id_shape("session", id))
+    {
+        return Ok(OpenCodeJournalPlan::Full(
+            "missing_or_invalid_session_projection",
+        ));
+    }
+    let message_ids = bounded_string_query(
+        conn,
+        &format!("select id from message where session_id in ({list}) order by session_id,id"),
+        OPENCODE_CLOSURE_ROW_CAP,
+    )?;
+    if message_ids
+        .iter()
+        .any(|id| !opencode_id_shape("message", id))
+    {
+        return Ok(OpenCodeJournalPlan::Full("invalid_message_projection"));
+    }
+    let part_ids = bounded_string_query(
+        conn,
+        &format!("select id from part where session_id in ({list}) order by session_id,id"),
+        OPENCODE_CLOSURE_ROW_CAP,
+    )?;
+    if part_ids.iter().any(|id| !opencode_id_shape("part", id)) {
+        return Ok(OpenCodeJournalPlan::Full("invalid_part_projection"));
+    }
+    let orphans: i64 = conn.query_row(&format!("select exists(select 1 from part p left join message m on m.id=p.message_id where p.session_id in ({list}) and (m.id is null or m.session_id<>p.session_id) limit 1)"), [], |r| r.get(0))?;
+    if orphans != 0 {
+        return Ok(OpenCodeJournalPlan::Full("projection_parent_mismatch"));
+    }
+    let parents = bounded_string_query(
+        conn,
+        &format!("select parent_id from session where id in ({list}) and parent_id is not null order by id"),
+        OPENCODE_AFFECTED_SESSION_CAP,
+    )?;
+    if parents.iter().any(|id| !opencode_id_shape("session", id)) {
+        return Ok(OpenCodeJournalPlan::Full("invalid_session_parent"));
+    }
+    for parent in parents {
+        let exists: i64 = conn.query_row(
+            "select exists(select 1 from session where id=?1)",
+            [parent],
+            |row| row.get(0),
+        )?;
+        if exists == 0 {
+            return Ok(OpenCodeJournalPlan::Full("missing_session_parent"));
+        }
+    }
+    Ok(OpenCodeJournalPlan::Incremental(OpenCodeIncrementalPlan {
+        sessions,
+        scanned: (
+            session_ids.len() as u64,
+            message_ids.len() as u64,
+            part_ids.len() as u64,
+            rows.len() as u64,
+        ),
+    }))
+}
+
+fn bounded_string_query(conn: &Connection, sql: &str, cap: usize) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(&format!("{sql} limit {}", cap + 1))?;
+    let values = stmt
+        .query_map([], |r| r.get(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if values.len() > cap {
+        return Err(CaptureError::UnsupportedOpenCodeIncrementalMutation(
+            "affected_closure_cap",
+        ));
+    }
+    Ok(values)
+}
+
+fn opencode_journal_snapshot(
+    conn: &Connection,
+    observation: &OpenCodeSqliteSourceObservation,
+) -> Result<OpenCodeIncrementalCursor> {
+    for table in ["session", "message", "part"] {
+        if !sqlite_table_exists(conn, table)? || !opencode_current_table_shape(conn, table)? {
+            return Err(CaptureError::InvalidPayload(
+                "OpenCode incremental schema is not capable".into(),
+            ));
+        }
+    }
+    if !opencode_exact_journal_schema(conn)? {
+        return Err(CaptureError::InvalidPayload(
+            "OpenCode durable journal schema/index contract is not exact".into(),
+        ));
+    }
+    for (table, columns) in [
+        ("event", &["id"][..]),
+        ("event_sequence", &["aggregate_id"][..]),
+        ("message", &["session_id"][..]),
+        ("part", &["session_id"][..]),
+        ("part", &["message_id"][..]),
+    ] {
+        if !opencode_has_binary_index_prefix(conn, table, columns)? {
+            return Err(CaptureError::InvalidPayload(format!(
+                "OpenCode {table} index/collation contract is not exact"
+            )));
+        }
+    }
+    if sqlite_table_exists(conn, "session_message")? || sqlite_table_exists(conn, "session_entry")?
+    {
+        return Err(CaptureError::InvalidPayload(
+            "OpenCode fallback tables make incremental projection ambiguous".into(),
+        ));
+    }
+    let schema_fingerprint = opencode_schema_fingerprint(conn)?;
+    let mark = |table: &str| -> Result<OpenCodeRowWatermark> {
+        let max_id: Option<String> =
+            conn.query_row(&format!("select max(id) from {table}"), [], |r| r.get(0))?;
+        if let Some(id) = max_id.as_deref() {
+            if !opencode_id_shape(table, id) {
+                return Err(CaptureError::InvalidPayload(
+                    "OpenCode IDs are not ascending recognized IDs".into(),
+                ));
+            }
+        }
+        let anchor = max_id
+            .as_deref()
+            .map(|id| opencode_row_anchor(conn, table, id))
+            .transpose()?
+            .flatten();
+        Ok(OpenCodeRowWatermark { max_id, anchor })
+    };
+    Ok(OpenCodeIncrementalCursor {
+        version: OPENCODE_INCREMENTAL_CURSOR_VERSION,
+        schema_fingerprint,
+        event: mark("event")?,
+        session: mark("session")?,
+        message: mark("message")?,
+        part: mark("part")?,
+        source_observation: observation.digest_hex(),
+        successful_incremental_count: 0,
+        last_full_reconciliation_ms: utc_now().timestamp_millis(),
+    })
+}
+
+fn opencode_exact_journal_schema(conn: &Connection) -> Result<bool> {
+    let columns = conn
+        .prepare("select name,upper(type),[notnull],pk from pragma_table_xinfo('event')")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })
+            .and_then(|rows| rows.collect::<std::result::Result<Vec<_>, rusqlite::Error>>())
+        });
+    let Ok(columns) = columns else {
+        return Ok(false);
+    };
+    let expected = [
+        ("id", "TEXT", 0, 1),
+        ("aggregate_id", "TEXT", 1, 0),
+        ("seq", "INTEGER", 1, 0),
+        ("type", "TEXT", 1, 0),
+        ("data", "TEXT", 1, 0),
+    ];
+    if columns.len() != expected.len()
+        || columns
+            .iter()
+            .zip(expected)
+            .any(|((n, t, nn, pk), (en, et, enn, epk))| {
+                n != en || t != et || *nn != enn || *pk != epk
+            })
+    {
+        return Ok(false);
+    }
+    let sequence: Vec<(String, String, i64, i64)> = conn
+        .prepare("select name,upper(type),[notnull],pk from pragma_table_info('event_sequence')")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    let expected_sequence = [
+        ("aggregate_id", "TEXT", 0, 1),
+        ("seq", "INTEGER", 1, 0),
+        ("owner_id", "TEXT", 0, 0),
+    ];
+    if sequence.len() != expected_sequence.len()
+        || sequence
+            .iter()
+            .zip(expected_sequence)
+            .any(|((n, t, nn, pk), (en, et, enn, epk))| {
+                n != en || t != et || *nn != enn || *pk != epk
+            })
+    {
+        return Ok(false);
+    }
+    for (index, unique, cols) in [
+        ("event_aggregate_seq_idx", 1, "aggregate_id,seq"),
+        ("event_aggregate_type_seq_idx", 0, "aggregate_id,type,seq"),
+    ] {
+        let found: Option<i64> = conn
+            .query_row(
+                "select [unique] from pragma_index_list('event') where name=?1",
+                [index],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if found != Some(unique) {
+            return Ok(false);
+        }
+        let actual: String = conn.query_row(&format!("select group_concat(name,',') from (select name from pragma_index_xinfo('{index}') where key=1 order by seqno)"), [], |r| r.get(0))?;
+        let binary: i64 = conn.query_row(
+            &format!(
+                "select count(*) from pragma_index_xinfo('{index}') where key=1 and coll<>'BINARY'"
+            ),
+            [],
+            |r| r.get(0),
+        )?;
+        if actual != cols || binary != 0 {
+            return Ok(false);
+        }
+    }
+    let fk: i64 = conn.query_row("select count(*) from pragma_foreign_key_list('event') where [table]='event_sequence' and [from]='aggregate_id' and [to]='aggregate_id' and on_delete='CASCADE'", [], |r| r.get(0))?;
+    Ok(fk == 1)
+}
+
+fn opencode_has_binary_index_prefix(
+    conn: &Connection,
+    table: &str,
+    prefix: &[&str],
+) -> Result<bool> {
+    let indexes = conn
+        .prepare(&format!("select name from pragma_index_list('{table}')"))?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for index in indexes {
+        let escaped = index.replace('\'', "''");
+        let entries = conn
+            .prepare(&format!(
+                "select name,coll from pragma_index_xinfo('{escaped}') where key=1 order by seqno"
+            ))?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if entries.len() >= prefix.len()
+            && entries
+                .iter()
+                .zip(prefix)
+                .all(|((name, collation), expected)| name == expected && collation == "BINARY")
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn opencode_known_durable_event(value: &str) -> bool {
+    const TYPES: &[&str] = &[
+        "agent.switched.1",
+        "model.switched.1",
+        "moved.1",
+        "prompted.1",
+        "prompt.admitted.1",
+        "context.updated.1",
+        "synthetic.1",
+        "shell.started.1",
+        "shell.ended.1",
+        "step.started.1",
+        "step.ended.2",
+        "step.failed.2",
+        "text.started.1",
+        "text.ended.1",
+        "tool.input.started.1",
+        "tool.input.ended.1",
+        "tool.called.1",
+        "tool.progress.1",
+        "tool.success.1",
+        "tool.failed.1",
+        "reasoning.started.1",
+        "reasoning.ended.1",
+        "retried.1",
+        "compaction.started.1",
+        "compaction.ended.1",
+        "revert.staged.1",
+        "revert.cleared.1",
+        "revert.committed.1",
+    ];
+    value
+        .strip_prefix("session.next.")
+        .is_some_and(|tail| TYPES.contains(&tail))
+}
+
+fn opencode_current_table_shape(conn: &Connection, table: &str) -> Result<bool> {
+    let required: &[&str] = match table {
+        "session" => &[
+            "id",
+            "parent_id",
+            "title",
+            "directory",
+            "time_created",
+            "time_updated",
+        ],
+        "message" => &["id", "session_id", "time_created", "time_updated", "data"],
+        "part" => &[
+            "id",
+            "message_id",
+            "session_id",
+            "time_created",
+            "time_updated",
+            "data",
+        ],
+        _ => return Ok(false),
+    };
+    let columns = sqlite_table_columns(conn, table)?;
+    if !required.iter().all(|name| columns.contains(*name)) {
+        return Ok(false);
+    }
+    let pk: i64 = conn.query_row(
+        &format!("select count(*) from pragma_table_info('{table}') where name='id' and pk=1 and type='TEXT'"), [], |r| r.get(0),
+    )?;
+    Ok(pk == 1)
+}
+
+fn opencode_id_shape(table: &str, id: &str) -> bool {
+    let prefix = match table {
+        "session" => "ses_",
+        "message" => "msg_",
+        "part" => "prt_",
+        "event" => "evt_",
+        _ => return false,
+    };
+    id.strip_prefix(prefix).is_some_and(|tail| {
+        tail.len() == 26
+            && tail[..12]
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            && tail[12..].bytes().all(|b| b.is_ascii_alphanumeric())
+    })
+}
+
+fn opencode_row_anchor(conn: &Connection, table: &str, id: &str) -> Result<Option<String>> {
+    let expression = match table {
+        "session" => "quote(id)||'|'||quote(parent_id)||'|'||quote(title)||'|'||quote(directory)||'|'||quote(time_created)||'|'||quote(time_updated)",
+        "message" => "quote(id)||'|'||quote(session_id)||'|'||quote(time_created)||'|'||quote(time_updated)||'|'||quote(data)",
+        "part" => "quote(id)||'|'||quote(message_id)||'|'||quote(session_id)||'|'||quote(time_created)||'|'||quote(time_updated)||'|'||quote(data)",
+        "event" => "quote(id)||'|'||quote(aggregate_id)||'|'||quote(seq)||'|'||quote(type)||'|'||quote(data)",
+        _ => return Ok(None),
+    };
+    let raw: Option<String> = conn
+        .query_row(
+            &format!("select {expression} from {table} where id=?1"),
+            [id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(raw.map(|value| {
+        let digest = Sha256::digest(value.as_bytes());
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    }))
+}
+
 fn import_opencode_sqlite_inner(
     path: &Path,
     store: &mut Store,
@@ -3523,7 +4208,7 @@ fn import_opencode_sqlite_inner(
     let before = observe_opencode_sqlite(path)?;
     let started = Instant::now();
     let mut normalization =
-        normalize_opencode_sqlite_with_hook(path, &context, normalization_hook)?;
+        normalize_opencode_sqlite_with_hook(path, &context, normalization_hook, None)?;
     normalization.summary.timing.record_normalization(started);
     let after = observe_opencode_sqlite(path)?;
     if !before.matches(&after) {
@@ -8580,6 +9265,15 @@ pub const OPENCODE_CURSOR_V2_PREFIX: &str = "opencode-v2:";
 /// integers) already present in existing stores.
 const OPENCODE_MESSAGE_PART_EVENT_INDEX_BASE: i64 = 100_000;
 
+fn sql_string_list(values: &BTreeSet<String>) -> String {
+    // Incremental capability validation admits only identifier-safe IDs.
+    values
+        .iter()
+        .map(|value| format!("'{value}'"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 struct OpenCodeCaptureContext<'a> {
     context: &'a ProviderAdapterContext,
     raw_source_path: String,
@@ -8684,13 +9378,14 @@ fn normalize_opencode_sqlite(
     path: &Path,
     context: &ProviderAdapterContext,
 ) -> Result<ProviderNormalizationResult> {
-    normalize_opencode_sqlite_with_hook(path, context, None)
+    normalize_opencode_sqlite_with_hook(path, context, None, None)
 }
 
 fn normalize_opencode_sqlite_with_hook(
     path: &Path,
     context: &ProviderAdapterContext,
     normalization_hook: Option<&dyn Fn(&Path)>,
+    selected_sessions: Option<&BTreeSet<String>>,
 ) -> Result<ProviderNormalizationResult> {
     let conn = Connection::open_with_flags(
         path,
@@ -8703,7 +9398,7 @@ fn normalize_opencode_sqlite_with_hook(
     }
     let user_version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     let schema_fingerprint = opencode_schema_fingerprint(&conn)?;
-    let sessions = opencode_sessions(&conn)?;
+    let sessions = opencode_sessions(&conn, selected_sessions)?;
     let has_message = sqlite_table_exists(&conn, "message")?;
     let has_part = sqlite_table_exists(&conn, "part")?;
     let has_session_message = sqlite_table_exists(&conn, "session_message")?;
@@ -8788,6 +9483,7 @@ fn normalize_opencode_sqlite_with_hook(
             &mut sessions_with_events,
             &mut skipped_bookkeeping_parts,
             &mut skipped_partless_messages,
+            selected_sessions,
         )?;
     }
     if has_session_message {
@@ -8877,6 +9573,7 @@ fn normalize_opencode_message_parts(
     sessions_with_events: &mut BTreeSet<String>,
     skipped_bookkeeping_parts: &mut usize,
     skipped_partless_messages: &mut usize,
+    selected_sessions: Option<&BTreeSet<String>>,
 ) -> Result<()> {
     let msg_columns = sqlite_table_columns(conn, "message")?;
     ensure_sqlite_table_columns(
@@ -8891,8 +9588,12 @@ fn normalize_opencode_message_parts(
     } else {
         "session_id, id"
     };
+    let selection = selected_sessions
+        .filter(|ids| !ids.is_empty())
+        .map(|ids| format!(" where session_id in ({})", sql_string_list(ids)))
+        .unwrap_or_default();
     let msg_sql = format!(
-        "select id, session_id, {m_time_created}, {m_time_updated}, data from message order by {order_by}"
+        "select id, session_id, {m_time_created}, {m_time_updated}, data from message{selection} order by {order_by}"
     );
 
     let mut part_stmt = if parts_populated {
@@ -9125,7 +9826,10 @@ fn emit_opencode_fallback_rows(
     }
 }
 
-fn opencode_sessions(conn: &Connection) -> Result<Vec<OpenCodeSessionRow>> {
+fn opencode_sessions(
+    conn: &Connection,
+    selected_sessions: Option<&BTreeSet<String>>,
+) -> Result<Vec<OpenCodeSessionRow>> {
     if !sqlite_table_exists(conn, "session")? {
         return Err(CaptureError::InvalidPayload(
             "OpenCode SQLite database is missing required session table".into(),
@@ -9154,10 +9858,14 @@ fn opencode_sessions(conn: &Connection) -> Result<Vec<OpenCodeSessionRow>> {
     } else {
         "id"
     };
+    let selection = selected_sessions
+        .filter(|ids| !ids.is_empty())
+        .map(|ids| format!(" where id in ({})", sql_string_list(ids)))
+        .unwrap_or_default();
     let sql = format!(
         "select id, {parent_id}, {title}, {directory}, {model}, {agent}, {time_created}, \
          {time_updated}, {tokens_input}, {tokens_output}, {tokens_reasoning}, \
-         {tokens_cache_read}, {tokens_cache_write} from session order by {order_by}"
+         {tokens_cache_read}, {tokens_cache_write} from session{selection} order by {order_by}"
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |row| {
@@ -13740,6 +14448,151 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual 41 GiB sparse OpenCode incremental append/search evidence"]
+    fn opencode_sparse_incremental_append_search_evidence() {
+        let temp = tempdir();
+        let temp_root = temp.path().to_path_buf();
+        let source = write_opencode_incremental_evidence_db(&temp);
+        let work = temp.path().join("work.sqlite");
+        let mut store = Store::open(&work).unwrap();
+        let options = OpenCodeSqliteImportOptions {
+            machine_id: "t291-manual".into(),
+            source_path: Some(source.clone()),
+            imported_at: DateTime::parse_from_rfc3339("2026-08-09T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            ..OpenCodeSqliteImportOptions::default()
+        };
+
+        // Establish a real full baseline before changing the source file. The
+        // event table contains the unrelated journal ballast, while only the
+        // projected message/part rows become normalized events.
+        let baseline =
+            import_opencode_sqlite_incremental(&source, &mut store, options.clone(), None).unwrap();
+        assert_eq!(baseline.mode, OpenCodeRefreshScanMode::Full);
+        assert_eq!(
+            baseline.summary.failed, 0,
+            "{:?}",
+            baseline.summary.failures
+        );
+        assert_eq!(baseline.summary.imported_sessions, 2);
+        assert_eq!(baseline.summary.imported_events, 2);
+        let baseline_cursor = baseline.cursor_json.clone().unwrap();
+        assert!(!baseline_cursor.contains(temp_root.to_string_lossy().as_ref()));
+
+        // A sparse tail is part of the actual source file, not a metadata-only
+        // stand-in. SQLite continues to use the valid database pages at the
+        // front and ignores the zero-filled trailing pages.
+        const SPARSE_SOURCE_BYTES: u64 = 41 * 1024 * 1024 * 1024;
+        let sparse_file = File::options().write(true).open(&source).unwrap();
+        sparse_file.set_len(SPARSE_SOURCE_BYTES).unwrap();
+        sparse_file.sync_all().unwrap();
+        drop(sparse_file);
+        assert_eq!(fs::metadata(&source).unwrap().len(), SPARSE_SOURCE_BYTES);
+
+        // OpenCode writes the projected rows and its durable event journal in
+        // one transaction. The journal row is what identifies the affected
+        // session for the incremental read.
+        let conn = Connection::open(&source).unwrap();
+        conn.execute_batch(
+            r#"
+            begin immediate;
+            insert into message values
+              ('msg_000000000003AAAAAAAAAAAAAA',
+               'ses_000000000001AAAAAAAAAAAAAA', 2, 2,
+               '{"role":"assistant"}');
+            insert into part values
+              ('prt_000000000003AAAAAAAAAAAAAA',
+               'msg_000000000003AAAAAAAAAAAAAA',
+               'ses_000000000001AAAAAAAAAAAAAA', 'text', 2, 2,
+               '{"type":"text","text":"manual291 incremental needle"}');
+            update event_sequence set seq=1
+              where aggregate_id='ses_000000000001AAAAAAAAAAAAAA';
+            insert into event values
+              ('evt_000000009000AAAAAAAAAAAAAA',
+               'ses_000000000001AAAAAAAAAAAAAA', 1,
+               'session.next.prompted.1',
+               '{"sessionID":"ses_000000000001AAAAAAAAAAAAAA", "messageID":"msg_000000000003AAAAAAAAAAAAAA"}');
+            commit;
+            "#,
+        )
+        .unwrap();
+        drop(conn);
+
+        let started = Instant::now();
+        let delta = import_opencode_sqlite_incremental(
+            &source,
+            &mut store,
+            options,
+            Some(&baseline_cursor),
+        )
+        .unwrap();
+        let elapsed = started.elapsed();
+        eprintln!("OpenCode #291 sparse 41 GiB incremental append elapsed: {elapsed:?}");
+        assert!(
+            elapsed <= std::time::Duration::from_millis(500),
+            "incremental append exceeded the 500 ms manual target: {elapsed:?}"
+        );
+
+        assert_eq!(delta.mode, OpenCodeRefreshScanMode::Incremental);
+        assert_eq!(delta.fallback_reason, None);
+        assert_eq!(delta.journal_rows_scanned, 1);
+        assert_eq!(delta.session_rows_scanned, 1);
+        assert_eq!(delta.message_rows_scanned, 2);
+        assert_eq!(delta.part_rows_scanned, 2);
+        assert_eq!(delta.summary.failed, 0, "{:?}", delta.summary.failures);
+        assert_eq!(delta.summary.imported_sessions, 0);
+        assert_eq!(delta.summary.skipped_sessions, 1);
+        assert_eq!(delta.summary.imported_events, 1);
+        assert_eq!(delta.summary.skipped_events, 1);
+        assert!(delta
+            .summary
+            .notes
+            .iter()
+            .any(|note| note.contains("sessions=1")));
+        assert!(!delta
+            .summary
+            .notes
+            .iter()
+            .any(|note| note.contains("sessions=2")));
+
+        let session_id =
+            provider_session_uuid(CaptureProvider::OpenCode, "ses_000000000001AAAAAAAAAAAAAA");
+        let events = store.events_for_session(session_id).unwrap();
+        assert!(events.iter().any(|event| event
+            .payload
+            .to_string()
+            .contains("manual291 incremental needle")));
+        assert!(store
+            .search_event_hits("manual291 incremental needle", 10)
+            .unwrap()
+            .iter()
+            .any(|hit| hit.event_id
+                == provider_event_uuid(
+                    CaptureProvider::OpenCode,
+                    "ses_000000000001AAAAAAAAAAAAAA",
+                    (OPENCODE_MESSAGE_PART_EVENT_INDEX_BASE + 1) as u64,
+                )));
+
+        let indexed = Connection::open(&work).unwrap();
+        let searchable: i64 = indexed
+            .query_row(
+                "select count(*) from event_search where event_search match 'manual291 AND incremental AND needle'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(searchable, 1);
+        drop(indexed);
+        drop(store);
+        drop(temp);
+        assert!(
+            !temp_root.exists(),
+            "manual fixture temp root was not removed"
+        );
+    }
+
+    #[test]
     fn native_opencode_rejects_source_changed_during_normalization_before_store_writes() {
         let temp = tempdir();
         let fixture = write_opencode_smoke_db(&temp, false);
@@ -14281,6 +15134,132 @@ mod tests {
             ["msg-child", "opencode-child", child_data],
         )
         .unwrap();
+        path
+    }
+
+    fn write_opencode_incremental_evidence_db(temp: &TempDir) -> PathBuf {
+        let path = temp.path().join("opencode-incremental-evidence.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            r#"
+            pragma foreign_keys=on;
+            create table session (
+                id text primary key,
+                project_id text not null,
+                parent_id text,
+                slug text not null,
+                directory text not null,
+                title text not null,
+                version text not null,
+                share_url text,
+                summary_additions integer,
+                summary_deletions integer,
+                summary_files integer,
+                summary_diffs text,
+                revert text,
+                permission text,
+                time_created integer not null,
+                time_updated integer not null,
+                time_compacting integer,
+                time_archived integer,
+                workspace_id text,
+                agent text,
+                model text,
+                cost real default 0 not null,
+                tokens_input integer default 0 not null,
+                tokens_output integer default 0 not null,
+                tokens_reasoning integer default 0 not null,
+                tokens_cache_read integer default 0 not null,
+                tokens_cache_write integer default 0 not null,
+                metadata text
+            );
+            create index session_parent_id_idx on session(parent_id);
+            create index session_time_created_id_idx on session(time_created,id);
+            create table message (
+                id text primary key,
+                session_id text not null,
+                time_created integer not null,
+                time_updated integer not null,
+                data text not null
+            );
+            create index message_session_id_idx on message(session_id,id);
+            create table part (
+                id text primary key,
+                message_id text not null,
+                session_id text not null,
+                type text not null,
+                time_created integer not null,
+                time_updated integer not null,
+                data text not null
+            );
+            create index part_message_id_idx on part(message_id,id);
+            create index part_session_id_idx on part(session_id,id);
+            create table event_sequence (
+                aggregate_id text primary key,
+                seq integer not null,
+                owner_id text
+            );
+            create table event (
+                id text primary key,
+                aggregate_id text not null
+                    references event_sequence(aggregate_id) on delete cascade,
+                seq integer not null,
+                type text not null,
+                data text not null
+            );
+            create unique index event_aggregate_seq_idx
+                on event(aggregate_id,seq);
+            create index event_aggregate_type_seq_idx
+                on event(aggregate_id,type,seq);
+            insert into session (
+                id, project_id, parent_id, slug, directory, title, version,
+                permission, time_created, time_updated, agent, model
+            ) values
+                ('ses_000000000001AAAAAAAAAAAAAA', 'project-1', null, 'target',
+                 '/workspace', 'target', '1.0.0', 'default', 1, 1, 'build',
+                 '{"providerID":"openai","modelID":"test"}'),
+                ('ses_000000000002AAAAAAAAAAAAAA', 'project-1', null, 'ballast',
+                 '/workspace', 'ballast', '1.0.0', 'default', 1, 1, 'build',
+                 '{"providerID":"openai","modelID":"test"}');
+            insert into message values
+                ('msg_000000000001AAAAAAAAAAAAAA',
+                 'ses_000000000001AAAAAAAAAAAAAA', 1, 1, '{"role":"user"}'),
+                ('msg_000000000002AAAAAAAAAAAAAA',
+                 'ses_000000000002AAAAAAAAAAAAAA', 1, 1, '{"role":"user"}');
+            insert into part values
+                ('prt_000000000001AAAAAAAAAAAAAA',
+                 'msg_000000000001AAAAAAAAAAAAAA',
+                 'ses_000000000001AAAAAAAAAAAAAA', 'text', 1, 1,
+                 '{"type":"text","text":"manual291 baseline"}'),
+                ('prt_000000000002AAAAAAAAAAAAAA',
+                 'msg_000000000002AAAAAAAAAAAAAA',
+                 'ses_000000000002AAAAAAAAAAAAAA', 'text', 1, 1,
+                 '{"type":"text","text":"unrelated ballast"}');
+            insert into event_sequence values
+                ('ses_000000000001AAAAAAAAAAAAAA', 0, null),
+                ('ses_000000000002AAAAAAAAAAAAAA', 5000, null);
+            insert into event values
+                ('evt_000000000001AAAAAAAAAAAAAA',
+                 'ses_000000000001AAAAAAAAAAAAAA', 0,
+                 'session.next.prompted.1',
+                 '{"sessionID":"ses_000000000001AAAAAAAAAAAAAA", "messageID":"msg_000000000001AAAAAAAAAAAAAA"}'),
+                ('evt_000000000002AAAAAAAAAAAAAA',
+                 'ses_000000000002AAAAAAAAAAAAAA', 0,
+                 'session.next.prompted.1',
+                 '{"sessionID":"ses_000000000002AAAAAAAAAAAAAA", "messageID":"msg_000000000002AAAAAAAAAAAAAA"}');
+            with recursive ballast(n) as (
+                select 1 union all select n + 1 from ballast where n < 5000
+            )
+            insert into event
+                select printf('evt_%012xAAAAAAAAAAAAAA', n + 16),
+                       'ses_000000000002AAAAAAAAAAAAAA', n,
+                       'session.next.prompted.1',
+                       '{"sessionID":"ses_000000000002AAAAAAAAAAAAAA", "messageID":"msg_000000000002AAAAAAAAAAAAAA"}'
+                  from ballast;
+            "#,
+        )
+        .unwrap();
+        drop(conn);
         path
     }
 
@@ -15537,5 +16516,171 @@ mod tests {
         assert!(summary.failures.iter().all(|failure| failure
             .error
             .contains("has provider `claude` but expected `codex`")));
+    }
+
+    #[test]
+    fn opencode_incremental_append_reads_only_affected_session_and_advances_cursor() {
+        let temp = tempdir();
+        let source = temp.path().join("opencode.db");
+        let conn = Connection::open(&source).unwrap();
+        conn.execute_batch(r#"
+            pragma foreign_keys=on;
+            create table session(id text primary key, parent_id text, title text not null,
+              directory text not null, time_created integer not null, time_updated integer not null);
+            create table message(id text primary key, session_id text not null,
+              time_created integer not null, time_updated integer not null, data text not null);
+            create index message_session on message(session_id);
+            create table part(id text primary key, message_id text not null, session_id text not null,
+              time_created integer not null, time_updated integer not null, data text not null);
+            create index part_message on part(message_id);
+            create index part_session on part(session_id,id);
+            create index message_session_id on message(session_id,id);
+            create table event_sequence(aggregate_id text primary key, seq integer not null, owner_id text);
+            create table event(id text primary key, aggregate_id text not null references event_sequence(aggregate_id) on delete cascade,
+              seq integer not null, type text not null, data text not null);
+            create unique index event_aggregate_seq_idx on event(aggregate_id,seq);
+            create index event_aggregate_type_seq_idx on event(aggregate_id,type,seq);
+            insert into session values('ses_000000000001AAAAAAAAAAAAAA',null,'one','/tmp',1,1);
+            insert into session values('ses_000000000002AAAAAAAAAAAAAA',null,'ballast','/tmp',1,1);
+            insert into message values('msg_000000000001AAAAAAAAAAAAAA','ses_000000000001AAAAAAAAAAAAAA',1,1,'{"role":"user"}');
+            insert into message values('msg_000000000002AAAAAAAAAAAAAA','ses_000000000002AAAAAAAAAAAAAA',1,1,'{"role":"user"}');
+            insert into part values('prt_000000000001AAAAAAAAAAAAAA','msg_000000000001AAAAAAAAAAAAAA','ses_000000000001AAAAAAAAAAAAAA',1,1,'{"type":"text","text":"baseline"}');
+            insert into part values('prt_000000000002AAAAAAAAAAAAAA','msg_000000000002AAAAAAAAAAAAAA','ses_000000000002AAAAAAAAAAAAAA',1,1,'{"type":"text","text":"ballast"}');
+            insert into event_sequence values('ses_000000000001AAAAAAAAAAAAAA',0,null);
+            insert into event_sequence values('ses_000000000002AAAAAAAAAAAAAA',0,null);
+            insert into event values('evt_000000000001AAAAAAAAAAAAAA','ses_000000000001AAAAAAAAAAAAAA',0,'session.next.prompted.1','{"sessionID":"ses_000000000001AAAAAAAAAAAAAA","messageID":"msg_000000000001AAAAAAAAAAAAAA"}');
+            insert into event values('evt_000000000002AAAAAAAAAAAAAA','ses_000000000002AAAAAAAAAAAAAA',0,'session.next.prompted.1','{"sessionID":"ses_000000000002AAAAAAAAAAAAAA","messageID":"msg_000000000002AAAAAAAAAAAAAA"}');
+            with recursive ballast(n) as (select 1 union all select n+1 from ballast where n<5000)
+              insert into event select printf('evt_%012xAAAAAAAAAAAAAA',n+16),'ses_000000000002AAAAAAAAAAAAAA',n,
+                'session.next.prompted.1','{"sessionID":"ses_000000000002AAAAAAAAAAAAAA","messageID":"msg_000000000002AAAAAAAAAAAAAA"}' from ballast;
+            update event_sequence set seq=5000 where aggregate_id='ses_000000000002AAAAAAAAAAAAAA';
+        "#).unwrap();
+        drop(conn);
+        let observed = observe_opencode_sqlite(&source).unwrap();
+        opencode_journal_snapshot(&open_provider_sqlite_readonly(&source).unwrap(), &observed)
+            .unwrap();
+        let mut store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let baseline = import_opencode_sqlite_incremental(
+            &source,
+            &mut store,
+            OpenCodeSqliteImportOptions::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(baseline.mode, OpenCodeRefreshScanMode::Full);
+        let baseline_json = baseline.cursor_json.as_deref().unwrap();
+        assert!(!baseline_json.contains(source.to_string_lossy().as_ref()));
+        assert!(!baseline_json.contains("baseline"));
+        let parsed: OpenCodeIncrementalCursor = serde_json::from_str(baseline_json).unwrap();
+        let mut run_due = parsed.clone();
+        run_due.successful_incremental_count = OPENCODE_RECONCILE_RUNS;
+        assert_eq!(
+            opencode_journal_fallback(&run_due, &parsed, parsed.last_full_reconciliation_ms),
+            Some("periodic_reconciliation")
+        );
+        let mut time_due = parsed.clone();
+        time_due.last_full_reconciliation_ms -= OPENCODE_RECONCILE_MS;
+        assert_eq!(
+            opencode_journal_fallback(&time_due, &parsed, parsed.last_full_reconciliation_ms),
+            Some("periodic_reconciliation")
+        );
+        let conn = Connection::open(&source).unwrap();
+        conn.execute_batch(r#"
+          begin immediate;
+          insert into message values('msg_000000000003AAAAAAAAAAAAAA','ses_000000000001AAAAAAAAAAAAAA',2,2,'{"role":"assistant"}');
+          insert into part values('prt_000000000003AAAAAAAAAAAAAA','msg_000000000003AAAAAAAAAAAAAA','ses_000000000001AAAAAAAAAAAAAA',2,2,'{"type":"text","text":"incremental needle"}');
+          update event_sequence set seq=1 where aggregate_id='ses_000000000001AAAAAAAAAAAAAA';
+          insert into event values('evt_000000009000AAAAAAAAAAAAAA','ses_000000000001AAAAAAAAAAAAAA',1,'session.next.prompted.1','{"sessionID":"ses_000000000001AAAAAAAAAAAAAA","messageID":"msg_000000000003AAAAAAAAAAAAAA"}');
+          commit;
+        "#).unwrap();
+        drop(conn);
+        let delta = import_opencode_sqlite_incremental(
+            &source,
+            &mut store,
+            OpenCodeSqliteImportOptions::default(),
+            baseline.cursor_json.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(
+            delta.mode,
+            OpenCodeRefreshScanMode::Incremental,
+            "fallback={:?}",
+            delta.fallback_reason
+        );
+        assert_eq!(
+            (
+                delta.session_rows_scanned,
+                delta.message_rows_scanned,
+                delta.part_rows_scanned
+            ),
+            (1, 2, 2)
+        );
+        assert_eq!(delta.journal_rows_scanned, 1);
+        let session_id =
+            provider_session_uuid(CaptureProvider::OpenCode, "ses_000000000001AAAAAAAAAAAAAA");
+        assert!(store
+            .events_for_session(session_id)
+            .unwrap()
+            .iter()
+            .any(|event| event.payload.to_string().contains("incremental needle")));
+        let indexed = Connection::open(temp.path().join("work.sqlite")).unwrap();
+        let searchable: i64 = indexed
+            .query_row(
+                "select count(*) from event_search where event_search match 'incremental AND needle'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(searchable > 0);
+        drop(indexed);
+
+        let conn = Connection::open(&source).unwrap();
+        conn.execute_batch(r#"
+          begin immediate;
+          update event_sequence set seq=2 where aggregate_id='ses_000000000001AAAAAAAAAAAAAA';
+          insert into event values('evt_00000000a000AAAAAAAAAAAAAA','ses_000000000001AAAAAAAAAAAAAA',2,'session.next.deleted.1','{"sessionID":"ses_000000000001AAAAAAAAAAAAAA"}');
+          commit;
+        "#).unwrap();
+        drop(conn);
+        let error = import_opencode_sqlite_incremental(
+            &source,
+            &mut store,
+            OpenCodeSqliteImportOptions::default(),
+            delta.cursor_json.as_deref(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CaptureError::UnsupportedOpenCodeIncrementalMutation("journal_deletion_or_reset")
+        ));
+
+        let conn = Connection::open(&source).unwrap();
+        conn.execute_batch("drop index event_aggregate_type_seq_idx;")
+            .unwrap();
+        drop(conn);
+        let incapable = import_opencode_sqlite_incremental(
+            &source,
+            &mut store,
+            OpenCodeSqliteImportOptions::default(),
+            delta.cursor_json.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(incapable.mode, OpenCodeRefreshScanMode::Full);
+        assert_eq!(incapable.fallback_reason, Some("schema_not_capable"));
+        assert!(incapable.cursor_json.is_none());
+    }
+
+    #[test]
+    fn opencode_ascending_id_validation_is_exact() {
+        assert!(opencode_id_shape("event", "evt_0123456789abAz09Az09Az09Az"));
+        assert!(!opencode_id_shape(
+            "event",
+            "evt_0123456789ABAz09Az09Az09Az"
+        ));
+        assert!(!opencode_id_shape("event", "evt_random"));
+        assert!(!opencode_id_shape(
+            "message",
+            "msg_0123456789abAz09-Az09Az09Az"
+        ));
     }
 }

@@ -218,7 +218,11 @@ atomic migration is unconditional, performs no backfill, and touches no base
 content, FTS projection, or rowid map. Operational refresh state is not part of
 logical archives or restores.
 
-Read-only commands require exactly v1003 and direct older stores to run one
+Schema v1004 adds only a nullable, 4096-byte-bounded `incremental_cursor` to
+that table. The atomic migration performs no backfill and does not read or
+modify content, FTS projections, or rowid maps.
+
+Read-only commands require exactly v1004 and direct older stores to run one
 writable command first.
 
 Downgrading a fork-versioned store back to an older ctx binary is

@@ -1439,6 +1439,38 @@ fn wait_for_child_file(child: &mut std::process::Child, path: &Path) {
     }
 }
 
+#[cfg(unix)]
+fn wait_for_child_token(child: &mut std::process::Child, path: &Path) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        // fs::write creates/truncates the file before it writes the token, so
+        // checking only for existence can observe the synchronization file in
+        // its transient empty state.
+        if let Ok(token) = fs::read_to_string(path) {
+            if token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return token;
+            }
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!(
+                "refresh child exited before writing token to {}: {status}",
+                path.display()
+            );
+        }
+        if Instant::now() >= deadline {
+            unsafe {
+                libc::kill(child.id() as i32, libc::SIGKILL);
+            }
+            let _ = child.wait();
+            panic!(
+                "refresh child did not write a complete token to {}",
+                path.display()
+            );
+        }
+        std::thread::yield_now();
+    }
+}
+
 #[test]
 fn evidence_search_stdout_and_secure_file_are_deterministic_and_channel_separated() {
     let temp = TempDir::new().unwrap();
@@ -8429,8 +8461,7 @@ fn search_refresh_crash_releases_process_lock_and_fences_reclaimed_lease() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    wait_for_child_file(&mut crashed_owner, &old_token_file);
-    let old_token = fs::read_to_string(&old_token_file).unwrap();
+    let old_token = wait_for_child_token(&mut crashed_owner, &old_token_file);
     assert_eq!(old_token.len(), 64);
     assert!(old_token.bytes().all(|byte| byte.is_ascii_hexdigit()));
 
@@ -8532,8 +8563,7 @@ fn search_refresh_crash_releases_process_lock_and_fences_reclaimed_lease() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    wait_for_child_file(&mut new_owner, &new_token_file);
-    let new_token = fs::read_to_string(&new_token_file).unwrap();
+    let new_token = wait_for_child_token(&mut new_owner, &new_token_file);
     assert_ne!(old_token, new_token);
 
     let stale_store = Store::open(&db_path).unwrap();

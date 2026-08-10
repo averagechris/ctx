@@ -21,6 +21,82 @@ fn tempdir() -> TempDir {
 }
 
 #[test]
+fn archive_plan_cli_is_private_deterministic_and_does_not_mutate_data_root() {
+    let temp = tempdir();
+    json_output(ctx(&temp).args(["setup", "--catalog-only", "--progress", "none", "--json"]));
+    warm_read_only(&temp.path().join("work.sqlite"));
+    let before = snapshot_tree(temp.path());
+    let first = json_output(ctx(&temp).args(["archive", "plan", "--cutoff-ms", "1000", "--json"]));
+    let second = json_output(ctx(&temp).args(["archive", "plan", "--cutoff-ms", "1000", "--json"]));
+    assert_eq!(first, second);
+    assert_eq!(first["private"], true);
+    assert_eq!(first["source_schema_version"], 1004);
+    assert_eq!(first["selected_root_ids"], json!([]));
+    let rendered = serde_json::to_string(&first).unwrap();
+    for forbidden in [
+        "transcript",
+        "raw_source_path",
+        "root_path",
+        temp.path().to_str().unwrap(),
+    ] {
+        assert!(!rendered.contains(forbidden));
+    }
+    assert_eq!(before, snapshot_tree(temp.path()));
+}
+
+#[test]
+fn archive_plan_unsupported_schema_fails_without_mutation() {
+    let temp = tempdir();
+    json_output(ctx(&temp).args(["setup", "--catalog-only", "--progress", "none", "--json"]));
+    let db = temp.path().join("work.sqlite");
+    Connection::open(&db)
+        .unwrap()
+        .pragma_update(None, "user_version", 1005)
+        .unwrap();
+    warm_read_only(&db);
+    let before = snapshot_tree(temp.path());
+    ctx(&temp)
+        .args(["archive", "plan", "--cutoff-ms", "1", "--json"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "unsupported history store schema version: 1005",
+        ));
+    assert_eq!(before, snapshot_tree(temp.path()));
+}
+
+fn warm_read_only(path: &Path) {
+    let conn =
+        Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let _: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+}
+
+fn snapshot_tree(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    fn walk(root: &Path, path: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+        let mut entries: Vec<_> = fs::read_dir(path)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        entries.sort();
+        for entry in entries {
+            if entry.is_dir() {
+                walk(root, &entry, out);
+            } else {
+                out.push((
+                    entry.strip_prefix(root).unwrap().to_owned(),
+                    fs::read(&entry).unwrap(),
+                ));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out
+}
+
+#[test]
 fn archive_create_has_json_and_human_contract_and_private_atomic_layout() {
     let temp = tempdir();
     json_output(ctx(&temp).args(["setup", "--catalog-only", "--progress", "none", "--json"]));

@@ -36,6 +36,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 mod archive;
+mod compaction;
 #[cfg(unix)]
 mod restore;
 #[cfg(unix)]
@@ -48,6 +49,7 @@ pub use archive::{
     ArchiveVerificationReport, ArchiveVerifyOptions, ARCHIVE_MAX_ENTITIES, ARCHIVE_MAX_OBJECTS,
     ARCHIVE_MAX_OBJECT_BYTES, ARCHIVE_MAX_TOTAL_BYTES,
 };
+pub use compaction::{CompactionPlan, CompactionPlanMember, CompactionRootDecision};
 #[cfg(unix)]
 pub use restore::{restore_archive_bundle, ArchiveRestoreReport};
 #[cfg(unix)]

@@ -93,7 +93,7 @@ on macOS); nested sticky directories are not trusted. Evidence export does not
 refresh/import, use the network, or add an MCP method. See
 [`evidence-bundle-v1.md`](evidence-bundle-v1.md) for the normative contract.
 
-## Archive Create
+## Archive Planning and Creation
 
 ```bash
 work="$(mktemp -d "${TMPDIR:-/tmp}/ctx-archive.XXXXXX")"
@@ -101,6 +101,7 @@ source_root="$work/source-root"
 bundle="$work/history.ctxar"       # absent destination
 restored_root="$work/restored-root" # absent destination
 CTX_DATA_ROOT="$source_root" ctx setup --catalog-only
+CTX_DATA_ROOT="$source_root" ctx archive plan --cutoff-ms 1700000000000 --json
 CTX_DATA_ROOT="$source_root" ctx archive create "$bundle"
 # Use `--json` instead of the preceding create command for script output.
 # ctx archive create "$bundle" --json
@@ -112,6 +113,17 @@ ctx archive restore "$bundle" "$restored_root"
 The complete user workflow, including fresh temporary paths, privacy, and
 failure semantics, is in [`archive.md`](archive.md). The normative bundle
 contract is [`archive-format-v1.md`](archive-format-v1.md).
+
+`archive plan --cutoff-ms <INTEGER>` is a deterministic, strictly read-only
+selective-compaction planner. The cutoff is inclusive and selects only sessions
+whose status is `completed` and whose non-null end time is at or before it.
+JSON reports sorted opaque IDs, decisions, directional closure and deletion-set
+membership, authenticated digests, byte estimates, and conservative unknown
+reasons. It is marked private and never emits paths, transcript bodies, or
+embedded content. Planning neither imports nor creates configuration/data-root
+state, migrates, checkpoints, vacuums, or changes canonical/FTS/map rows. It
+requires an existing store at the exact schema supported by the binary. A plan
+does not create an archive and is not permission to delete data.
 
 `archive create` writes a v1 private directory bundle. Its destination must be
 absent, even if an empty directory exists. The writer streams all fifteen

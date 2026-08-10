@@ -1,10 +1,22 @@
 # Portable Archive Workflows
 
-`ctx archive` creates, checks, and restores a portable logical archive of the
+`ctx archive` plans selective compaction and creates, checks, and restores a portable logical archive of the
 current local data root. The archive is a private directory bundle, not a copy
 of SQLite. It is useful for moving indexed history to a fresh data root or for
 keeping a logical recovery copy; it is not a byte-for-byte SQLite disaster
 snapshot.
+
+Inspect a stable read-only compaction plan with an explicit inclusive cutoff:
+
+```bash
+CTX_DATA_ROOT="$source_root" ctx archive plan --cutoff-ms 1700000000000 --json
+```
+
+Planning opens only an existing current-schema store and performs no discovery,
+import, migration, checkpoint, vacuum, or write. Its private output omits paths
+and history content. Archive membership and the smaller authenticated deletion
+set are distinct; this planner creates no selective archive and deletes or
+physically reclaims nothing.
 
 The normative container and stream contract is [Archive Format
 v1](archive-format-v1.md). This page is the user workflow; it intentionally

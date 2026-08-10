@@ -329,12 +329,25 @@ struct ArchiveArgs {
 
 #[derive(Debug, Subcommand)]
 enum ArchiveCommand {
+    #[command(about = "Plan selective compaction without modifying the data root")]
+    Plan(ArchivePlanArgs),
     #[command(about = "Stream the current data root into an atomic archive bundle")]
     Create(ArchiveCreateArgs),
     #[command(about = "Verify a complete archive bundle without modifying it")]
     Verify(ArchiveVerifyArgs),
     #[command(about = "Restore a verified archive into a strictly absent data root")]
     Restore(ArchiveRestoreArgs),
+}
+
+#[derive(Debug, Args)]
+struct ArchivePlanArgs {
+    #[arg(
+        long,
+        help = "Inclusive completed-session end-time cutoff in milliseconds"
+    )]
+    cutoff_ms: i64,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -2486,10 +2499,37 @@ fn evidence_failure<T>(common: &EvidenceCommonArgs, code: &str, message: &str) -
 
 fn run_archive(args: ArchiveArgs, data_root: PathBuf) -> Result<()> {
     match args.command {
+        ArchiveCommand::Plan(plan) => run_archive_plan(plan, data_root),
         ArchiveCommand::Create(create) => run_archive_create(create, data_root),
         ArchiveCommand::Verify(verify) => run_archive_verify(verify),
         ArchiveCommand::Restore(restore) => run_archive_restore(restore),
     }
+}
+
+fn run_archive_plan(args: ArchivePlanArgs, data_root: PathBuf) -> Result<()> {
+    let db_path = database_path(data_root);
+    let mut store = Store::open_read_only(&db_path)
+        .with_context(|| format!("open ctx store read-only: {}", db_path.display()))?;
+    let plan = store.plan_compaction(args.cutoff_ms)?;
+    if args.json {
+        println!("{}", serde_json::to_string(&plan)?);
+    } else {
+        println!(
+            "private compaction plan {}: {} selected roots, {} members, {} deletion-authorized, expected archive {} bytes",
+            plan.plan_digest,
+            plan.selected_root_ids.len(),
+            plan.members.len(),
+            plan.deletion_authorized_count,
+            plan.expected_selective_archive_bytes,
+        );
+        for root in &plan.roots {
+            println!(
+                "{}\t{}\t{}",
+                root.session_id, root.disposition, root.rationale
+            );
+        }
+    }
+    Ok(())
 }
 
 fn run_archive_restore(args: ArchiveRestoreArgs) -> Result<()> {

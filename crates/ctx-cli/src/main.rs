@@ -1,5 +1,6 @@
 use std::{
     env, fs,
+    fs::OpenOptions,
     io::{Cursor, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     str::FromStr,
@@ -34,9 +35,9 @@ use ctx_history_capture::{
     import_custom_history_jsonl_v1_reader, import_factory_ai_droid_sessions,
     import_gemini_cli_history, import_hermes_sqlite, import_nanoclaw_project,
     import_openclaw_history, import_opencode_sqlite, import_pi_session_jsonl,
-    provider_source_for_path, provider_source_spec, stable_capture_uuid,
+    observe_opencode_sqlite, provider_source_for_path, provider_source_spec, stable_capture_uuid,
     validate_custom_history_jsonl_v1, validate_custom_history_jsonl_v1_reader,
-    AntigravityCliImportOptions, AstrBotSqliteImportOptions, CatalogSummary,
+    AntigravityCliImportOptions, AstrBotSqliteImportOptions, CaptureError, CatalogSummary,
     ClaudeProjectsImportOptions, CodexEventImportMode, CodexHistoryImportOptions,
     CodexSessionCatalogOptions, CodexSessionImportOptions, CodexSessionImportProgress,
     CodexSessionImportProgressCallback, CodexToolOutputMode, CopilotCliImportOptions,
@@ -64,11 +65,11 @@ use ctx_history_store::{
     archive_verification_error_code, restore_archive_bundle, verify_archive_bundle_with_options,
     write_secure_output, ArchiveOptions, ArchiveVerifyOptions, CatalogSession,
     CatalogSourceIndexUpdate, IdPrefixResolution, RawSqlOptions, RawSqlResult, RawSqlValue,
-    SourceHealthClassification, SourceImportFile, SourceImportFileIndexUpdate, Store, StoreError,
-    ARCHIVE_MAX_ENTITIES, ARCHIVE_MAX_OBJECTS, ARCHIVE_MAX_OBJECT_BYTES, ARCHIVE_MAX_TOTAL_BYTES,
-    CATALOG_IMPORT_OUTCOME_UNATTRIBUTED_CODE, RAW_SQL_DEFAULT_MAX_COLUMNS,
-    RAW_SQL_DEFAULT_MAX_ROWS, RAW_SQL_DEFAULT_MAX_SQL_BYTES, RAW_SQL_DEFAULT_MAX_VALUE_BYTES,
-    RAW_SQL_MAX_TIMEOUT, SOURCE_IMPORT_ZERO_YIELD_ANOMALY_CODE,
+    SourceHealthClassification, SourceImportFile, SourceImportFileIndexUpdate, SourceRefreshClaim,
+    SourceRefreshErrorCode, Store, StoreError, ARCHIVE_MAX_ENTITIES, ARCHIVE_MAX_OBJECTS,
+    ARCHIVE_MAX_OBJECT_BYTES, ARCHIVE_MAX_TOTAL_BYTES, CATALOG_IMPORT_OUTCOME_UNATTRIBUTED_CODE,
+    RAW_SQL_DEFAULT_MAX_COLUMNS, RAW_SQL_DEFAULT_MAX_ROWS, RAW_SQL_DEFAULT_MAX_SQL_BYTES,
+    RAW_SQL_DEFAULT_MAX_VALUE_BYTES, RAW_SQL_MAX_TIMEOUT, SOURCE_IMPORT_ZERO_YIELD_ANOMALY_CODE,
 };
 use history_source_plugins::{
     discover_history_source_plugins, discover_history_source_plugins_with_diagnostics,
@@ -80,6 +81,70 @@ const WAL_TRUNCATE_MIN_BYTES: u64 = 64 * 1024 * 1024;
 const LARGE_IMPORT_SOURCE_FILES_WARNING: usize = 10_000;
 const LARGE_IMPORT_SOURCE_BYTES_WARNING: u64 = 1024 * 1024 * 1024;
 const MAX_SEARCH_LIMIT: usize = 200;
+const SEARCH_REFRESH_LEASE_MS: i64 = 30 * 60 * 1_000;
+
+struct SourceRefreshProcessLock {
+    _file: fs::File,
+}
+
+impl SourceRefreshProcessLock {
+    fn try_acquire(data_root: &Path, key: &str) -> Result<Option<Self>> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+            let lock_dir = data_root.join("refresh-locks");
+            fs::create_dir_all(&lock_dir)?;
+            fs::set_permissions(&lock_dir, fs::Permissions::from_mode(0o700))?;
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(lock_dir.join(key))?;
+            fs::set_permissions(lock_dir.join(key), fs::Permissions::from_mode(0o600))?;
+            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if result == 0 {
+                Ok(Some(Self { _file: file }))
+            } else {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    Ok(None)
+                } else {
+                    Err(error.into())
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (data_root, key);
+            Err(anyhow!(
+                "source refresh process locks are unsupported on this platform"
+            ))
+        }
+    }
+}
+
+// Test-only crash fixture hook.  The environment variables are intentionally
+// private and inert unless a test supplies them: the child reports the lease
+// token after both coordination layers have been acquired, then waits on a
+// file barrier so the test can kill it without running cleanup.
+fn test_refresh_lease_barrier(token: &str) -> Result<()> {
+    let Some(token_file) = env::var_os("CTX_TEST_REFRESH_LEASE_TOKEN_FILE") else {
+        return Ok(());
+    };
+    fs::write(token_file, token)?;
+    let Some(release_file) = env::var_os("CTX_TEST_REFRESH_LEASE_RELEASE_FILE") else {
+        return Ok(());
+    };
+    let release_file = PathBuf::from(release_file);
+    while !release_file.exists() {
+        thread::yield_now();
+    }
+    Ok(())
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "ctx", version, about = "Search local agent history")]
@@ -1171,6 +1236,7 @@ struct ImportTotals {
     source_files: usize,
     source_bytes: u64,
     imported_sources: usize,
+    refreshed_sources: usize,
     failed_sources: usize,
     imported_sessions: usize,
     imported_events: usize,
@@ -1178,6 +1244,8 @@ struct ImportTotals {
     skipped: usize,
     failed: usize,
     unchanged_sources: usize,
+    refresh_in_progress_sources: usize,
+    retry_backoff_sources: usize,
     zero_yield_anomaly_sources: usize,
     health_persistence_failures: usize,
     phase_timings: SearchRefreshPhaseTimings,
@@ -1310,6 +1378,13 @@ impl ImportTotals {
         self.source_files += stats.files;
         self.source_bytes = self.source_bytes.saturating_add(stats.bytes);
         self.imported_sources += 1;
+        if summary.imported > 0
+            || summary.imported_sessions > 0
+            || summary.imported_events > 0
+            || summary.imported_edges > 0
+        {
+            self.refreshed_sources += 1;
+        }
         self.imported_sessions += summary.imported_sessions;
         self.imported_events += summary.imported_events;
         self.imported_edges += summary.imported_edges;
@@ -1505,12 +1580,34 @@ impl SearchRefreshReport {
         duration_ms: u128,
         phases: SearchRefreshPhaseTimings,
     ) -> Self {
+        let outcome_kinds = [
+            totals.refreshed_sources,
+            totals.unchanged_sources,
+            totals.refresh_in_progress_sources,
+            totals.retry_backoff_sources,
+        ]
+        .into_iter()
+        .filter(|count| *count > 0)
+        .count();
         let status = if totals.zero_yield_anomaly_sources > 0 {
             "degraded_zero_yield"
         } else if totals.health_persistence_failures > 0 {
             "degraded_health_persistence"
+        } else if outcome_kinds > 1 {
+            "completed_mixed"
         } else {
             "completed"
+        };
+        let reason = match status {
+            "completed_mixed" if totals.refreshed_sources > 0 => "refreshed_partial",
+            "completed_mixed" => "mixed",
+            "completed" if totals.refreshed_sources > 0 => "refreshed",
+            "completed" if totals.unchanged_sources > 0 => "unchanged",
+            "completed" if totals.refresh_in_progress_sources > 0 => "refresh_in_progress",
+            "completed" if totals.retry_backoff_sources > 0 => "retry_backoff",
+            "completed" => "refreshed",
+            "degraded_zero_yield" => "zero_yield_anomaly",
+            _ => "health_persistence_failed",
         };
         Self {
             mode,
@@ -1519,11 +1616,7 @@ impl SearchRefreshReport {
             totals,
             duration_ms,
             index_age_seconds: Some(0),
-            reason: match status {
-                "completed" => "refreshed",
-                "degraded_zero_yield" => "zero_yield_anomaly",
-                _ => "health_persistence_failed",
-            },
+            reason,
             error: None,
             phases,
         }
@@ -1561,10 +1654,16 @@ impl SearchRefreshReport {
             "mode": self.mode.as_str(),
             "status": self.status,
             "source_count": self.source_count,
-            "ran": self.status == "completed" || self.status == "degraded_zero_yield" || self.status == "failed",
+            "ran": self.status == "completed" || self.status == "completed_mixed" || self.status == "degraded_zero_yield" || self.status == "failed",
             "duration_ms": self.duration_ms,
             "index_age_seconds": self.index_age_seconds,
             "reason": self.reason,
+            "reason_counts": {
+                "refreshed": self.totals.refreshed_sources,
+                "unchanged": self.totals.unchanged_sources,
+                "refresh_in_progress": self.totals.refresh_in_progress_sources,
+                "retry_backoff": self.totals.retry_backoff_sources,
+            },
             "totals": import_totals_json(&self.totals),
             "phases": self.phases.to_json(),
             "error": self.error,
@@ -3567,6 +3666,7 @@ fn import_totals_json(totals: &ImportTotals) -> Value {
         "source_files": totals.source_files,
         "source_bytes": totals.source_bytes,
         "imported_sources": totals.imported_sources,
+        "refreshed_sources": totals.refreshed_sources,
         "failed_sources": totals.failed_sources,
         "imported_sessions": totals.imported_sessions,
         "imported_events": totals.imported_events,
@@ -3574,6 +3674,8 @@ fn import_totals_json(totals: &ImportTotals) -> Value {
         "skipped": totals.skipped,
         "failed": totals.failed,
         "unchanged_sources": totals.unchanged_sources,
+        "refresh_in_progress_sources": totals.refresh_in_progress_sources,
+        "retry_backoff_sources": totals.retry_backoff_sources,
         "zero_yield_anomaly_sources": totals.zero_yield_anomaly_sources,
         "health_persistence_failed": totals.health_persistence_failures,
     })
@@ -6086,7 +6188,7 @@ fn refresh_sources_for_search(
     fs::create_dir_all(data_root)?;
     config::write_default_config(data_root)?;
     let db_path = database_path(data_root.to_path_buf());
-    let planned_sources = sources
+    let mut planned_sources = sources
         .into_iter()
         .map(|source| (source, SourceStats::default()))
         .collect::<Vec<_>>();
@@ -6101,6 +6203,126 @@ fn refresh_sources_for_search(
     };
     let progress = ProgressReporter::new(progress_arg, json_output, "search-refresh", 0);
     let mut totals = ImportTotals::default();
+
+    // OpenCode is the only provider with a cheap consistency-set signature.
+    // Coordinate it before entering the generic importer; all other providers
+    // retain their existing behavior.
+    let mut remaining = Vec::with_capacity(planned_sources.len());
+    let mut refresh_store = Store::open(&db_path)?;
+    for (source, stats) in planned_sources.drain(..) {
+        if source.provider != CaptureProvider::OpenCode {
+            remaining.push((source, stats));
+            continue;
+        }
+        let lock_key = refresh_store.source_refresh_lock_key(
+            source.provider.as_str(),
+            source.source_format,
+            &source.path,
+            "",
+        )?;
+        let Some(_process_lock) = SourceRefreshProcessLock::try_acquire(data_root, &lock_key)?
+        else {
+            if refresh == RefreshArg::Strict {
+                return Err(anyhow!("OpenCode refresh is already in progress"));
+            }
+            totals.refresh_in_progress_sources += 1;
+            continue;
+        };
+        let observed = observe_opencode_sqlite(&source.path)?;
+        let claim = refresh_store.claim_source_refresh(
+            source.provider.as_str(),
+            source.source_format,
+            &source.path,
+            "",
+            observed.digest(),
+            refresh == RefreshArg::Strict,
+            SEARCH_REFRESH_LEASE_MS,
+        )?;
+        let token = match claim {
+            SourceRefreshClaim::Unchanged => {
+                totals.unchanged_sources += 1;
+                continue;
+            }
+            SourceRefreshClaim::RefreshInProgress if refresh == RefreshArg::Auto => {
+                totals.refresh_in_progress_sources += 1;
+                continue;
+            }
+            SourceRefreshClaim::RetryBackoff if refresh == RefreshArg::Auto => {
+                totals.retry_backoff_sources += 1;
+                continue;
+            }
+            SourceRefreshClaim::RefreshInProgress => {
+                return Err(anyhow!("OpenCode refresh is already in progress"));
+            }
+            SourceRefreshClaim::RetryBackoff => unreachable!("strict bypasses retry backoff"),
+            SourceRefreshClaim::Acquired { token } => token,
+        };
+        test_refresh_lease_barrier(&token)?;
+
+        let mut attempt_observation = observed;
+        let mut retried_changed_source = false;
+        let summary = loop {
+            match import_one_source_without_search_refresh(&mut refresh_store, &source, None, false)
+            {
+                Ok(summary) => break summary,
+                Err(err)
+                    if !retried_changed_source && error_is_source_changed_during_read(&err) =>
+                {
+                    retried_changed_source = true;
+                    attempt_observation = observe_opencode_sqlite(&source.path)?;
+                }
+                Err(err) => {
+                    let code = if error_is_source_changed_during_read(&err) {
+                        SourceRefreshErrorCode::SourceChangedDuringRead
+                    } else {
+                        SourceRefreshErrorCode::ProviderReadFailed
+                    };
+                    let _ = refresh_store.fail_source_refresh(
+                        source.provider.as_str(),
+                        source.source_format,
+                        &source.path,
+                        "",
+                        &token,
+                        attempt_observation.digest(),
+                        code,
+                    )?;
+                    return Err(err);
+                }
+            }
+        };
+        if !refresh_store.complete_source_refresh(
+            source.provider.as_str(),
+            source.source_format,
+            &source.path,
+            "",
+            &token,
+            attempt_observation.digest(),
+        )? {
+            return Err(anyhow!(
+                "OpenCode refresh lease was reclaimed before completion"
+            ));
+        }
+        let health = classify_import_health(&stats, &summary);
+        totals.add_with_health(&summary, &stats, &health);
+        let health_started = Instant::now();
+        if let Err(err) = persist_source_health(
+            &refresh_store,
+            source.provider.as_str(),
+            source.source_format,
+            &source.path,
+            "",
+            &health,
+            true,
+        ) {
+            totals.health_persistence_failures += 1;
+            emit_health_persistence_warning(progress_arg, &err);
+        }
+        totals
+            .phase_timings
+            .health_persistence
+            .record(health_started, 1);
+    }
+    planned_sources = remaining;
     if should_parallelize_import(&planned_sources) {
         let source_states = Arc::new(Mutex::new(
             planned_sources
@@ -6257,6 +6479,14 @@ fn refresh_sources_for_search(
 
     Store::open(&db_path)?.checkpoint_wal_truncate_if_larger_than(WAL_TRUNCATE_MIN_BYTES)?;
     Ok(totals)
+}
+
+fn error_is_source_changed_during_read(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<CaptureError>()
+            .is_some_and(|capture| matches!(capture, CaptureError::SourceChangedDuringRead))
+    })
 }
 
 fn run_doctor(args: DoctorArgs, data_root: PathBuf) -> Result<()> {
@@ -8360,5 +8590,112 @@ mod tests {
         store.upsert_sync_cursor(&cursor).unwrap();
         // New-format cursor: no rescan needed.
         assert!(!source_cursor_requires_rescan(&store, &source).unwrap());
+    }
+
+    #[test]
+    fn source_refresh_process_lock_is_exclusive_across_subprocesses() {
+        use super::SourceRefreshProcessLock;
+        use std::{path::PathBuf, process::Command, thread, time::Duration};
+
+        const CHILD_ENV: &str = "CTX_TEST_REFRESH_LOCK_CHILD";
+        let root = std::env::var_os(CHILD_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| tempdir().unwrap().keep());
+        let ready = root.join("ready");
+        let release = root.join("release");
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let _lock = SourceRefreshProcessLock::try_acquire(&root, &"a".repeat(64))
+                .unwrap()
+                .expect("child owns lock");
+            fs::write(&ready, b"ready").unwrap();
+            while !release.exists() {
+                thread::sleep(Duration::from_millis(5));
+            }
+            return;
+        }
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::source_refresh_process_lock_is_exclusive_across_subprocesses",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, &root)
+            .spawn()
+            .unwrap();
+        for _ in 0..1_000 {
+            if ready.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            ready.exists(),
+            "child did not reach the expensive-work barrier"
+        );
+        assert!(
+            SourceRefreshProcessLock::try_acquire(&root, &"a".repeat(64))
+                .unwrap()
+                .is_none()
+        );
+        fs::write(release, b"release").unwrap();
+        assert!(child.wait().unwrap().success());
+        assert!(
+            SourceRefreshProcessLock::try_acquire(&root, &"a".repeat(64))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn mixed_refresh_outcomes_have_authoritative_reason_counts() {
+        use super::{RefreshArg, SearchRefreshPhaseTimings, SearchRefreshReport};
+
+        for (totals, reason) in [
+            (
+                ImportTotals {
+                    refreshed_sources: 1,
+                    refresh_in_progress_sources: 1,
+                    ..ImportTotals::default()
+                },
+                "refreshed_partial",
+            ),
+            (
+                ImportTotals {
+                    unchanged_sources: 1,
+                    retry_backoff_sources: 1,
+                    ..ImportTotals::default()
+                },
+                "mixed",
+            ),
+            (
+                ImportTotals {
+                    refresh_in_progress_sources: 1,
+                    retry_backoff_sources: 1,
+                    ..ImportTotals::default()
+                },
+                "mixed",
+            ),
+        ] {
+            let expected = [
+                totals.refreshed_sources,
+                totals.unchanged_sources,
+                totals.refresh_in_progress_sources,
+                totals.retry_backoff_sources,
+            ];
+            let report = SearchRefreshReport::completed(
+                RefreshArg::Auto,
+                expected.iter().sum(),
+                totals,
+                0,
+                SearchRefreshPhaseTimings::default(),
+            )
+            .to_json();
+            assert_eq!(report["status"], "completed_mixed");
+            assert_eq!(report["reason"], reason);
+            assert_eq!(report["reason_counts"]["refreshed"], expected[0]);
+            assert_eq!(report["reason_counts"]["unchanged"], expected[1]);
+            assert_eq!(report["reason_counts"]["refresh_in_progress"], expected[2]);
+            assert_eq!(report["reason_counts"]["retry_backoff"], expected[3]);
+        }
     }
 }

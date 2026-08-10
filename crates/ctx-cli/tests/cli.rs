@@ -1,6 +1,8 @@
 use assert_cmd::Command;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use ctx_history_store::verify_archive_bundle;
+#[cfg(unix)]
+use ctx_history_store::{SourceRefreshClaim, SourceRefreshErrorCode, Store};
 use predicates::prelude::*;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
@@ -468,6 +470,30 @@ fn ctx(temp: &TempDir) -> Command {
     command.env("CTX_DATA_ROOT", temp.path());
     command.env("HOME", temp.path());
     command
+}
+
+#[cfg(unix)]
+fn wait_for_child_file(child: &mut std::process::Child, path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if path.exists() {
+            return;
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!(
+                "refresh child exited before creating {}: {status}",
+                path.display()
+            );
+        }
+        if Instant::now() >= deadline {
+            unsafe {
+                libc::kill(child.id() as i32, libc::SIGKILL);
+            }
+            let _ = child.wait();
+            panic!("refresh child did not create {}", path.display());
+        }
+        std::thread::yield_now();
+    }
 }
 
 #[test]
@@ -4398,10 +4424,10 @@ fn read_only_commands_direct_old_schemas_to_a_writable_migration() {
 
 #[test]
 fn read_only_commands_reject_foreign_schemas_without_impossible_migration_advice() {
-    // 16 sits in the unreviewed upstream gap; 1003 is newer than this
+    // 16 sits in the unreviewed upstream gap; 1004 is newer than this
     // binary. Neither can be migrated by it, so the guidance must say
     // upgrade/restore rather than suggesting a migration command.
-    for version in [16i64, 1003] {
+    for version in [16i64, 1004] {
         let temp = tempdir();
         let db_path = write_bare_store_with_user_version(&temp, version);
         let before = fs::read(&db_path).unwrap();
@@ -4435,7 +4461,7 @@ fn read_only_commands_reject_foreign_schemas_without_impossible_migration_advice
 #[test]
 fn mcp_status_reports_version_guidance_for_foreign_schema() {
     let temp = tempdir();
-    write_bare_store_with_user_version(&temp, 1003);
+    write_bare_store_with_user_version(&temp, 1004);
     let responses = mcp_roundtrip(
         &temp,
         &[
@@ -4467,7 +4493,7 @@ fn mcp_status_reports_version_guidance_for_foreign_schema() {
     assert_eq!(result["isError"], true);
     let error = result["structuredContent"]["error"].as_str().unwrap();
     assert!(
-        error.contains("schema version 1003 is newer than or incompatible with this ctx binary"),
+        error.contains("schema version 1004 is newer than or incompatible with this ctx binary"),
         "{error}"
     );
     assert!(error.contains("upgrade ctx"), "{error}");
@@ -4476,7 +4502,7 @@ fn mcp_status_reports_version_guidance_for_foreign_schema() {
 
 #[test]
 fn mcp_non_status_tools_report_version_guidance_without_mutating() {
-    for version in [15i64, 16, 1003] {
+    for version in [15i64, 16, 1004] {
         let temp = tempdir();
         let db_path = write_bare_store_with_user_version(&temp, version);
         let bytes_before = fs::read(&db_path).unwrap();
@@ -7407,6 +7433,217 @@ fn search_refreshes_discovered_codex_sessions_before_query() {
     assert_eq!(status["pending_catalog_sessions"], 0);
 }
 
+#[cfg(unix)]
+#[test]
+fn search_refresh_crash_releases_process_lock_and_fences_reclaimed_lease() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::{fs::PermissionsExt, process::ExitStatusExt};
+
+    let temp = tempdir();
+    let query = "opencode-crash-reclaim-oracle";
+    let source = PathBuf::from(write_native_opencode_fixture(&temp, query));
+    let discovered = temp.path().join(".local/share/opencode/opencode.db");
+    fs::create_dir_all(discovered.parent().unwrap()).unwrap();
+    fs::copy(&source, &discovered).unwrap();
+
+    let old_token_file = temp.path().join("old-owner-token");
+    let old_release_file = temp.path().join("old-owner-release");
+    let mut crashed_owner = StdCommand::new(assert_cmd::cargo::cargo_bin("ctx"))
+        .args([
+            "search",
+            query,
+            "--provider",
+            "opencode",
+            "--refresh",
+            "strict",
+            "--json",
+        ])
+        .env("CTX_DATA_ROOT", temp.path())
+        .env("HOME", temp.path())
+        .env("CTX_TEST_REFRESH_LEASE_TOKEN_FILE", &old_token_file)
+        .env("CTX_TEST_REFRESH_LEASE_RELEASE_FILE", &old_release_file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for_child_file(&mut crashed_owner, &old_token_file);
+    let old_token = fs::read_to_string(&old_token_file).unwrap();
+    assert_eq!(old_token.len(), 64);
+    assert!(old_token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+    unsafe {
+        assert_eq!(libc::kill(crashed_owner.id() as i32, libc::SIGKILL), 0);
+    }
+    let crashed_status = crashed_owner.wait().unwrap();
+    assert!(
+        !crashed_status.success(),
+        "crashed owner unexpectedly succeeded"
+    );
+    assert_eq!(crashed_status.signal(), Some(libc::SIGKILL));
+
+    let db_path = temp.path().join("work.sqlite");
+    let source_key = {
+        let store = Store::open(&db_path).unwrap();
+        store
+            .source_refresh_lock_key("opencode", "opencode_sqlite", &discovered, "")
+            .unwrap()
+    };
+
+    let lock_dir = temp.path().join("refresh-locks");
+    let lock_path = lock_dir.join(&source_key);
+    assert_eq!(
+        fs::metadata(&lock_dir).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(source_key.len(), 64);
+    assert!(!lock_path
+        .to_string_lossy()
+        .contains(discovered.to_string_lossy().as_ref()));
+
+    // The child died without dropping its File.  Re-taking the same flock is
+    // the kernel-level assertion that the advisory lock was crash-released.
+    let lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0,
+        "crash did not release the per-source process lock"
+    );
+
+    let claimant = Store::open(&db_path).unwrap();
+    assert_eq!(
+        claimant
+            .claim_source_refresh(
+                "opencode",
+                "opencode_sqlite",
+                &discovered,
+                "",
+                &[1; 32],
+                false,
+                60_000,
+            )
+            .unwrap(),
+        SourceRefreshClaim::RefreshInProgress
+    );
+    drop(claimant);
+    drop(lock_file);
+
+    // Move only the durable lease clock.  No wall-clock wait is needed, and a
+    // claimant still cannot pass while the original token is current.
+    let conn = Connection::open(&db_path).unwrap();
+    assert_eq!(
+        conn.execute(
+            "UPDATE source_refresh_state SET lease_expires_at_ms = 0 WHERE source_key = ?1",
+            params![source_key],
+        )
+        .unwrap(),
+        1
+    );
+    drop(conn);
+
+    let new_token_file = temp.path().join("new-owner-token");
+    let new_release_file = temp.path().join("new-owner-release");
+    let mut new_owner = StdCommand::new(assert_cmd::cargo::cargo_bin("ctx"))
+        .args([
+            "search",
+            query,
+            "--provider",
+            "opencode",
+            "--refresh",
+            "strict",
+            "--json",
+        ])
+        .env("CTX_DATA_ROOT", temp.path())
+        .env("HOME", temp.path())
+        .env("CTX_TEST_REFRESH_LEASE_TOKEN_FILE", &new_token_file)
+        .env("CTX_TEST_REFRESH_LEASE_RELEASE_FILE", &new_release_file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_child_file(&mut new_owner, &new_token_file);
+    let new_token = fs::read_to_string(&new_token_file).unwrap();
+    assert_ne!(old_token, new_token);
+
+    let stale_store = Store::open(&db_path).unwrap();
+    assert!(!stale_store
+        .complete_source_refresh(
+            "opencode",
+            "opencode_sqlite",
+            &discovered,
+            "",
+            &old_token,
+            &[9; 32],
+        )
+        .unwrap());
+    assert!(!stale_store
+        .fail_source_refresh(
+            "opencode",
+            "opencode_sqlite",
+            &discovered,
+            "",
+            &old_token,
+            &[9; 32],
+            SourceRefreshErrorCode::ProviderReadFailed,
+        )
+        .unwrap());
+    let active_conn = Connection::open(&db_path).unwrap();
+    let active_token: String = active_conn
+        .query_row(
+            "SELECT lease_token FROM source_refresh_state WHERE source_key = ?1",
+            params![source_key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(active_token, new_token);
+    drop(active_conn);
+    drop(stale_store);
+
+    fs::write(&new_release_file, b"release").unwrap();
+    let new_output = new_owner.wait_with_output().unwrap();
+    assert!(
+        new_output.status.success(),
+        "new owner failed: {}",
+        String::from_utf8_lossy(&new_output.stderr)
+    );
+    let refreshed: Value = serde_json::from_slice(&new_output.stdout).unwrap();
+    assert_eq!(refreshed["freshness"]["status"], "completed");
+    assert_eq!(refreshed["freshness"]["totals"]["imported_events"], 1);
+    assert_search_provider_oracle(&refreshed, "opencode", query, 1, "message");
+
+    let conn = Connection::open(&db_path).unwrap();
+    type RefreshState = (Option<Vec<u8>>, Option<Vec<u8>>, Option<String>, i64);
+    let (successful, observed, lease_token, success_count): RefreshState = conn
+        .query_row(
+            "SELECT successful_signature, observed_signature, lease_token, success_count
+             FROM source_refresh_state WHERE source_key = ?1",
+            params![source_key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(successful, observed);
+    assert!(successful.is_some());
+    assert!(lease_token.is_none());
+    assert_eq!(success_count, 1);
+    assert_eq!(
+        sqlite_count(
+            &conn,
+            "SELECT COUNT(*) FROM events e JOIN sessions s ON e.session_id = s.id WHERE s.provider = 'opencode'",
+        ),
+        1,
+        "only the reclaimed owner may leave imported canonical state"
+    );
+}
+
 #[test]
 fn search_uses_persistent_refresh_policy_when_cli_value_is_omitted() {
     let temp = tempdir();
@@ -7693,7 +7930,8 @@ fn search_refresh_manifested_source_noop_then_one_change_reports_freshness_count
         "--json",
     ]));
     assert_eq!(second["freshness"]["ran"], true);
-    assert_eq!(second["freshness"]["reason"], "refreshed");
+    assert_eq!(second["freshness"]["reason"], "unchanged");
+    assert_eq!(second["freshness"]["reason_counts"]["unchanged"], 1);
     assert_eq!(second["freshness"]["totals"]["imported_sessions"], 0);
     assert_eq!(second["freshness"]["totals"]["imported_events"], 0);
     assert_eq!(second["freshness"]["totals"]["skipped"], 0);

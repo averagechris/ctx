@@ -49,11 +49,30 @@ store write, or refresh read; the query opens the existing current store
 read-only as before.
 
 `unchanged_sources` counts provider sources proven unchanged by metadata/cursor
-state without importing new rows: manifested provider roots persist file path,
-size, mtime, and indexed timestamp, and a rescan that finds no pending files
-reports the source as unchanged. It reports the observed refresh
-outcome; it does not add a new metadata fast path or change provider import
-performance.
+state without importing new rows. OpenCode automatic refresh persists only a
+store-keyed HMAC identity and 32-byte main/WAL/SHM metadata signatures. An equal
+successful signature reports `unchanged` without opening or normalizing the
+provider database. It stores no source path or transcript content.
+
+Concurrent OpenCode refreshes coordinate with a crash-released, per-source OS
+advisory lock (private opaque filename) plus a 30-minute token-fenced database lease.
+Auto mode serves the existing index with `refresh_in_progress`; unchanged
+failures use deterministic exponential backoff (one second through five
+minutes) and report `retry_backoff`. A changed signature bypasses backoff.
+Strict mode bypasses backoff and fails rather than silently serving stale data
+when another owner holds the lease. Additive freshness totals expose bounded
+`refresh_in_progress_sources` and `retry_backoff_sources` counts. Mixed work
+uses status `completed_mixed`, reason `refreshed_partial` when any source was
+refreshed (otherwise `mixed`), and authoritative aggregate `reason_counts`;
+diagnostics expose no source key, path, signature,
+lease token, or provider error.
+
+OpenCode still fully normalizes the database whenever its consistency set
+changes; this state is not an incremental-read cursor. The ignored
+`opencode_sparse_signature_warm_p95` capture test is the manual metadata-only
+40+ GiB sparse-file harness (target warm p95 <=500 ms). It is manual evidence,
+is not run by CI, and uses a temporary
+root and does not read file contents, the real home directory, or the network.
 
 Freshness age uses existing manifest, history-record, and session timestamps.
 Event timestamps are queried only as a compatibility fallback for stores that

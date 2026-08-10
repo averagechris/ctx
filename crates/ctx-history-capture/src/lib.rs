@@ -6641,6 +6641,7 @@ struct OpenCodeSqliteSourceSignature {
     main: OpenCodeSqliteFileSignature,
     wal: OpenCodeSqliteFileSignature,
     shm: OpenCodeSqliteFileSignature,
+    wal_markers: Option<OpenCodeWalMarkers>,
 }
 
 #[derive(Debug, Serialize)]
@@ -6652,6 +6653,19 @@ struct OpenCodeSqliteFileSignature {
 }
 
 #[derive(Debug, Serialize)]
+struct OpenCodeWalMarkers {
+    page_size: u32,
+    checkpoint_sequence: u32,
+    salt_1: u32,
+    salt_2: u32,
+    complete_frames: u64,
+    last_frame_page: Option<u32>,
+    last_frame_commit_pages: Option<u32>,
+    last_frame_salt_1: Option<u32>,
+    last_frame_salt_2: Option<u32>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
 struct PortableFileTime {
     before_epoch: bool,
     seconds: u64,
@@ -6677,10 +6691,11 @@ pub fn observe_opencode_sqlite(path: impl AsRef<Path>) -> Result<OpenCodeSqliteS
     let wal = observe_opencode_sqlite_file(&opencode_sqlite_sidecar_path(path, "-wal"))?;
     let shm = observe_opencode_sqlite_file(&opencode_sqlite_sidecar_path(path, "-shm"))?;
     let signature = OpenCodeSqliteSourceSignature {
-        format: "opencode-sqlite-source-v1",
+        format: "opencode-sqlite-source-v2",
         main,
         wal,
         shm,
+        wal_markers: observe_opencode_wal_markers(&opencode_sqlite_sidecar_path(path, "-wal"))?,
     };
     let serialized_signature = serde_json::to_string(&signature)?;
     let digest = Sha256::digest(serialized_signature.as_bytes()).into();
@@ -6688,6 +6703,60 @@ pub fn observe_opencode_sqlite(path: impl AsRef<Path>) -> Result<OpenCodeSqliteS
         serialized_signature,
         digest,
     })
+}
+
+fn observe_opencode_wal_markers(path: &Path) -> Result<Option<OpenCodeWalMarkers>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let size = file.metadata()?.len();
+    if size < 32 {
+        return Ok(None);
+    }
+    let mut header = [0_u8; 32];
+    file.read_exact(&mut header)?;
+    let word = |offset: usize| u32::from_be_bytes(header[offset..offset + 4].try_into().unwrap());
+    if !matches!(word(0), 0x377f_0682 | 0x377f_0683) {
+        return Ok(None);
+    }
+    let raw_page_size = word(8);
+    let page_size = if raw_page_size == 1 {
+        65_536
+    } else {
+        raw_page_size
+    };
+    if !(512..=65_536).contains(&page_size) || !page_size.is_power_of_two() {
+        return Ok(None);
+    }
+    let frame_size = 24_u64 + u64::from(page_size);
+    let complete_frames = (size - 32) / frame_size;
+    let mut markers = OpenCodeWalMarkers {
+        page_size,
+        checkpoint_sequence: word(12),
+        salt_1: word(16),
+        salt_2: word(20),
+        complete_frames,
+        last_frame_page: None,
+        last_frame_commit_pages: None,
+        last_frame_salt_1: None,
+        last_frame_salt_2: None,
+    };
+    if complete_frames > 0 {
+        file.seek(SeekFrom::Start(32 + (complete_frames - 1) * frame_size))?;
+        let mut frame = [0_u8; 24];
+        file.read_exact(&mut frame)?;
+        let frame_word =
+            |offset: usize| u32::from_be_bytes(frame[offset..offset + 4].try_into().unwrap());
+        markers.last_frame_page = Some(frame_word(0));
+        markers.last_frame_commit_pages = Some(frame_word(4));
+        markers.last_frame_salt_1 = Some(frame_word(8));
+        markers.last_frame_salt_2 = Some(frame_word(12));
+    }
+    Ok(Some(markers))
 }
 
 fn opencode_sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
@@ -13602,6 +13671,72 @@ mod tests {
         assert_ne!(initial, with_shm);
         fs::remove_file(&shm).unwrap();
         assert_eq!(initial, observe_opencode_sqlite(&path).unwrap());
+    }
+
+    #[test]
+    fn opencode_observation_tracks_wal_only_commits_and_reset_reuse() {
+        let temp = tempdir();
+        let path = temp.path().join("opencode.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE messages(id INTEGER PRIMARY KEY, body TEXT);
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .unwrap();
+        let main_before = fs::metadata(&path).unwrap();
+        conn.execute("INSERT INTO messages(body) VALUES ('one')", [])
+            .unwrap();
+        let first_commit = observe_opencode_sqlite(&path).unwrap();
+        let main_after_first = fs::metadata(&path).unwrap();
+        assert_eq!(main_before.len(), main_after_first.len());
+        assert_eq!(
+            portable_file_time(&main_before),
+            portable_file_time(&main_after_first),
+            "commit unexpectedly changed the main DB instead of remaining WAL-only"
+        );
+        conn.execute("INSERT INTO messages(body) VALUES ('two')", [])
+            .unwrap();
+        let second_commit = observe_opencode_sqlite(&path).unwrap();
+        assert_ne!(first_commit, second_commit);
+
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        let checkpointed = observe_opencode_sqlite(&path).unwrap();
+        assert_ne!(second_commit, checkpointed);
+        conn.execute("INSERT INTO messages(body) VALUES ('six')", [])
+            .unwrap();
+        let reset_reuse = observe_opencode_sqlite(&path).unwrap();
+        assert_ne!(checkpointed, reset_reuse);
+        assert_ne!(
+            first_commit, reset_reuse,
+            "WAL reset salts must fence same-size reuse"
+        );
+    }
+
+    #[test]
+    #[ignore = "manual sparse-file metadata performance evidence"]
+    fn opencode_sparse_signature_warm_p95() {
+        let temp = tempdir();
+        let path = temp.path().join("opencode-sparse.db");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(41 * 1024 * 1024 * 1024).unwrap();
+        observe_opencode_sqlite(&path).unwrap();
+        let mut samples = (0..100)
+            .map(|_| {
+                let started = Instant::now();
+                observe_opencode_sqlite(&path).unwrap();
+                started.elapsed()
+            })
+            .collect::<Vec<_>>();
+        samples.sort_unstable();
+        let p95 = samples[94];
+        eprintln!("OpenCode sparse 41 GiB metadata signature warm p95: {p95:?}");
+        assert!(
+            p95 <= std::time::Duration::from_millis(500),
+            "warm p95 was {p95:?}"
+        );
     }
 
     #[test]

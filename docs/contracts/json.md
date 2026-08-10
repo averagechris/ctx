@@ -416,16 +416,16 @@ event ID) inside the hex token so keyset paging can resume; this is not path,
 query, or provider metadata.
 
 Writable opens migrate known v0-v15 stores through the fork chain — v1000
-(durable FTS rowid maps), v1001 (pagination indexes), then v1002 (path-free
-source health) — and existing v1000/v1001 stores to v1002; reserved versions
-16-999 and versions above 1002 fail closed
+  (durable FTS rowid maps), v1001 (pagination indexes), v1002 (path-free
+  source health), then v1003 (path-free refresh coordination) — and existing
+  v1000–v1002 stores to v1003; reserved versions 16-999 and versions above 1003 fail closed
 without mutation. Index creation and `user_version = 1001` are one
 transaction, and the step touches neither the rowid maps nor the FTS
 projections. The v1001 migration adds exactly
 `idx_sessions_provider_external_session_started` on
 `sessions(provider, external_session_id, started_at_ms DESC, id)` and
 `idx_events_session_seq_id` on `events(session_id, seq, id)`. Read-only
-search/show/locate/MCP opens require exactly v1002 and never migrate or write.
+search/show/locate/MCP opens require exactly v1003 and never migrate or write.
 Restart long-lived processes such as `ctx mcp` after upgrading so they reopen
 through the v1002 gate.
 

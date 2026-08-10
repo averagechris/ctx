@@ -965,8 +965,8 @@ impl IdPrefixAmbiguity {
 /// this fork's first schema divergence jumps to 1000 (docs/fork-plan.md,
 /// decision 9) so fork migrations can never collide with upstream's chain.
 /// v1000 is the landed rowid-map migration; v1001 adds bounded pagination
-/// indexes and v1002 adds the path-free source-health ledger. The next fork
-/// migration is 1003.
+/// indexes, v1002 adds the path-free source-health ledger, and v1003 adds
+/// path-free automatic-refresh coordination state.
 ///
 /// Any binary whose chain ends at v15 refuses to *open* a fork-versioned
 /// store, both read-only (exact-version check in [`Store::open_read_only`])
@@ -978,7 +978,7 @@ impl IdPrefixAmbiguity {
 /// open connection can keep writing until it restarts, which is why release
 /// guidance says to restart long-lived ctx processes after upgrading and
 /// why map entries are verified before every point delete.
-const SCHEMA_VERSION: i64 = 1002;
+const SCHEMA_VERSION: i64 = 1003;
 /// First schema version of this fork's migration chain (the v1000 rowid-map
 /// migration). Writable opens migrate every reviewed version at or above
 /// this up to [`SCHEMA_VERSION`]; the fork chain has no gaps.
@@ -992,7 +992,7 @@ const UPSTREAM_SCHEMA_VERSION_MAX: i64 = 15;
 /// True when a writable open of this binary can migrate the given on-disk
 /// schema version to the current one: everything at or below the ported
 /// upstream chain (≤ v15) migrates, and so does every reviewed fork version
-/// (currently v1000 and v1001, upgraded without touching rowid maps or FTS
+/// (currently v1000 through v1002, upgraded without touching rowid maps or FTS
 /// projections). Versions in the (15, 1000)
 /// gap and versions above [`SCHEMA_VERSION`] belong to other (newer or
 /// unreviewed) binaries and are rejected rather than migrated; callers
@@ -2795,6 +2795,9 @@ impl Store {
         if user_version < 1002 {
             migrate_to_v1002(&self.conn)?;
         }
+        if user_version < 1003 {
+            migrate_to_v1003(&self.conn)?;
+        }
         create_fts_tables_if_supported(&self.conn)?;
         // Recreate dropped rowid map tables empty on open; an empty map is
         // always safe (writes degrade to the legacy full-scan path and each
@@ -3654,7 +3657,7 @@ impl Store {
         logical_id: &str,
         classification: SourceHealthClassification,
     ) -> Result<()> {
-        let source_key = self.source_health_key(provider, format, logical_path, logical_id)?;
+        let source_key = self.source_identity_key(provider, format, logical_path, logical_id)?;
         self.conn.execute(
             r#"INSERT INTO source_health(source_key, classification, updated_at_ms)
                VALUES (?1, ?2, ?3)
@@ -3677,7 +3680,7 @@ impl Store {
         logical_path: &Path,
         logical_id: &str,
     ) -> Result<usize> {
-        let source_key = self.source_health_key(provider, format, logical_path, logical_id)?;
+        let source_key = self.source_identity_key(provider, format, logical_path, logical_id)?;
         Ok(self.conn.execute(
             "UPDATE source_health SET classification = 'healthy', updated_at_ms = ?2 WHERE source_key = ?1",
             params![source_key, utc_now().timestamp_millis()],
@@ -3690,7 +3693,7 @@ impl Store {
         Ok(self.conn.execute("DELETE FROM source_health", [])?)
     }
 
-    fn source_health_key(
+    fn source_identity_key(
         &self,
         provider: &str,
         format: &str,
@@ -3715,6 +3718,136 @@ impl Store {
             input.extend_from_slice(component);
         }
         Ok(hmac_sha256_hex(&key, &input))
+    }
+
+    /// Returns the opaque store-keyed identity used for private coordination
+    /// filenames. The returned value contains no reversible path material.
+    pub fn source_refresh_lock_key(
+        &self,
+        provider: &str,
+        format: &str,
+        logical_path: &Path,
+        logical_id: &str,
+    ) -> Result<String> {
+        self.source_identity_key(provider, format, logical_path, logical_id)
+    }
+
+    /// Atomically decides whether an automatic source refresh may proceed.
+    /// Source identity is HMACed with the store-local key; paths are never persisted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn claim_source_refresh(
+        &self,
+        provider: &str,
+        format: &str,
+        logical_path: &Path,
+        logical_id: &str,
+        observation: &[u8; 32],
+        bypass_backoff: bool,
+        lease_ms: i64,
+    ) -> Result<SourceRefreshClaim> {
+        let source_key = self.source_identity_key(provider, format, logical_path, logical_id)?;
+        let now = utc_now().timestamp_millis();
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let result = (|| -> Result<SourceRefreshClaim> {
+            let state = self.conn.query_row(
+                "SELECT successful_signature, observed_signature, next_retry_at_ms, lease_token, lease_expires_at_ms FROM source_refresh_state WHERE source_key = ?1",
+                [&source_key],
+                |row| Ok((row.get::<_, Option<Vec<u8>>>(0)?, row.get::<_, Option<Vec<u8>>>(1)?, row.get::<_, Option<i64>>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, Option<i64>>(4)?)),
+            ).optional()?;
+            if let Some((successful, observed, next_retry, lease_token, lease_expiry)) = &state {
+                if lease_token.is_some() && lease_expiry.is_some_and(|expiry| expiry > now) {
+                    return Ok(SourceRefreshClaim::RefreshInProgress);
+                }
+                if successful.as_deref() == Some(observation.as_slice()) {
+                    return Ok(SourceRefreshClaim::Unchanged);
+                }
+                if !bypass_backoff
+                    && observed.as_deref() == Some(observation.as_slice())
+                    && next_retry.is_some_and(|retry| retry > now)
+                {
+                    return Ok(SourceRefreshClaim::RetryBackoff);
+                }
+            }
+            let token: String =
+                self.conn
+                    .query_row("SELECT lower(hex(randomblob(32)))", [], |row| row.get(0))?;
+            self.conn.execute(
+                r#"INSERT INTO source_refresh_state(source_key, observed_signature, attempt_count, last_attempt_at_ms, failure_count, lease_token, lease_expires_at_ms)
+                   VALUES (?1, ?2, 1, ?3, 0, ?4, ?5)
+                   ON CONFLICT(source_key) DO UPDATE SET
+                     failure_count = CASE WHEN source_refresh_state.observed_signature = excluded.observed_signature THEN source_refresh_state.failure_count ELSE 0 END,
+                     next_retry_at_ms = CASE WHEN source_refresh_state.observed_signature = excluded.observed_signature THEN source_refresh_state.next_retry_at_ms ELSE NULL END,
+                     last_error_code = CASE WHEN source_refresh_state.observed_signature = excluded.observed_signature THEN source_refresh_state.last_error_code ELSE NULL END,
+                     observed_signature = excluded.observed_signature,
+                     attempt_count = source_refresh_state.attempt_count + 1,
+                     last_attempt_at_ms = excluded.last_attempt_at_ms,
+                     lease_token = excluded.lease_token,
+                     lease_expires_at_ms = excluded.lease_expires_at_ms"#,
+                params![source_key, observation.as_slice(), now, token, now.saturating_add(lease_ms.max(1))],
+            )?;
+            Ok(SourceRefreshClaim::Acquired { token })
+        })();
+        match result {
+            Ok(claim) => {
+                self.conn.execute_batch("COMMIT;")?;
+                Ok(claim)
+            }
+            Err(err) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(err)
+            }
+        }
+    }
+
+    pub fn complete_source_refresh(
+        &self,
+        provider: &str,
+        format: &str,
+        logical_path: &Path,
+        logical_id: &str,
+        token: &str,
+        successful_observation: &[u8; 32],
+    ) -> Result<bool> {
+        let source_key = self.source_identity_key(provider, format, logical_path, logical_id)?;
+        let changed = self.conn.execute(
+            "UPDATE source_refresh_state SET successful_signature=?3, observed_signature=?3, success_count=success_count+1, last_success_at_ms=?4, failure_count=0, next_retry_at_ms=NULL, last_error_code=NULL, lease_token=NULL, lease_expires_at_ms=NULL WHERE source_key=?1 AND lease_token=?2",
+            params![source_key, token, successful_observation.as_slice(), utc_now().timestamp_millis()],
+        )?;
+        Ok(changed == 1)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn fail_source_refresh(
+        &self,
+        provider: &str,
+        format: &str,
+        logical_path: &Path,
+        logical_id: &str,
+        token: &str,
+        observation: &[u8; 32],
+        error_code: SourceRefreshErrorCode,
+    ) -> Result<bool> {
+        let source_key = self.source_identity_key(provider, format, logical_path, logical_id)?;
+        let now = utc_now().timestamp_millis();
+        let current: Option<(Vec<u8>, i64)> = self.conn.query_row(
+            "SELECT observed_signature, failure_count FROM source_refresh_state WHERE source_key=?1 AND lease_token=?2",
+            params![source_key, token], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        let Some((previous, previous_count)) = current else {
+            return Ok(false);
+        };
+        let failure_count = if previous.as_slice() == observation {
+            previous_count.saturating_add(1).min(19)
+        } else {
+            1
+        };
+        let shift = u32::try_from(failure_count.saturating_sub(1).min(18)).unwrap_or(18);
+        let delay_ms = 1_000i64.saturating_mul(1i64 << shift).min(300_000);
+        let changed = self.conn.execute(
+            "UPDATE source_refresh_state SET observed_signature=?3, failure_count=?4, next_retry_at_ms=?5, last_error_code=?6, lease_token=NULL, lease_expires_at_ms=NULL WHERE source_key=?1 AND lease_token=?2",
+            params![source_key, token, observation.as_slice(), failure_count, now.saturating_add(delay_ms), error_code.as_str()],
+        )?;
+        Ok(changed == 1)
     }
 
     pub fn source_health_counts(&self) -> Result<SourceHealthCounts> {
@@ -8226,6 +8359,67 @@ fn migrate_to_v1002(conn: &Connection) -> Result<()> {
         Err(err) => {
             let _ = conn.execute_batch("ROLLBACK;");
             Err(err)
+        }
+    }
+}
+
+/// Operational, path-free source refresh state. This deliberately performs no
+/// backfill and does not read or modify base content, FTS, or rowid maps.
+fn migrate_to_v1003(conn: &Connection) -> Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let migration = conn.execute_batch(r#"
+        CREATE TABLE source_refresh_state (
+          source_key TEXT PRIMARY KEY CHECK (length(source_key) = 64 AND source_key NOT GLOB '*[^0-9a-f]*'),
+          successful_signature BLOB CHECK (successful_signature IS NULL OR length(successful_signature) = 32),
+          observed_signature BLOB CHECK (observed_signature IS NULL OR length(observed_signature) = 32),
+          attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+          success_count INTEGER NOT NULL DEFAULT 0 CHECK (success_count >= 0 AND success_count <= attempt_count),
+          last_attempt_at_ms INTEGER,
+          last_success_at_ms INTEGER,
+          failure_count INTEGER NOT NULL DEFAULT 0 CHECK (failure_count BETWEEN 0 AND 19),
+          next_retry_at_ms INTEGER,
+          last_error_code TEXT CHECK (last_error_code IS NULL OR (length(last_error_code) BETWEEN 1 AND 64 AND last_error_code NOT GLOB '*[^a-z0-9_]*')),
+          lease_token TEXT CHECK (lease_token IS NULL OR (length(lease_token) = 64 AND lease_token NOT GLOB '*[^0-9a-f]*')),
+          lease_expires_at_ms INTEGER,
+          CHECK ((lease_token IS NULL) = (lease_expires_at_ms IS NULL)),
+          CHECK ((failure_count = 0 AND next_retry_at_ms IS NULL AND last_error_code IS NULL) OR
+                 (failure_count > 0 AND next_retry_at_ms IS NOT NULL AND last_error_code IS NOT NULL))
+        );
+        CREATE INDEX source_refresh_retry_idx ON source_refresh_state(next_retry_at_ms) WHERE next_retry_at_ms IS NOT NULL;
+        CREATE INDEX source_refresh_lease_idx ON source_refresh_state(lease_expires_at_ms) WHERE lease_expires_at_ms IS NOT NULL;
+        PRAGMA user_version = 1003;
+    "#);
+    match migration {
+        Ok(()) => {
+            conn.execute_batch("COMMIT;")?;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(StoreError::Sql(err))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceRefreshClaim {
+    Acquired { token: String },
+    Unchanged,
+    RefreshInProgress,
+    RetryBackoff,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceRefreshErrorCode {
+    SourceChangedDuringRead,
+    ProviderReadFailed,
+}
+
+impl SourceRefreshErrorCode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SourceChangedDuringRead => "source_changed_during_read",
+            Self::ProviderReadFailed => "provider_read_failed",
         }
     }
 }
@@ -15234,7 +15428,7 @@ mod search_rowid_map_tests {
         );
 
         let store = Store::open(&path).unwrap();
-        assert_eq!(user_version(&store), 1002);
+        assert_eq!(user_version(&store), 1003);
         assert_eq!(user_version(&store), SCHEMA_VERSION);
 
         // The maps exist and start empty: no backfill.
@@ -15289,7 +15483,7 @@ mod search_rowid_map_tests {
         let temp = tempdir();
         let store = Store::open(temp.path().join("work.sqlite")).unwrap();
         assert_eq!(user_version(&store), SCHEMA_VERSION);
-        assert_eq!(user_version(&store), 1002);
+        assert_eq!(user_version(&store), 1003);
         // The upstream chain ran first: its v13+ stable views exist.
         assert_eq!(
             count(
@@ -15343,15 +15537,15 @@ mod search_rowid_map_tests {
         drop(Store::open(&future_path).unwrap());
         Connection::open(&future_path)
             .unwrap()
-            .execute_batch("PRAGMA user_version = 1003;")
+            .execute_batch("PRAGMA user_version = 1004;")
             .unwrap();
         assert!(matches!(
             Store::open(&future_path),
-            Err(StoreError::UnsupportedSchemaVersion(1003))
+            Err(StoreError::UnsupportedSchemaVersion(1004))
         ));
         assert!(matches!(
             Store::open_read_only(&future_path),
-            Err(StoreError::UnsupportedSchemaVersion(1003))
+            Err(StoreError::UnsupportedSchemaVersion(1004))
         ));
 
         // Read-only open also requires the exact current version for fork
@@ -15402,7 +15596,7 @@ mod search_rowid_map_tests {
         // persistent PRAGMA (journal_mode = WAL) applied before the version
         // gate would show up as mutated bytes, a changed journal mode, or
         // WAL sidecar files.
-        for version in [16i64, 999, 1003] {
+        for version in [16i64, 999, 1004] {
             let path = temp.path().join(format!("foreign-{version}.sqlite"));
             {
                 let conn = Connection::open(&path).unwrap();
@@ -15490,6 +15684,9 @@ mod search_rowid_map_tests {
             conn.execute_batch(
                 r#"
                 BEGIN IMMEDIATE;
+                DROP INDEX source_refresh_retry_idx;
+                DROP INDEX source_refresh_lease_idx;
+                DROP TABLE source_refresh_state;
                 DROP TABLE record_search_rowids;
                 DROP TABLE event_search_rowids;
                 PRAGMA user_version = 15;
@@ -15515,7 +15712,7 @@ mod search_rowid_map_tests {
         // v1001 pagination indexes): data intact, maps recreated empty,
         // lazy healing resumes.
         let store = Store::open(&path).unwrap();
-        assert_eq!(user_version(&store), 1002);
+        assert_eq!(user_version(&store), 1003);
         assert_eq!(
             count(&store, "SELECT COUNT(*) FROM record_search_rowids"),
             0
@@ -15625,6 +15822,9 @@ mod search_rowid_map_tests {
             conn.execute_batch(
                 r#"
                 BEGIN IMMEDIATE;
+                DROP INDEX source_refresh_retry_idx;
+                DROP INDEX source_refresh_lease_idx;
+                DROP TABLE source_refresh_state;
                 DROP INDEX idx_sessions_provider_external_session_started;
                 DROP INDEX idx_events_session_seq_id;
                 PRAGMA user_version = 1000;
@@ -15654,7 +15854,7 @@ mod search_rowid_map_tests {
 
         // A writable open migrates v1000 → v1001 in place.
         let store = Store::open(&path).unwrap();
-        assert_eq!(user_version(&store), 1002);
+        assert_eq!(user_version(&store), 1003);
         for index in [
             "idx_sessions_provider_external_session_started",
             "idx_events_session_seq_id",
@@ -16496,7 +16696,7 @@ mod catalog_tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(user_version, 1002);
+        assert_eq!(user_version, 1003);
         let event_plan = store
             .conn
             .prepare("EXPLAIN QUERY PLAN SELECT id FROM events WHERE session_id = ?1 AND (seq, id) > (?2, ?3) ORDER BY seq, id LIMIT ?4")
@@ -16557,7 +16757,7 @@ mod catalog_tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(migrated_version, 1002);
+        assert_eq!(migrated_version, 1003);
         for index in [
             "idx_events_session_seq_id",
             "idx_sessions_provider_external_session_started",
@@ -16570,8 +16770,224 @@ mod catalog_tests {
     }
 
     #[test]
+    fn source_refresh_state_claims_backoff_and_token_fencing_are_path_free() {
+        let temp = tempdir();
+        let path = temp.path().join("privacy-sentinel-opencode.db");
+        fs::write(&path, b"privacy-sentinel-content").unwrap();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let first = [1_u8; 32];
+        let token = match store
+            .claim_source_refresh(
+                "opencode",
+                "opencode_sqlite",
+                &path,
+                "",
+                &first,
+                false,
+                60_000,
+            )
+            .unwrap()
+        {
+            SourceRefreshClaim::Acquired { token } => token,
+            other => panic!("unexpected claim: {other:?}"),
+        };
+        assert_eq!(
+            store
+                .claim_source_refresh(
+                    "opencode",
+                    "opencode_sqlite",
+                    &path,
+                    "",
+                    &first,
+                    false,
+                    60_000
+                )
+                .unwrap(),
+            SourceRefreshClaim::RefreshInProgress
+        );
+        assert!(!store
+            .complete_source_refresh(
+                "opencode",
+                "opencode_sqlite",
+                &path,
+                "",
+                "stale-token",
+                &first
+            )
+            .unwrap());
+        assert!(store
+            .fail_source_refresh(
+                "opencode",
+                "opencode_sqlite",
+                &path,
+                "",
+                &token,
+                &first,
+                SourceRefreshErrorCode::ProviderReadFailed,
+            )
+            .unwrap());
+        assert_eq!(
+            store
+                .claim_source_refresh(
+                    "opencode",
+                    "opencode_sqlite",
+                    &path,
+                    "",
+                    &first,
+                    false,
+                    60_000
+                )
+                .unwrap(),
+            SourceRefreshClaim::RetryBackoff
+        );
+        let changed = [2_u8; 32];
+        let stale_token = match store
+            .claim_source_refresh(
+                "opencode",
+                "opencode_sqlite",
+                &path,
+                "",
+                &changed,
+                false,
+                60_000,
+            )
+            .unwrap()
+        {
+            SourceRefreshClaim::Acquired { token } => token,
+            other => panic!("unexpected changed-observation claim: {other:?}"),
+        };
+        store
+            .conn
+            .execute(
+                "UPDATE source_refresh_state SET lease_expires_at_ms = 0",
+                [],
+            )
+            .unwrap();
+        let reclaimed = store
+            .claim_source_refresh(
+                "opencode",
+                "opencode_sqlite",
+                &path,
+                "",
+                &changed,
+                false,
+                60_000,
+            )
+            .unwrap();
+        assert!(matches!(reclaimed, SourceRefreshClaim::Acquired { .. }));
+        assert!(!store
+            .complete_source_refresh(
+                "opencode",
+                "opencode_sqlite",
+                &path,
+                "",
+                &stale_token,
+                &changed,
+            )
+            .unwrap());
+        let dump: String = store.conn.query_row(
+            "SELECT group_concat(source_key || coalesce(last_error_code, ''), '') FROM source_refresh_state",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(!dump.contains("privacy-sentinel"));
+    }
+
+    #[test]
+    fn active_lease_precedes_unchanged_across_connections() {
+        let temp = tempdir();
+        let db = temp.path().join("work.sqlite");
+        let source = temp.path().join("opencode.db");
+        fs::write(&source, b"source").unwrap();
+        let first = Store::open(&db).unwrap();
+        let second = Store::open(&db).unwrap();
+        let successful = [3_u8; 32];
+        let token = match first
+            .claim_source_refresh(
+                "opencode",
+                "opencode_sqlite",
+                &source,
+                "",
+                &successful,
+                false,
+                60_000,
+            )
+            .unwrap()
+        {
+            SourceRefreshClaim::Acquired { token } => token,
+            other => panic!("unexpected initial claim: {other:?}"),
+        };
+        assert!(first
+            .complete_source_refresh(
+                "opencode",
+                "opencode_sqlite",
+                &source,
+                "",
+                &token,
+                &successful
+            )
+            .unwrap());
+        let changed = [4_u8; 32];
+        assert!(matches!(
+            first
+                .claim_source_refresh(
+                    "opencode",
+                    "opencode_sqlite",
+                    &source,
+                    "",
+                    &changed,
+                    false,
+                    60_000
+                )
+                .unwrap(),
+            SourceRefreshClaim::Acquired { .. }
+        ));
+        assert_eq!(
+            second
+                .claim_source_refresh(
+                    "opencode",
+                    "opencode_sqlite",
+                    &source,
+                    "",
+                    &successful,
+                    false,
+                    60_000
+                )
+                .unwrap(),
+            SourceRefreshClaim::RefreshInProgress
+        );
+    }
+
+    #[test]
+    fn schema_v1003_collision_rolls_back_without_advancing_version() {
+        let temp = tempdir();
+        let path = temp.path().join("collision.sqlite");
+        let store = Store::open(&path).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "DROP INDEX source_refresh_retry_idx;
+             DROP INDEX source_refresh_lease_idx;
+             DROP TABLE source_refresh_state;
+             CREATE TABLE source_refresh_state(sentinel TEXT);
+             PRAGMA user_version = 1002;",
+            )
+            .unwrap();
+        drop(store);
+        assert!(Store::open(&path).is_err());
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1002
+        );
+        assert!(conn
+            .prepare("SELECT sentinel FROM source_refresh_state")
+            .is_ok());
+    }
+
+    #[test]
     fn writable_open_rejects_in_between_fork_schema_versions_without_mutation() {
-        for version in [16_i64, 999, 1003] {
+        for version in [16_i64, 999, 1004] {
             let temp = tempdir();
             let db = temp.path().join(format!("v{version}.sqlite"));
             let conn = Connection::open(&db).unwrap();
@@ -18272,7 +18688,12 @@ mod catalog_tests {
             store.upsert_event(&event).unwrap();
             store
                 .conn
-                .execute_batch("PRAGMA user_version = 14;")
+                .execute_batch(
+                    "DROP INDEX source_refresh_retry_idx;
+                     DROP INDEX source_refresh_lease_idx;
+                     DROP TABLE source_refresh_state;
+                     PRAGMA user_version = 14;",
+                )
                 .unwrap();
         }
 

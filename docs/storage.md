@@ -211,8 +211,14 @@ rowid maps nor the FTS projections; there is no rebuild and no reimport.
 Schema v1002 adds a standalone path-free source-health ledger. It stores only
 keyed source identities, closed-vocabulary health, and bounded counts; it does
 not affect imports or search and does not rebuild/backfill FTS or rowid maps.
+Schema v1003 adds `source_refresh_state`, keyed with the same per-store HMAC
+identity mechanism. It contains only fixed-size observation digests, bounded
+attempt/failure timing, stable error codes, and token-fenced lease state. The
+atomic migration is unconditional, performs no backfill, and touches no base
+content, FTS projection, or rowid map. Operational refresh state is not part of
+logical archives or restores.
 
-Read-only commands require exactly v1002 and direct older stores to run one
+Read-only commands require exactly v1003 and direct older stores to run one
 writable command first.
 
 Downgrading a fork-versioned store back to an older ctx binary is

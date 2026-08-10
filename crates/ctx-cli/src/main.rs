@@ -65,13 +65,14 @@ use ctx_history_query::{
 };
 use ctx_history_store::{
     archive_verification_error_code, restore_archive_bundle, verify_archive_bundle_with_options,
-    write_secure_output, ArchiveOptions, ArchiveVerifyOptions, CatalogSession,
-    CatalogSourceIndexUpdate, IdPrefixResolution, RawSqlOptions, RawSqlResult, RawSqlValue,
-    SourceHealthClassification, SourceImportFile, SourceImportFileIndexUpdate, SourceRefreshClaim,
-    SourceRefreshErrorCode, Store, StoreError, ARCHIVE_MAX_ENTITIES, ARCHIVE_MAX_OBJECTS,
-    ARCHIVE_MAX_OBJECT_BYTES, ARCHIVE_MAX_TOTAL_BYTES, CATALOG_IMPORT_OUTCOME_UNATTRIBUTED_CODE,
-    RAW_SQL_DEFAULT_MAX_COLUMNS, RAW_SQL_DEFAULT_MAX_ROWS, RAW_SQL_DEFAULT_MAX_SQL_BYTES,
-    RAW_SQL_DEFAULT_MAX_VALUE_BYTES, RAW_SQL_MAX_TIMEOUT, SOURCE_IMPORT_ZERO_YIELD_ANOMALY_CODE,
+    write_secure_output, ArchiveDeletionOptions, ArchiveOptions, ArchiveVerifyOptions,
+    CatalogSession, CatalogSourceIndexUpdate, IdPrefixResolution, RawSqlOptions, RawSqlResult,
+    RawSqlValue, SourceHealthClassification, SourceImportFile, SourceImportFileIndexUpdate,
+    SourceRefreshClaim, SourceRefreshErrorCode, Store, StoreError, ARCHIVE_MAX_ENTITIES,
+    ARCHIVE_MAX_OBJECTS, ARCHIVE_MAX_OBJECT_BYTES, ARCHIVE_MAX_TOTAL_BYTES,
+    CATALOG_IMPORT_OUTCOME_UNATTRIBUTED_CODE, RAW_SQL_DEFAULT_MAX_COLUMNS,
+    RAW_SQL_DEFAULT_MAX_ROWS, RAW_SQL_DEFAULT_MAX_SQL_BYTES, RAW_SQL_DEFAULT_MAX_VALUE_BYTES,
+    RAW_SQL_MAX_TIMEOUT, SOURCE_IMPORT_ZERO_YIELD_ANOMALY_CODE,
 };
 use history_source_plugins::{
     discover_history_source_plugins, discover_history_source_plugins_with_diagnostics,
@@ -350,6 +351,23 @@ enum ArchiveCommand {
     Override(ArchiveOverrideArgs),
     #[command(about = "Show bounded path-free suppression counts")]
     SuppressionStatus(JsonArgs),
+    #[command(about = "Explicitly commit archive-backed selective hot deletion")]
+    Commit(ArchiveCommitArgs),
+}
+
+#[derive(Debug, Args)]
+struct ArchiveCommitArgs {
+    #[arg(help = "Published and registered selective archive bundle")]
+    bundle: PathBuf,
+    #[arg(
+        long,
+        help = "Confirm irreversible logical deletion from the hot store"
+    )]
+    yes: bool,
+    #[arg(long, help = "Re-verify and re-plan without changing the store")]
+    dry_run: bool,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -2545,6 +2563,65 @@ fn run_archive(args: ArchiveArgs, data_root: PathBuf) -> Result<()> {
         ArchiveCommand::Register(register) => run_archive_register(register, data_root),
         ArchiveCommand::Override(override_args) => run_archive_override(override_args, data_root),
         ArchiveCommand::SuppressionStatus(status) => run_suppression_status(status, data_root),
+        ArchiveCommand::Commit(commit) => run_archive_commit(commit, data_root),
+    }
+}
+
+fn run_archive_commit(args: ArchiveCommitArgs, data_root: PathBuf) -> Result<()> {
+    if !args.dry_run && !args.yes {
+        if args.json {
+            eprintln!(
+                "{}",
+                serde_json::to_string(
+                    &json!({"error":{"code":"confirmation_required","message":"pass --yes to commit hot deletion"}})
+                )?
+            );
+            return Err(anyhow::Error::new(SilentExit { code: 2 }));
+        }
+        anyhow::bail!("hot deletion requires explicit --yes confirmation (or use --dry-run)");
+    }
+    let mut store = Store::open(database_path(data_root))?;
+    match store.commit_archive_deletion(
+        &args.bundle,
+        ArchiveDeletionOptions {
+            dry_run: args.dry_run,
+        },
+    ) {
+        Ok(report) => {
+            if args.json {
+                println!("{}", serde_json::to_string(&report)?);
+            } else if report.dry_run {
+                println!(
+                    "archive {} is eligible for deletion of {} hot members (dry run)",
+                    report.archive_id, report.deletion_member_count
+                );
+            } else {
+                println!(
+                    "committed archive-backed deletion {}: {} hot members{}",
+                    report.archive_id,
+                    report.deleted_member_count,
+                    if report.duplicate {
+                        " (already committed)"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            Ok(())
+        }
+        Err(error) if args.json => {
+            // Deliberately omit the supplied path and verifier diagnostics:
+            // archive locations and canonical content are private.
+            eprintln!(
+                "{}",
+                serde_json::to_string(
+                    &json!({"error":{"code":"archive_deletion_refused","message":"archive-backed hot deletion was refused"}})
+                )?
+            );
+            let _ = error;
+            Err(anyhow::Error::new(SilentExit { code: 1 }))
+        }
+        Err(error) => Err(error.into()),
     }
 }
 

@@ -103,6 +103,38 @@ fn archive_register_cli_suppresses_nonempty_reimport() {
     let registration =
         json_output(ctx(&temp).args(["archive", "register", bundle.to_str().unwrap(), "--json"]));
     assert_eq!(registration["suppression_count"], 1, "{registration}");
+    ctx(&temp)
+        .args(["archive", "commit", bundle.to_str().unwrap(), "--json"])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("confirmation_required"));
+    let dry_run = json_output(ctx(&temp).args([
+        "archive",
+        "commit",
+        bundle.to_str().unwrap(),
+        "--dry-run",
+        "--json",
+    ]));
+    assert_eq!(dry_run["dry_run"], true, "{dry_run}");
+    assert_eq!(dry_run["deleted_member_count"], 0, "{dry_run}");
+    let committed = json_output(ctx(&temp).args([
+        "archive",
+        "commit",
+        bundle.to_str().unwrap(),
+        "--yes",
+        "--json",
+    ]));
+    assert_eq!(committed["dry_run"], false, "{committed}");
+    assert_eq!(committed["duplicate"], false, "{committed}");
+    let duplicate = json_output(ctx(&temp).args([
+        "archive",
+        "commit",
+        bundle.to_str().unwrap(),
+        "--yes",
+        "--json",
+    ]));
+    assert_eq!(duplicate["duplicate"], true, "{duplicate}");
     fs::write(
         &moved,
         content

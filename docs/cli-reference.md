@@ -107,6 +107,9 @@ CTX_DATA_ROOT="$source_root" ctx archive create "$bundle"
 # ctx archive create "$bundle" --json
 ctx archive verify "$bundle"
 # ctx archive verify "$bundle" --json
+CTX_DATA_ROOT="$source_root" ctx archive register "$bundle"
+CTX_DATA_ROOT="$source_root" ctx archive commit "$bundle" --dry-run
+CTX_DATA_ROOT="$source_root" ctx archive commit "$bundle" --yes
 ctx archive restore "$bundle" "$restored_root"
 ```
 
@@ -143,6 +146,17 @@ record/event FTS projections and explicit rowid maps; `artifact_search` is
 cleared and intentionally remains empty and unused. Machine-local operational
 tables are excluded. The archive format version is independent of the SQLite
 schema version; the current binary creates the destination schema normally.
+
+`archive register` verifies a selective bundle and activates its durable
+path-free reimport suppression. `archive commit` is the separate, explicit hot
+deletion step. `--dry-run` re-verifies the published bundle and recomputes the
+current plan, closure, membership, deletion fixed point, content digests, and
+references without writing. A real commit requires `--yes`. It uses one
+immediate transaction for authenticated exclusive base rows, active record and
+event FTS rows, explicit rowid maps, and ledger states. Changed, missing,
+shared, or newly referenced content is refused rather than broadening the
+deletion set. Duplicate invocation after success is safe. This logical deletion
+does not unlink object files, checkpoint, vacuum, or reclaim SQLite pages.
 
 By default all three commands print a concise human result. With `--json`, a
 successful command prints one JSON object to stdout. For `verify`, and for the

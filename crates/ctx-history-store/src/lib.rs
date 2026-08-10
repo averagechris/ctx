@@ -37,6 +37,7 @@ use thiserror::Error;
 use uuid::Uuid;
 mod archive;
 mod compaction;
+mod deletion;
 #[cfg(unix)]
 mod restore;
 #[cfg(unix)]
@@ -51,6 +52,7 @@ pub use archive::{
     ARCHIVE_MAX_OBJECT_BYTES, ARCHIVE_MAX_TOTAL_BYTES,
 };
 pub use compaction::{CompactionPlan, CompactionPlanMember, CompactionRootDecision};
+pub use deletion::{ArchiveDeletionOptions, ArchiveDeletionReport};
 #[cfg(unix)]
 pub use restore::{restore_archive_bundle, ArchiveRestoreReport};
 #[cfg(unix)]

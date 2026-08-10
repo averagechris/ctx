@@ -1613,6 +1613,8 @@ fn setup_writes_day_one_config_contract_without_overwriting_existing_config() {
     ctx(&temp).arg("setup").assert().success();
     let default_config = fs::read_to_string(&config_path).unwrap();
     assert!(default_config.contains("# ctx configuration"));
+    assert!(default_config.contains("# [search]"));
+    assert!(default_config.contains("# refresh = \"auto\""));
     assert!(!default_config.contains("[upgrade]"));
     assert!(!default_config.contains("[analytics]"));
 
@@ -7337,6 +7339,123 @@ fn search_refreshes_discovered_codex_sessions_before_query() {
     assert_eq!(status["cataloged_sessions"], 2);
     assert_eq!(status["indexed_catalog_sessions"], 2);
     assert_eq!(status["pending_catalog_sessions"], 0);
+}
+
+#[test]
+fn search_uses_persistent_refresh_policy_when_cli_value_is_omitted() {
+    let temp = tempdir();
+    let plugin_root = tempdir();
+    let plugin = write_history_source_plugin_at_with_refresh(
+        plugin_root.path(),
+        "hermes",
+        true,
+        Some("auto"),
+        None,
+    );
+    fs::write(
+        temp.path().join("config.toml"),
+        "[search]\nrefresh = \"strict\"\n",
+    )
+    .unwrap();
+
+    let search = json_output(
+        ctx(&temp)
+            .env("CTX_HISTORY_PLUGIN_PATH", &plugin.manifest_dir)
+            .args([
+                "search",
+                "hermes plugin initial marker",
+                "--provider",
+                "custom",
+                "--json",
+            ]),
+    );
+    assert_eq!(search["freshness"]["mode"], "strict");
+    assert_eq!(search["freshness"]["status"], "completed");
+    assert!(plugin.run_marker.exists());
+}
+
+#[test]
+fn search_cli_refresh_overrides_persistent_policy() {
+    let temp = tempdir();
+    let plugin_root = tempdir();
+    let plugin = write_history_source_plugin_at_with_refresh(
+        plugin_root.path(),
+        "hermes",
+        true,
+        Some("auto"),
+        None,
+    );
+    fs::write(
+        temp.path().join("config.toml"),
+        "[search]\nrefresh = \"off\"\n",
+    )
+    .unwrap();
+
+    let search = json_output(
+        ctx(&temp)
+            .env("CTX_HISTORY_PLUGIN_PATH", &plugin.manifest_dir)
+            .args([
+                "search",
+                "hermes plugin initial marker",
+                "--provider",
+                "custom",
+                "--refresh",
+                "strict",
+                "--json",
+            ]),
+    );
+    assert_eq!(search["freshness"]["mode"], "strict");
+    assert_eq!(search["freshness"]["status"], "completed");
+    assert!(plugin.run_marker.exists());
+}
+
+#[test]
+fn search_rejects_invalid_refresh_config_clearly() {
+    for contents in [
+        "[search]\nrefresh = \"sometimes\"\n",
+        "[search\nrefresh = \"auto\"\n",
+    ] {
+        let temp = tempdir();
+        fs::write(temp.path().join("config.toml"), contents).unwrap();
+        let (_, stderr) = failure_output(ctx(&temp).args(["search", "anything", "--json"]));
+        assert!(stderr.contains("parse ctx config"), "{stderr}");
+        assert!(stderr.contains("config.toml"), "{stderr}");
+    }
+}
+
+#[test]
+fn configured_refresh_off_does_not_discover_or_write_on_an_empty_root() {
+    let temp = tempdir();
+    let plugin_root = tempdir();
+    let plugin = write_history_source_plugin_at_with_refresh(
+        plugin_root.path(),
+        "hermes",
+        true,
+        Some("auto"),
+        None,
+    );
+    let config = temp.path().join("config.toml");
+    fs::write(&config, "[search]\nrefresh = \"off\"\n").unwrap();
+
+    let (_, stderr) = failure_output(
+        ctx(&temp)
+            .env("CTX_HISTORY_PLUGIN_PATH", &plugin.manifest_dir)
+            .args([
+                "search",
+                "hermes plugin initial marker",
+                "--provider",
+                "custom",
+                "--json",
+            ]),
+    );
+    assert!(stderr.contains("ctx store is not initialized"), "{stderr}");
+    assert!(!plugin.run_marker.exists());
+    assert!(!temp.path().join("work.sqlite").exists());
+    assert_eq!(
+        fs::read_to_string(&config).unwrap(),
+        "[search]\nrefresh = \"off\"\n"
+    );
+    assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
 }
 
 #[test]

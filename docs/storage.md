@@ -121,8 +121,22 @@ API keys, or remote accounts.
 `config.toml` under the configured data root when `CTX_DATA_ROOT` or
 `--data-root` points elsewhere. Existing config files are left in place.
 
-The day-1 generated config contains only comments; there are no supported
-configuration keys today.
+The supported search policy is:
+
+```toml
+[search]
+refresh = "auto" # "auto", "off", or "strict"
+```
+
+An explicit `ctx search --refresh ...` overrides the key. Otherwise the key is
+used, with `auto` as the fallback when the file or key is absent. Invalid TOML
+or policy values fail clearly. A configured `off` is the same strict read-only
+path as `--refresh off`: it performs no provider/plugin discovery and does not
+create or modify the data root, config, SQLite store, migrations, imports, or
+checkpoints; an existing current store is opened read-only.
+
+The generated config contains commented examples and is valid whether the
+`[search]` section remains commented out or is enabled.
 
 ## Index Lifecycle
 
@@ -144,6 +158,12 @@ ctx import --provider codex --path ~/.codex/sessions
 ctx import --format ctx-history-jsonl-v1 --path ./history.jsonl
 ctx import --history-source example-agent/default
 ```
+
+For scheduled refreshes, use `ctx import --all --strict` from launchd, systemd,
+or an equivalent scheduler. Preserve the same OS user, `HOME`, `CTX_DATA_ROOT`,
+`CTX_HISTORY_PLUGIN_PATH` (or plugin path), `PATH`, and provider-specific
+environment/visibility as the interactive invocation so provider discovery and
+history-source plugins see the same inputs.
 
 Current adapters are safe to re-run. They rescan sources idempotently and keep
 source paths or cursors when available.

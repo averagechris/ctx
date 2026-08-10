@@ -563,7 +563,7 @@ fn tool_search(arguments: &Value, data_root: &Path, state: &mut McpState) -> Res
         file,
         session,
         events: optional_bool(arguments, "events")?.unwrap_or(false),
-        refresh: RefreshArg::Off,
+        refresh: Some(RefreshArg::Off),
         include_current_session,
         json: false,
         format: OutputFormat::Json,

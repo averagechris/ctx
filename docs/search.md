@@ -6,6 +6,23 @@ into dense event-level results when needed. By default it first performs a quiet
 best-effort refresh of discovered native provider sources and enabled auto
 history-source plugins, then queries the local SQLite store.
 
+## Persistent refresh policy
+
+Search refresh can be selected persistently in `$CTX_DATA_ROOT/config.toml` (or
+the configured data root when using `--data-root`):
+
+```toml
+[search]
+refresh = "auto" # "auto", "off", or "strict"
+```
+
+The CLI `--refresh auto|off|strict` option always overrides this setting. When
+the option is omitted, the config value is used; a missing file or key defaults
+to `auto`. Invalid TOML or unsupported values fail clearly rather than silently
+changing search behavior. `off` is read-only and skips source discovery,
+plugins, initialization, migration, imports, checkpoints, and writes; it only
+queries an existing current store.
+
 ## Search
 
 Examples:
@@ -208,7 +225,8 @@ the active Codex session tree by default so the current prompt and its subagent
 work do not dominate history research. Use `--include-current-session` when you
 are intentionally looking for material from the active session tree.
 
-`--refresh` defaults to `auto`. `auto` attempts a best-effort pre-search import
+`--refresh` defaults to `auto` unless `[search] refresh` selects another policy.
+`auto` attempts a best-effort pre-search import
 of discovered native provider sources and enabled auto history-source plugins,
 then serves the existing index if that refresh fails. On large discovered
 sources or already-cataloged indexes, `auto` serves current results without a
@@ -218,6 +236,12 @@ never runs plugin commands. `strict` fails the search if the refresh cannot run
 or import successfully. Preview native sources such as NanoClaw and AstrBot,
 plus search-only sources without native import support, are searched from the
 existing index until they are explicitly imported through a supported path.
+
+For launchd/systemd and similar schedulers, use `ctx import --all --strict` as
+the refresh job. Preserve the same user, `HOME`, `CTX_DATA_ROOT`, plugin path,
+`PATH`, and provider-specific environment/visibility used by interactive ctx
+commands; otherwise discovery and plugin execution can observe a different
+machine-local history set.
 
 Use `--refresh off` for a strictly read-only search over the existing ctx index.
 This avoids provider imports, plugin execution, and updates to the ctx SQLite

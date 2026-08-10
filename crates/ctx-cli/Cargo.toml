@@ -24,6 +24,7 @@ serde.workspace = true
 serde_json.workspace = true
 rusqlite.workspace = true
 sha2.workspace = true
+toml.workspace = true
 uuid.workspace = true
 ctx-history-capture = { path = "../ctx-history-capture" }
 ctx-history-core = { path = "../ctx-history-core" }

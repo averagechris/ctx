@@ -104,11 +104,28 @@ catch-up scan; use
 `--refresh strict` or `ctx import --all` when you need a full
 catch-up before querying.
 
+To persist a different search policy, edit `config.toml` under the data root:
+
+```toml
+[search]
+refresh = "off" # or "auto" / "strict"
+```
+
+An explicit `--refresh` always wins over the config key. If both are omitted,
+the policy is `auto`; invalid TOML or values are reported as errors. Use
+`--refresh off` (or configure `off`) for a read-only query of an existing index.
+
 When ctx runs inside Codex, search excludes the active Codex session tree by
 default when it can identify it. Use `--include-current-session` if the current
 session or its subagent work is the history you want to search. Use
 `--refresh off` when you need a strictly read-only query over the existing ctx
 index.
+
+For launchd/systemd and other unattended refreshes, schedule
+`ctx import --all --strict` instead of relying on search to catch up. Run it as
+the same user with the same `HOME`, `CTX_DATA_ROOT`, plugin path,
+`PATH`, and provider-specific environment/visibility as interactive ctx; these
+values determine which local histories and plugins are visible.
 
 ## 6. Use JSON For Scripts
 

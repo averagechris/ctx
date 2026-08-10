@@ -578,11 +578,10 @@ struct SearchArgs {
     #[arg(
         long,
         value_enum,
-        default_value_t = RefreshArg::Auto,
-        help = "Pre-search refresh behavior: auto, off, or strict",
-        long_help = "Pre-search refresh behavior. auto best-effort refreshes discovered native provider sources and enabled auto history-source plugins, then serves the existing index if refresh fails; off searches the existing index only; strict fails if the refresh cannot run or import successfully."
+        help = "Pre-search refresh behavior. auto best-effort refreshes discovered sources; off is read-only; strict fails on refresh errors",
+        long_help = "Pre-search refresh behavior. auto best-effort refreshes discovered native provider sources and enabled auto history-source plugins, then serves the existing index if refresh fails; off searches the existing index only; strict fails if the refresh cannot run or import successfully. Explicit values override config.toml; when omitted, ctx uses [search] refresh from config.toml or defaults to auto."
     )]
-    refresh: RefreshArg,
+    refresh: Option<RefreshArg>,
     #[arg(
         long,
         help = "Include the active Codex session tree when CODEX_THREAD_ID is set"
@@ -888,8 +887,8 @@ fn broader_search_argv(args: &SearchArgs, query: &str) -> Option<Vec<String>> {
             parts.push(flag.to_owned());
         }
     }
-    if args.refresh != RefreshArg::Auto {
-        parts.push(format!("--refresh={}", args.refresh.as_str()));
+    if args.refresh_mode() != RefreshArg::Auto {
+        parts.push(format!("--refresh={}", args.refresh_mode().as_str()));
     }
     if !query.trim().is_empty() {
         parts.push("--".to_owned());
@@ -966,12 +965,26 @@ enum RefreshArg {
 }
 
 impl RefreshArg {
+    fn from_config(policy: config::RefreshPolicy) -> Self {
+        match policy {
+            config::RefreshPolicy::Auto => Self::Auto,
+            config::RefreshPolicy::Off => Self::Off,
+            config::RefreshPolicy::Strict => Self::Strict,
+        }
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             Self::Auto => "auto",
             Self::Off => "off",
             Self::Strict => "strict",
         }
+    }
+}
+
+impl SearchArgs {
+    fn refresh_mode(&self) -> RefreshArg {
+        self.refresh.unwrap_or(RefreshArg::Auto)
     }
 }
 
@@ -5319,9 +5332,18 @@ fn csv_escape(value: &str) -> String {
     }
 }
 
-fn run_search(args: SearchArgs, data_root: PathBuf) -> Result<()> {
+fn run_search(mut args: SearchArgs, data_root: PathBuf) -> Result<()> {
     let search_format = effective_format(args.format, args.json);
-    if args.continuation.is_some() && args.refresh != RefreshArg::Off {
+    let configured_refresh = match config::read_refresh_policy(&data_root) {
+        Ok(policy) => policy.map(RefreshArg::from_config),
+        Err(error) => return paged_request_error(search_format, "config_error", error),
+    };
+    let refresh_mode = args
+        .refresh
+        .or(configured_refresh)
+        .unwrap_or(RefreshArg::Auto);
+    args.refresh = Some(refresh_mode);
+    if args.continuation.is_some() && args.refresh_mode() != RefreshArg::Off {
         return paged_request_error(
             search_format,
             "continuation_requires_refresh_off",
@@ -5361,7 +5383,8 @@ fn run_search(args: SearchArgs, data_root: PathBuf) -> Result<()> {
         Ok(refresh) => refresh,
         Err(error) => return paged_request_error(search_format, "refresh_error", error),
     };
-    if refresh.status == "failed" && args.refresh == RefreshArg::Auto && !had_existing_store {
+    if refresh.status == "failed" && args.refresh_mode() == RefreshArg::Auto && !had_existing_store
+    {
         return paged_request_error(
             search_format,
             "refresh_error",
@@ -5371,7 +5394,7 @@ fn run_search(args: SearchArgs, data_root: PathBuf) -> Result<()> {
             ),
         );
     }
-    if !db_path.exists() && args.refresh == RefreshArg::Auto {
+    if !db_path.exists() && args.refresh_mode() == RefreshArg::Auto {
         // Preserve the existing empty-index first-run behavior, but confine
         // initialization to the refresh phase and reopen read-only to query.
         if let Err(error) = Store::open(&db_path) {
@@ -5468,13 +5491,14 @@ fn run_search(args: SearchArgs, data_root: PathBuf) -> Result<()> {
             Ok(())
         })())?;
     } else {
-        if refresh.status == "failed" && args.refresh == RefreshArg::Auto {
+        if refresh.status == "failed" && args.refresh_mode() == RefreshArg::Auto {
             if let Some(error) = &refresh.error {
                 eprintln!(
                     "warning: search refresh failed; serving existing index; use --refresh strict to fail instead: {error}"
                 );
             }
-        } else if refresh.status == "degraded_zero_yield" && args.refresh == RefreshArg::Auto {
+        } else if refresh.status == "degraded_zero_yield" && args.refresh_mode() == RefreshArg::Auto
+        {
             eprintln!(
                 "warning: search refresh detected zero-yield import health anomalies; serving search results; run `ctx doctor` or `ctx import --strict`"
             );
@@ -5827,12 +5851,12 @@ pub(crate) fn search_next_argv(
 
 fn refresh_before_search(args: &SearchArgs, data_root: &Path) -> Result<SearchRefreshReport> {
     let started = Instant::now();
-    if args.refresh == RefreshArg::Off {
+    if args.refresh_mode() == RefreshArg::Off {
         let mut report = SearchRefreshReport::skipped(RefreshArg::Off, "skipped");
         report.reason = "refresh_off";
         return Ok(report);
     }
-    let _delayed_progress = DelayedRefreshProgress::start(args.refresh);
+    let _delayed_progress = DelayedRefreshProgress::start(args.refresh_mode());
     let source_identity = normalize_source_identity_filters(SourceIdentityFilterArgs::from(args))?;
     if !source_identity.is_empty()
         && args
@@ -5851,7 +5875,7 @@ fn refresh_before_search(args: &SearchArgs, data_root: &Path) -> Result<SearchRe
     let plugin_sources =
         match search_refresh_plugin_sources(data_root, args.provider, &source_identity) {
             Ok(sources) => sources,
-            Err(err) if args.refresh == RefreshArg::Auto => {
+            Err(err) if args.refresh_mode() == RefreshArg::Auto => {
                 return Ok(SearchRefreshReport::failed(
                     RefreshArg::Auto,
                     sources.len(),
@@ -5862,30 +5886,36 @@ fn refresh_before_search(args: &SearchArgs, data_root: &Path) -> Result<SearchRe
             Err(err) => return Err(err.context("search refresh failed")),
         };
     if sources.is_empty() && plugin_sources.is_empty() {
-        if args.refresh == RefreshArg::Strict {
+        if args.refresh_mode() == RefreshArg::Strict {
             return Err(anyhow!(
                 "strict search refresh found no supported discovered native provider or enabled auto history-source plugin sources; rerun the search with --refresh off to use the existing index"
             ));
         }
-        let mut report = SearchRefreshReport::skipped(args.refresh, "no_sources");
+        let mut report = SearchRefreshReport::skipped(args.refresh_mode(), "no_sources");
         report.reason = "no_sources";
         report.duration_ms = started.elapsed().as_millis();
         return Ok(report);
     }
     let source_count = sources.len().saturating_add(plugin_sources.len());
-    match refresh_sources_for_search(data_root, sources, plugin_sources, args.refresh, args.json) {
+    match refresh_sources_for_search(
+        data_root,
+        sources,
+        plugin_sources,
+        args.refresh_mode(),
+        args.json,
+    ) {
         Ok(totals) => {
-            if args.refresh == RefreshArg::Strict && totals.zero_yield_anomaly_sources > 0 {
+            if args.refresh_mode() == RefreshArg::Strict && totals.zero_yield_anomaly_sources > 0 {
                 return Err(anyhow!("strict search refresh detected zero-yield import anomaly; run `ctx import --strict` or `ctx doctor`"));
             }
             Ok(SearchRefreshReport::completed(
-                args.refresh,
+                args.refresh_mode(),
                 source_count,
                 totals,
                 started.elapsed().as_millis(),
             ))
         }
-        Err(err) if args.refresh == RefreshArg::Auto => Ok(SearchRefreshReport::failed(
+        Err(err) if args.refresh_mode() == RefreshArg::Auto => Ok(SearchRefreshReport::failed(
             RefreshArg::Auto,
             source_count,
             error_summary(&err),

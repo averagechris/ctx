@@ -13,6 +13,18 @@ CTX_DATA_ROOT=/tmp/ctx ctx status
 variable `CTX_DATA_ROOT` provides the same value. The root is used directly; ctx
 does not append another product directory.
 
+Search refresh policy is stored in `config.toml` under that root:
+
+```toml
+[search]
+refresh = "auto" # also "off" or "strict"
+```
+
+For `ctx search`, an explicit `--refresh` overrides the config value. If the
+option is omitted, the configured value is used, falling back to `auto` when the
+file or key is absent. Invalid TOML and invalid policy values are errors. The
+generated default config contains commented examples of this key.
+
 ## Setup And Health
 
 ```bash
@@ -210,6 +222,12 @@ a non-empty source but imported no sessions, events, or edges and saw no safe
 skip, empty, or plugin cursor-only reason. By default the import completes and
 prints a warning on stderr. `--strict` prints the complete human or JSON report
 first, then exits with runtime code 1 if any zero-yield anomaly was detected.
+
+For launchd, systemd, or another scheduler, schedule `ctx import --all
+--strict` as the explicit freshness job. Run it as the same user and preserve
+the interactive `HOME`, `CTX_DATA_ROOT`, `CTX_HISTORY_PLUGIN_PATH` (or plugin
+path), `PATH`, and provider-specific environment/visibility. A scheduler with
+different values can otherwise miss provider histories or plugin executables.
 
 Custom history can be imported from an explicit JSONL file with
 `--format ctx-history-jsonl-v1 --path <file>`. This path is not discovered or

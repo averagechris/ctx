@@ -69,7 +69,7 @@ This table describes core command effects.
 | `ctx docs` | embedded documentation in the binary | selected topic `--out` path for `ctx docs show --out` or selected `--out` directory for `ctx docs man --out` |
 | `ctx archive create` | current SQLite content and referenced object bytes | absent private archive bundle, published atomically |
 | `ctx archive verify` | archive bundle and its private verifier scratch state | private sibling `.ctxar-verify-<id>/state.sqlite` scratch database, normally removed; bundle contents are not changed |
-| `ctx archive restore` | verified archive bundle and current binary's store schema | absent private data root, published atomically after staging |
+| `ctx archive restore` | verified archive bundle and current binary's store schema | full bundles: absent private root, atomically published; registered selective bundles: explicit authenticated closure merged into the existing private root |
 | `ctx doctor --storage` | SQLite index, data root metadata, file sizes, SQLite page/freelist metrics | none |
 
 `ctx status` and `ctx doctor --storage` do not migrate schemas, import history,

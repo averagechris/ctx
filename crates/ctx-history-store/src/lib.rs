@@ -54,7 +54,10 @@ pub use archive::{
 pub use compaction::{CompactionPlan, CompactionPlanMember, CompactionRootDecision};
 pub use deletion::{ArchiveDeletionOptions, ArchiveDeletionReport};
 #[cfg(unix)]
-pub use restore::{restore_archive_bundle, ArchiveRestoreReport};
+pub use restore::{
+    restore_archive_bundle, restore_archive_bundle_selective, ArchiveRestoreReport,
+    ArchiveRestoreSelection,
+};
 #[cfg(unix)]
 pub use secure_output::{write_secure_output, SecureOutputCode, SecureOutputError};
 #[cfg(not(unix))]
@@ -68,11 +71,20 @@ pub use suppression::{
 #[derive(Debug, Clone)]
 pub struct ArchiveRestoreReport {
     pub path: PathBuf,
+    pub format: String,
     pub archive_id: Uuid,
     pub source_schema_version: i64,
     pub entity_count: u64,
     pub object_count: u64,
     pub object_bytes: u64,
+    pub inserted_count: u64,
+    pub reused_count: u64,
+    pub selected_root_count: u64,
+}
+#[cfg(not(unix))]
+#[derive(Debug, Clone, Default)]
+pub struct ArchiveRestoreSelection {
+    pub session_ids: Vec<Uuid>,
 }
 #[cfg(not(unix))]
 pub fn restore_archive_bundle(

@@ -24,8 +24,11 @@ selection input. The bundle retains this v1 layout and all fifteen streams
 (including empty streams), but carries `scope.kind = "selective"` and the
 planner's root decisions, member dispositions, deletion authorization, and
 root/closure/membership/deletion/plan digests in `selective`. Full and
-selective family/scope mismatches are rejected; selective restore and deletion
-are intentionally not implemented by this command.
+selective family/scope mismatches are rejected. `ctx archive restore` accepts
+a registered selective bundle and an existing data root; repeatable
+`--session-id UUID` selectors restore the authenticated union closure, while
+omitting selectors restores every archived root. Restore is explicit and does
+not discover archives or run from refresh/import paths.
 
 Selective bundles keep large closure evidence out of `manifest.json`.
 `evidence/root-members.jsonl` is a private, checksummed, bounded-line canonical

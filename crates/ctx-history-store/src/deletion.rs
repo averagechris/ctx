@@ -319,7 +319,12 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{fs, os::unix::process::ExitStatusExt, process::Command};
     use tempfile::tempdir;
+
+    const SELECTED_SESSION: &str = "70000000-0000-7000-8000-000000000099";
+    const SELECTED_EVENT: &str = "70000000-0000-7000-8000-000000000100";
+    const SELECTED_ARTIFACT: &str = "70000000-0000-7000-8000-000000000104";
 
     fn atomic_snapshot(store: &Store) -> Vec<String> {
         [
@@ -348,6 +353,16 @@ mod tests {
     }
 
     fn fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        fixture_with_object(false)
+    }
+
+    fn object_fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        fixture_with_object(true)
+    }
+
+    fn fixture_with_object(
+        with_object: bool,
+    ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
         let temp = tempdir().unwrap();
         let db = temp.path().join("work.sqlite");
         let bundle = temp.path().join("selected.ctxar");
@@ -363,7 +378,42 @@ mod tests {
              VALUES('70000000-0000-7000-8000-000000000102','70000000-0000-7000-8000-000000000101','codex','stable-two','primary',1,'completed','full',1,2,1,2,'local_only','local_only',0,'{\"source_format\":\"codex-jsonl-v1\"}');
              INSERT INTO events(id,seq,session_id,event_type,occurred_at_ms,payload_json,dedupe_key,visibility,redaction_state,fidelity,sync_state,sync_version,metadata_json)
              VALUES('70000000-0000-7000-8000-000000000103',2,'70000000-0000-7000-8000-000000000102','message',1,'{}','d2','local_only','raw','full','local_only',0,'{}');"
-        ).unwrap();
+         ).unwrap();
+        if with_object {
+            use std::os::unix::fs::PermissionsExt;
+
+            let bytes = b"selective restore object fixture";
+            let hash = format!("{:x}", Sha256::digest(bytes));
+            let shard = temp.path().join("objects").join(&hash[..2]);
+            fs::create_dir_all(&shard).unwrap();
+            fs::write(shard.join(&hash), bytes).unwrap();
+            fs::set_permissions(
+                temp.path().join("objects"),
+                fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            fs::set_permissions(&shard, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::set_permissions(shard.join(&hash), fs::Permissions::from_mode(0o600)).unwrap();
+            store
+                .conn
+                .execute(
+                    "INSERT INTO artifacts(id,kind,blob_hash,blob_path,byte_size,media_type,preview_text,redaction_state,created_at_ms,updated_at_ms,source_id,visibility,fidelity,sync_state,sync_version,metadata_json) VALUES(?1,'binary',?2,?3,?4,'application/octet-stream','fixture','raw',1,2,'70000000-0000-7000-8000-000000000098','local_only','full','local_only',0,'{}')",
+                    params![
+                        SELECTED_ARTIFACT,
+                        hash,
+                        format!("objects/{}/{}", &hash[..2], hash),
+                        bytes.len() as i64
+                    ],
+                )
+                .unwrap();
+            store
+                .conn
+                .execute(
+                    "UPDATE events SET payload_blob_id=?1 WHERE id=?2",
+                    params![SELECTED_ARTIFACT, SELECTED_EVENT],
+                )
+                .unwrap();
+        }
         drop(store);
         let mut ro = Store::open_read_only(&db).unwrap();
         ro.create_selective_archive(&bundle, 2, crate::ArchiveOptions::default())
@@ -373,6 +423,425 @@ mod tests {
         let registration = store.register_selective_archive(&bundle).unwrap();
         assert_eq!(registration.suppression_count, 2);
         (temp, db, bundle)
+    }
+
+    #[test]
+    fn selective_restore_rehydrates_requested_root_and_is_idempotent() {
+        let (_temp, db, bundle) = fixture();
+        let root = db.parent().unwrap();
+        let mut store = Store::open(&db).unwrap();
+        store
+            .commit_archive_deletion(&bundle, ArchiveDeletionOptions::default())
+            .unwrap();
+        store.conn.execute("INSERT INTO event_search(event_id,safe_preview_text,rank_bucket) VALUES('70000000-0000-7000-8000-000000000999','unrelated','notice')",[]).unwrap();
+        let unrelated_rowid = store.conn.last_insert_rowid();
+        EVENT_SEARCH_ROWID_MAP
+            .store_entry(
+                &store.conn,
+                "70000000-0000-7000-8000-000000000999",
+                unrelated_rowid,
+            )
+            .unwrap();
+        drop(store);
+        let selected = crate::ArchiveRestoreSelection {
+            session_ids: vec![Uuid::parse_str("70000000-0000-7000-8000-000000000099").unwrap()],
+        };
+        let first = crate::restore_archive_bundle_selective(
+            &bundle,
+            root,
+            ArchiveVerifyOptions::default(),
+            selected.clone(),
+        )
+        .unwrap();
+        assert!(first.inserted_count >= 2);
+        let store = Store::open_read_only(&db).unwrap();
+        assert_eq!(
+            store
+                .conn
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM sessions WHERE id='70000000-0000-7000-8000-000000000099'",
+                    [],
+                    |r| r.get(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM sessions WHERE id='70000000-0000-7000-8000-000000000102'",
+                    [],
+                    |r| r.get(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(store.conn.query_row::<i64,_,_>("SELECT search_rowid FROM event_search_rowids WHERE event_id='70000000-0000-7000-8000-000000000999'",[],|r|r.get(0)).unwrap(), unrelated_rowid);
+        assert_eq!(store.conn.query_row::<i64,_,_>("SELECT count(*) FROM compaction_archive_suppressions WHERE association_state='restored'",[],|r|r.get(0)).unwrap(), 1);
+        assert_eq!(store.conn.query_row::<i64,_,_>("SELECT count(*) FROM compaction_archive_suppressions WHERE association_state='active'",[],|r|r.get(0)).unwrap(), 1);
+        drop(store);
+        let second = crate::restore_archive_bundle_selective(
+            &bundle,
+            root,
+            ArchiveVerifyOptions::default(),
+            selected,
+        )
+        .unwrap();
+        assert_eq!(second.inserted_count, 0);
+        assert!(second.reused_count >= 2);
+    }
+
+    #[test]
+    fn selective_restore_conflict_is_zero_mutation() {
+        let (_temp, db, bundle) = fixture();
+        let root = db.parent().unwrap();
+        let mut store = Store::open(&db).unwrap();
+        store
+            .commit_archive_deletion(&bundle, ArchiveDeletionOptions::default())
+            .unwrap();
+        store.conn.execute("INSERT INTO sessions(id,provider,agent_type,is_primary,status,fidelity,started_at_ms,created_at_ms,updated_at_ms,visibility,sync_state,sync_version,metadata_json) VALUES('70000000-0000-7000-8000-000000000099','codex','primary',1,'completed','full',1,1,2,'local_only','local_only',0,'{\"conflict\":true}')",[]).unwrap();
+        let before: (i64,i64,i64)=store.conn.query_row("SELECT (SELECT count(*) FROM sessions),(SELECT count(*) FROM compaction_operations),(SELECT count(*) FROM compaction_restore_markers)",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        drop(store);
+        let result = crate::restore_archive_bundle_selective(
+            &bundle,
+            root,
+            ArchiveVerifyOptions::default(),
+            crate::ArchiveRestoreSelection {
+                session_ids: vec![Uuid::parse_str("70000000-0000-7000-8000-000000000099").unwrap()],
+            },
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("canonical content conflict"));
+        let store = Store::open_read_only(&db).unwrap();
+        let after: (i64,i64,i64)=store.conn.query_row("SELECT (SELECT count(*) FROM sessions),(SELECT count(*) FROM compaction_operations),(SELECT count(*) FROM compaction_restore_markers)",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn selective_restore_retries_database_crash_boundaries() {
+        for phase in [
+            "after_preflight",
+            "after_locked_preflight",
+            "after_projection",
+            "before_db_commit",
+            "after_db_commit",
+        ] {
+            let (_temp, db, bundle) = fixture();
+            let root = db.parent().unwrap();
+            let mut store = Store::open(&db).unwrap();
+            store
+                .commit_archive_deletion(&bundle, ArchiveDeletionOptions::default())
+                .unwrap();
+            drop(store);
+            let selected = crate::ArchiveRestoreSelection {
+                session_ids: vec![Uuid::parse_str("70000000-0000-7000-8000-000000000099").unwrap()],
+            };
+            crate::restore::set_selective_fail_phase(Some(phase));
+            assert!(
+                crate::restore_archive_bundle_selective(
+                    &bundle,
+                    root,
+                    ArchiveVerifyOptions::default(),
+                    selected.clone()
+                )
+                .is_err(),
+                "{phase}"
+            );
+            crate::restore::set_selective_fail_phase(None);
+            crate::restore_archive_bundle_selective(
+                &bundle,
+                root,
+                ArchiveVerifyOptions::default(),
+                selected,
+            )
+            .unwrap();
+            let store = Store::open_read_only(&db).unwrap();
+            assert_eq!(store.conn.query_row::<i64,_,_>("SELECT count(*) FROM sessions WHERE id='70000000-0000-7000-8000-000000000099'",[],|r|r.get(0)).unwrap(),1,"{phase}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selective_restore_retries_object_crash_boundaries_in_a_killed_subprocess() {
+        if let (Some(phase), Some(db), Some(bundle)) = (
+            std::env::var_os("CTX_TEST_SELECTIVE_RESTORE_CHILD_PHASE"),
+            std::env::var_os("CTX_TEST_SELECTIVE_RESTORE_CHILD_DB"),
+            std::env::var_os("CTX_TEST_SELECTIVE_RESTORE_CHILD_BUNDLE"),
+        ) {
+            let phase = phase.to_string_lossy().into_owned();
+            let db = std::path::PathBuf::from(db);
+            let bundle = std::path::PathBuf::from(bundle);
+            std::env::set_var("CTX_TEST_SELECTIVE_RESTORE_SIGKILL_PHASE", &phase);
+            let _ = crate::restore_archive_bundle_selective(
+                &bundle,
+                db.parent().unwrap(),
+                ArchiveVerifyOptions::default(),
+                crate::ArchiveRestoreSelection {
+                    session_ids: vec![Uuid::parse_str(SELECTED_SESSION).unwrap()],
+                },
+            );
+            panic!("selective restore child returned without SIGKILL at {phase}");
+        }
+
+        for phase in [
+            "after_object_sync",
+            "after_object_publish",
+            "after_shard_sync",
+        ] {
+            let (_temp, db, bundle) = object_fixture();
+            let root = db.parent().unwrap();
+            let mut store = Store::open(&db).unwrap();
+            store
+                .commit_archive_deletion(&bundle, ArchiveDeletionOptions::default())
+                .unwrap();
+
+            // Shared artifact rows are intentionally retained by hot deletion;
+            // remove this selected canonical row to model the missing hot
+            // reference that restore must recreate. The archive and ledger
+            // remain the authenticated source of truth.
+            let hash: String = store
+                .conn
+                .query_row(
+                    "SELECT blob_hash FROM artifacts WHERE id=?1",
+                    [SELECTED_ARTIFACT],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            store
+                .conn
+                .execute("DELETE FROM artifacts WHERE id=?1", [SELECTED_ARTIFACT])
+                .unwrap();
+            drop(store);
+            fs::remove_file(root.join("objects").join(&hash[..2]).join(&hash)).unwrap();
+
+            let status = Command::new(std::env::current_exe().unwrap())
+                .arg("selective_restore_retries_object_crash_boundaries_in_a_killed_subprocess")
+                .arg("--nocapture")
+                .env("CTX_TEST_SELECTIVE_RESTORE_CHILD_PHASE", phase)
+                .env("CTX_TEST_SELECTIVE_RESTORE_CHILD_DB", db.as_os_str())
+                .env(
+                    "CTX_TEST_SELECTIVE_RESTORE_CHILD_BUNDLE",
+                    bundle.as_os_str(),
+                )
+                .status()
+                .unwrap();
+            assert_eq!(status.signal(), Some(libc::SIGKILL), "{phase}: {status}");
+
+            let store = Store::open_read_only(&db).unwrap();
+            assert_eq!(
+                store
+                    .conn
+                    .query_row::<i64, _, _>(
+                        "SELECT count(*) FROM artifacts WHERE id=?1",
+                        [SELECTED_ARTIFACT],
+                        |row| row.get(0),
+                    )
+                    .unwrap(),
+                0,
+                "{phase}: object publication must precede, but not commit, the artifact ref"
+            );
+            assert_eq!(
+                store
+                    .conn
+                    .query_row::<i64, _, _>(
+                        "SELECT count(*) FROM compaction_operations WHERE operation_kind='restore' AND phase='committed'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap(),
+                0,
+                "{phase}: restore operation committed before the crash"
+            );
+            assert_eq!(
+                store
+                    .conn
+                    .query_row::<String, _, _>(
+                        "SELECT membership_state || ':' || hot_state FROM compaction_archive_members WHERE entity_kind='artifacts' AND entity_key=?1",
+                        [SELECTED_ARTIFACT],
+                        |row| row.get(0),
+                    )
+                    .unwrap(),
+                "suppressed:present",
+                "{phase}: ledger changed before DB commit"
+            );
+            assert_eq!(
+                store
+                    .conn
+                    .query_row::<String, _, _>(
+                        "SELECT association_state FROM compaction_archive_suppressions LIMIT 1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap(),
+                "active",
+                "{phase}: suppression changed before DB commit"
+            );
+            drop(store);
+
+            let selected = crate::ArchiveRestoreSelection {
+                session_ids: vec![Uuid::parse_str(SELECTED_SESSION).unwrap()],
+            };
+            crate::restore_archive_bundle_selective(
+                &bundle,
+                root,
+                ArchiveVerifyOptions::default(),
+                selected.clone(),
+            )
+            .unwrap();
+
+            let store = Store::open_read_only(&db).unwrap();
+            let (artifact_hash, artifact_size, artifact_path): (String, i64, String) = store
+                .conn
+                .query_row(
+                    "SELECT blob_hash,byte_size,blob_path FROM artifacts WHERE id=?1",
+                    [SELECTED_ARTIFACT],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            let object = root.join(&artifact_path);
+            let bytes = fs::read(&object).unwrap();
+            assert_eq!(bytes.len() as i64, artifact_size, "{phase}");
+            assert_eq!(
+                format!("{:x}", Sha256::digest(&bytes)),
+                artifact_hash,
+                "{phase}"
+            );
+            assert_eq!(artifact_hash, hash, "{phase}");
+            let mut artifacts = store
+                .conn
+                .prepare("SELECT id,blob_hash,byte_size,blob_path FROM artifacts ORDER BY id")
+                .unwrap();
+            let rows = artifacts
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .unwrap();
+            let mut artifact_count = 0;
+            for row in rows {
+                let (id, row_hash, row_size, row_path) = row.unwrap();
+                let bytes = fs::read(root.join(row_path)).unwrap();
+                assert_eq!(bytes.len() as i64, row_size, "{phase}: {id}");
+                assert_eq!(
+                    format!("{:x}", Sha256::digest(&bytes)),
+                    row_hash,
+                    "{phase}: {id}"
+                );
+                artifact_count += 1;
+            }
+            assert_eq!(
+                artifact_count, 1,
+                "{phase}: every restored artifact must be checked"
+            );
+            drop(artifacts);
+            assert_eq!(
+                store
+                    .conn
+                    .query_row::<i64, _, _>(
+                        "SELECT count(*) FROM events WHERE payload_blob_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM artifacts a WHERE a.id=events.payload_blob_id)",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap(),
+                0,
+                "{phase}: dangling canonical artifact reference"
+            );
+            for (kind, key) in [
+                ("sessions", SELECTED_SESSION),
+                ("events", SELECTED_EVENT),
+                ("artifacts", SELECTED_ARTIFACT),
+                ("object_blob", hash.as_str()),
+            ] {
+                assert_eq!(
+                    store
+                        .conn
+                        .query_row::<String, _, _>(
+                            "SELECT membership_state || ':' || hot_state FROM compaction_archive_members WHERE entity_kind=?1 AND entity_key=?2",
+                            params![kind, key],
+                            |row| row.get(0),
+                        )
+                        .unwrap(),
+                    "restored:present",
+                    "{phase}: selected ledger member {kind}/{key} did not converge"
+                );
+            }
+            assert_eq!(
+                store
+                    .conn
+                    .query_row::<i64, _, _>(
+                        "SELECT count(*) FROM compaction_archive_suppressions WHERE association_state='restored'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap(),
+                1,
+                "{phase}: suppression ledger did not converge"
+            );
+            assert_eq!(
+                store
+                    .conn
+                    .query_row::<String, _, _>(
+                        "SELECT f.effective_state FROM compaction_suppression_facts f JOIN compaction_archive_suppressions s USING(identity_key,content_key) WHERE s.association_state='restored'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap(),
+                "restored",
+                "{phase}: suppression fact did not converge"
+            );
+            assert_eq!(
+                store
+                    .conn
+                    .query_row::<i64, _, _>(
+                        "SELECT count(*) FROM compaction_restore_markers",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap(),
+                1,
+                "{phase}: canonical restore marker missing"
+            );
+            assert_eq!(
+                store
+                    .conn
+                    .query_row::<i64, _, _>(
+                        "SELECT count(*) FROM compaction_operations WHERE operation_kind='restore' AND phase='committed'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap(),
+                1,
+                "{phase}: canonical restore operation missing"
+            );
+            drop(store);
+
+            assert_private_tree(root);
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_private_tree(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = fs::symlink_metadata(path).unwrap();
+        let expected = if metadata.is_dir() { 0o700 } else { 0o600 };
+        assert_eq!(
+            metadata.permissions().mode() & 0o777,
+            expected,
+            "{}",
+            path.display()
+        );
+        if metadata.is_dir() {
+            for entry in fs::read_dir(path).unwrap() {
+                assert_private_tree(&entry.unwrap().path());
+            }
+        }
     }
 
     fn full_fk_fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {

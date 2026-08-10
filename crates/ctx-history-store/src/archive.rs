@@ -2916,6 +2916,13 @@ pub(super) struct VerifiedArchive {
 
 impl VerifiedArchive {
     pub(super) fn selective_suppression_facts(&self) -> Result<Vec<crate::SuppressionIdentity>> {
+        self.selective_suppression_facts_for_sessions(None)
+    }
+
+    pub(super) fn selective_suppression_facts_for_sessions(
+        &self,
+        allowed: Option<&std::collections::BTreeSet<String>>,
+    ) -> Result<Vec<crate::SuppressionIdentity>> {
         let plan = self
             .manifest
             .selective_plan
@@ -2927,6 +2934,7 @@ impl VerifiedArchive {
             .filter(|member| {
                 member.entity_kind == "sessions"
                     && matches!(member.disposition.as_str(), "selected_root" | "owned_child")
+                    && allowed.map_or(true, |ids| ids.contains(&member.entity_key))
             })
             .map(|member| member.entity_key.as_str())
             .collect::<std::collections::HashSet<_>>();

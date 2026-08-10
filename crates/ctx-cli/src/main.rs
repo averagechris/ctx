@@ -64,13 +64,13 @@ use ctx_history_query::{
     DEFAULT_ITEM_BYTES, DEFAULT_PAGE_BYTES, DEFAULT_SHOW_LIMIT, MAX_SHOW_LIMIT,
 };
 use ctx_history_store::{
-    archive_verification_error_code, restore_archive_bundle, verify_archive_bundle_with_options,
-    write_secure_output, ArchiveDeletionOptions, ArchiveOptions, ArchiveVerifyOptions,
-    CatalogSession, CatalogSourceIndexUpdate, IdPrefixResolution, RawSqlOptions, RawSqlResult,
-    RawSqlValue, SourceHealthClassification, SourceImportFile, SourceImportFileIndexUpdate,
-    SourceRefreshClaim, SourceRefreshErrorCode, Store, StoreError, ARCHIVE_MAX_ENTITIES,
-    ARCHIVE_MAX_OBJECTS, ARCHIVE_MAX_OBJECT_BYTES, ARCHIVE_MAX_TOTAL_BYTES,
-    CATALOG_IMPORT_OUTCOME_UNATTRIBUTED_CODE, RAW_SQL_DEFAULT_MAX_COLUMNS,
+    archive_verification_error_code, restore_archive_bundle_selective,
+    verify_archive_bundle_with_options, write_secure_output, ArchiveDeletionOptions,
+    ArchiveOptions, ArchiveVerifyOptions, CatalogSession, CatalogSourceIndexUpdate,
+    IdPrefixResolution, RawSqlOptions, RawSqlResult, RawSqlValue, SourceHealthClassification,
+    SourceImportFile, SourceImportFileIndexUpdate, SourceRefreshClaim, SourceRefreshErrorCode,
+    Store, StoreError, ARCHIVE_MAX_ENTITIES, ARCHIVE_MAX_OBJECTS, ARCHIVE_MAX_OBJECT_BYTES,
+    ARCHIVE_MAX_TOTAL_BYTES, CATALOG_IMPORT_OUTCOME_UNATTRIBUTED_CODE, RAW_SQL_DEFAULT_MAX_COLUMNS,
     RAW_SQL_DEFAULT_MAX_ROWS, RAW_SQL_DEFAULT_MAX_SQL_BYTES, RAW_SQL_DEFAULT_MAX_VALUE_BYTES,
     RAW_SQL_MAX_TIMEOUT, SOURCE_IMPORT_ZERO_YIELD_ANOMALY_CODE,
 };
@@ -435,8 +435,16 @@ struct ArchiveVerifyArgs {
 struct ArchiveRestoreArgs {
     #[arg(help = "Published archive bundle directory")]
     bundle: PathBuf,
-    #[arg(help = "Strictly absent destination data-root directory")]
+    #[arg(
+        help = "Absent destination for full archives; existing data root for selective archives"
+    )]
     target: PathBuf,
+    #[arg(
+        long = "session-id",
+        value_name = "UUID",
+        help = "Restore this archived session root and its authenticated dependency closure (repeatable)"
+    )]
+    session_ids: Vec<Uuid>,
     #[arg(
         long,
         help = "Emit JSON on success and typed verifier rejection envelopes; destination and restore failures remain ordinary errors"
@@ -2713,16 +2721,25 @@ fn run_archive_restore(args: ArchiveRestoreArgs) -> Result<()> {
         max_object_bytes: args.max_object_bytes,
         max_total_bytes: args.max_bytes,
     };
-    match restore_archive_bundle(&args.bundle, &args.target, options) {
+    match restore_archive_bundle_selective(
+        &args.bundle,
+        &args.target,
+        options,
+        ctx_history_store::ArchiveRestoreSelection {
+            session_ids: args.session_ids,
+        },
+    ) {
         Ok(report) => {
             if args.json {
                 println!(
                     "{}",
                     serde_json::to_string(&json!({
-                        "format": "ctx-archive", "format_version": 1,
+                        "format": report.format, "format_version": 1,
                         "archive_id": report.archive_id, "source_schema_version": report.source_schema_version,
                         "path": report.path, "restored": true, "entity_count": report.entity_count,
                         "objects": {"count": report.object_count, "total_bytes": report.object_bytes},
+                        "inserted_count": report.inserted_count, "reused_count": report.reused_count,
+                        "selected_root_count": report.selected_root_count,
                     }))?
                 );
             } else {

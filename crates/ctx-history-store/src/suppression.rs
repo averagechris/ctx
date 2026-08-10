@@ -168,7 +168,7 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
-fn derive_effective_state(
+pub(crate) fn derive_effective_state(
     tx: &Transaction<'_>,
     identity_key: &str,
     content_key: &str,

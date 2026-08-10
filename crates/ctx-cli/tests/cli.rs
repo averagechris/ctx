@@ -4825,6 +4825,22 @@ fn docs_commands_expose_embedded_docs_and_man_pages() {
 }
 
 #[test]
+fn archive_restore_help_documents_repeatable_selectors() {
+    let temp = tempdir();
+    let output = ctx(&temp)
+        .args(["archive", "restore", "--help"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let help = String::from_utf8(output).unwrap();
+    assert!(help.contains("--session-id <UUID>"));
+    assert!(help.contains("authenticated dependency closure"));
+    assert!(help.contains("existing data root for selective archives"));
+}
+
+#[test]
 fn provider_session_lookup_requires_explicit_provider_flags_in_help() {
     let temp = tempdir();
     for args in [

@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use rusqlite::{types::ValueRef, Transaction};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::{Result, Store, StoreError, SCHEMA_VERSION};
 
 const ALGORITHM: &str = "ctx-compaction-directional-closure/v1";
-const STREAMS: &[(&str, &str, &str)] = &[
+pub(crate) const STREAMS: &[(&str, &str, &str)] = &[
     ("capture_sources", "id", "id,kind,provider,machine_id,process_id,cwd,raw_source_path,external_session_id,started_at_ms,ended_at_ms,fidelity,visibility,sync_state,sync_version,metadata_json"),
     ("vcs_workspaces", "id", "id,kind,root_path,repo_fingerprint,primary_remote_url_normalized,host,owner,name,monorepo_subpath,created_at_ms,updated_at_ms,source_id,visibility,fidelity,sync_state,sync_version,deleted_at_ms,metadata_json"),
     ("history_records", "id", "id,title,summary,status,primary_vcs_workspace_id,started_at_ms,last_activity_at_ms,completed_at_ms,confidence,created_at_ms,updated_at_ms,source_id,visibility,fidelity,sync_state,sync_version,deleted_at_ms,metadata_json,body,tags_json,kind,workspace"),
@@ -29,7 +29,8 @@ const STREAMS: &[(&str, &str, &str)] = &[
     ("record_edges", "id", "id,from_record_id,to_record_id,edge_type,confidence,created_at_ms,updated_at_ms,source_id,visibility,fidelity,sync_state,sync_version,deleted_at_ms,metadata_json"),
 ];
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompactionRootDecision {
     pub session_id: String,
     pub disposition: String,
@@ -41,7 +42,8 @@ pub struct CompactionRootDecision {
     pub deletion_member_count: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompactionPlanMember {
     pub entity_kind: String,
     pub entity_key: String,
@@ -51,20 +53,22 @@ pub struct CompactionPlanMember {
     pub deletion_authorized: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompactionEstimate {
     pub bytes: Option<u64>,
     pub reason_unknown: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompactionPlan {
-    pub format: &'static str,
+    pub format: String,
     pub format_version: u32,
     pub private: bool,
     pub source_schema_version: i64,
     pub cutoff_ms: i64,
-    pub graph_algorithm: &'static str,
+    pub graph_algorithm: String,
     pub roots: Vec<CompactionRootDecision>,
     pub members: Vec<CompactionPlanMember>,
     pub selected_root_ids: Vec<String>,
@@ -100,6 +104,7 @@ enum CanonicalValue {
     Real(u64),
     Text(String),
 }
+
 type Rows = BTreeMap<String, BTreeMap<String, CanonicalRow>>;
 
 impl Store {
@@ -113,7 +118,7 @@ impl Store {
     }
 }
 
-fn plan(tx: &Transaction<'_>, cutoff_ms: i64) -> Result<CompactionPlan> {
+pub(crate) fn plan(tx: &Transaction<'_>, cutoff_ms: i64) -> Result<CompactionPlan> {
     let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version != SCHEMA_VERSION {
         return Err(StoreError::UnsupportedSchemaVersion(version));
@@ -154,7 +159,6 @@ fn plan(tx: &Transaction<'_>, cutoff_ms: i64) -> Result<CompactionPlan> {
     }
 
     let mut union: BTreeMap<(String, String), (String, bool)> = BTreeMap::new();
-    let mut closures = BTreeMap::new();
     for root in &selected {
         let closure = closure_for_root(&rows, root, cutoff_ms)?;
         for (key, value) in &closure {
@@ -168,14 +172,13 @@ fn plan(tx: &Transaction<'_>, cutoff_ms: i64) -> Result<CompactionPlan> {
                 })
                 .or_insert_with(|| value.clone());
         }
-        closures.insert(root.clone(), closure);
     }
     authorize_deletion_fixed_point(&rows, &mut union)?;
     let mut per_root = BTreeMap::new();
     for root in &selected {
-        let closure = closures
-            .get(root)
-            .expect("closure was collected for every selected root");
+        // Reconstruct one root at a time. Keeping every per-root closure here
+        // makes a heavily shared graph consume O(root_count * closure_size).
+        let closure = closure_for_root(&rows, root, cutoff_ms)?;
         let finalized = closure
             .iter()
             .map(|(key, (disposition, _))| {
@@ -260,12 +263,12 @@ fn plan(tx: &Transaction<'_>, cutoff_ms: i64) -> Result<CompactionPlan> {
         ],
     );
     Ok(CompactionPlan {
-        format: "ctx-compaction-plan",
+        format: "ctx-compaction-plan".into(),
         format_version: 1,
         private: true,
         source_schema_version: version,
         cutoff_ms,
-        graph_algorithm: ALGORITHM,
+        graph_algorithm: ALGORITHM.into(),
         selected_root_ids: selected,
         ambiguous_root_count: roots
             .iter()
@@ -961,6 +964,7 @@ fn authorize_deletion_fixed_point(
             .map(|(key, _)| key.clone())
             .collect();
         let mut revoke = BTreeSet::new();
+        let mut blockers = BTreeSet::new();
         for (owner_kind, owner_rows) in rows {
             for (owner_id, owner) in owner_rows {
                 if candidates.contains(&(owner_kind.clone(), owner_id.clone())) {
@@ -969,6 +973,7 @@ fn authorize_deletion_fixed_point(
                 for target in outgoing_references(owner_kind, owner)? {
                     if candidates.contains(&target) {
                         revoke.insert(target);
+                        blockers.insert((owner_kind.clone(), owner_id.clone()));
                     }
                 }
             }
@@ -976,6 +981,13 @@ fn authorize_deletion_fixed_point(
         if revoke.is_empty() {
             return Ok(());
         }
+        // Retain the canonical inbound owners that prove why a candidate is
+        // shared. Without these boundary rows a selective verifier observing
+        // only the archive would incorrectly re-authorize deletion.
+        for (kind, id) in blockers {
+            include(union, &kind, &id, "boundary_edge", false);
+        }
+        complete_dependency_references(rows, union)?;
         for key in revoke {
             if let Some(member) = union.get_mut(&key) {
                 member.1 = false;
@@ -1155,25 +1167,23 @@ fn digest_members(
     m: &BTreeMap<(String, String), (String, bool)>,
     rows: &Rows,
 ) -> Result<String> {
-    let mut tuples = Vec::new();
+    let mut digest = FramedDigest::new(domain, m.len());
     for ((kind, id), (disposition, delete)) in m {
         let content = if kind == "object_blob" {
             id.clone()
         } else {
             content_key(kind, id, require(rows, kind, id)?)
         };
-        tuples.push(encode_fields(&[
+        let tuple = encode_fields(&[
             kind.as_bytes(),
             id.as_bytes(),
             content.as_bytes(),
             disposition.as_bytes(),
             if *delete { b"1" } else { b"0" },
-        ]));
+        ]);
+        digest.part(&tuple);
     }
-    Ok(digest_fields(
-        domain,
-        &tuples.iter().map(Vec::as_slice).collect::<Vec<_>>(),
-    ))
+    Ok(digest.finish())
 }
 fn digest_plan_members(
     domain: &str,
@@ -1191,90 +1201,215 @@ fn digest_plan_members_refs(
     members: &[&CompactionPlanMember],
     authorization: bool,
 ) -> String {
-    let tuples: Vec<_> = if authorization {
-        let mut ordered: Vec<_> = members
-            .iter()
-            .map(|m| {
-                (
-                    m.entity_kind.as_str(),
-                    m.entity_key.as_str(),
-                    m.content_key.as_str(),
-                    m.disposition.as_str(),
-                )
-            })
-            .collect();
-        ordered.sort_unstable();
-        ordered
-            .into_iter()
-            .map(|(kind, key, content, reason)| {
-                encode_fields(&[
-                    kind.as_bytes(),
-                    key.as_bytes(),
-                    content.as_bytes(),
-                    reason.as_bytes(),
-                ])
-            })
-            .collect()
-    } else {
-        let mut ordered: Vec<_> = members
-            .iter()
-            .map(|m| {
-                (
-                    m.entity_kind.as_str(),
-                    m.entity_key.as_str(),
-                    m.content_key.as_str(),
-                    m.disposition.as_str(),
-                    m.ownership.as_str(),
-                )
-            })
-            .collect();
-        ordered.sort_unstable();
-        ordered
-            .into_iter()
-            .map(|(kind, key, content, reason, ownership)| {
-                encode_fields(&[
-                    kind.as_bytes(),
-                    key.as_bytes(),
-                    content.as_bytes(),
-                    reason.as_bytes(),
-                    ownership.as_bytes(),
-                ])
-            })
-            .collect()
-    };
-    digest_fields(
-        domain,
-        &tuples.iter().map(Vec::as_slice).collect::<Vec<_>>(),
-    )
+    if members.windows(2).any(|pair| {
+        (
+            &pair[0].entity_kind,
+            &pair[0].entity_key,
+            &pair[0].content_key,
+            &pair[0].disposition,
+        ) > (
+            &pair[1].entity_kind,
+            &pair[1].entity_key,
+            &pair[1].content_key,
+            &pair[1].disposition,
+        )
+    }) {
+        // Public plan production is already ordered. Retain the historical
+        // helper semantics for unusual callers without imposing a duplicate
+        // full vector on the archive path.
+        let mut ordered = members.to_vec();
+        ordered.sort_unstable_by_key(|member| {
+            (
+                &member.entity_kind,
+                &member.entity_key,
+                &member.content_key,
+                &member.disposition,
+            )
+        });
+        return digest_plan_members_refs(domain, &ordered, authorization);
+    }
+    // `members` originates from the already ordered plan vector; filtering
+    // preserves that order, so hashing needs no second full-size sort vector.
+    let mut digest = FramedDigest::new(domain, members.len());
+    for member in members {
+        let tuple = if authorization {
+            encode_fields(&[
+                member.entity_kind.as_bytes(),
+                member.entity_key.as_bytes(),
+                member.content_key.as_bytes(),
+                member.disposition.as_bytes(),
+            ])
+        } else {
+            encode_fields(&[
+                member.entity_kind.as_bytes(),
+                member.entity_key.as_bytes(),
+                member.content_key.as_bytes(),
+                member.disposition.as_bytes(),
+                member.ownership.as_bytes(),
+            ])
+        };
+        digest.part(&tuple);
+    }
+    digest.finish()
 }
 fn digest_roots(cutoff: i64, roots: &[CompactionRootDecision]) -> String {
-    let tuples: Vec<_> = roots
+    let mut digest = RootDigest::new(cutoff, roots.len());
+    for r in roots {
+        digest.push(r);
+    }
+    digest.finish()
+}
+
+pub(crate) struct RootDigest {
+    cutoff: i64,
+    digest: FramedDigest,
+}
+
+impl RootDigest {
+    pub(crate) fn new(cutoff: i64, count: usize) -> Self {
+        Self {
+            cutoff,
+            digest: FramedDigest::new("root-set", count),
+        }
+    }
+
+    pub(crate) fn push(&mut self, r: &CompactionRootDecision) {
+        let ended = r
+            .observed_ended_at_ms
+            .map(|v| {
+                let mut b = vec![1];
+                b.extend_from_slice(&v.to_be_bytes());
+                b
+            })
+            .unwrap_or_else(|| vec![0]);
+        let tuple = encode_fields(&[
+            r.session_id.as_bytes(),
+            r.disposition.as_bytes(),
+            r.observed_status.as_bytes(),
+            &ended,
+            &self.cutoff.to_be_bytes(),
+            r.closure_digest.as_deref().unwrap_or("").as_bytes(),
+            &r.member_count.to_be_bytes(),
+            &r.deletion_member_count.to_be_bytes(),
+        ]);
+        self.digest.part(&tuple);
+    }
+
+    pub(crate) fn finish(self) -> String {
+        self.digest.finish()
+    }
+}
+
+pub(crate) fn visit_root_members(
+    tx: &Transaction<'_>,
+    plan: &CompactionPlan,
+    mut visit: impl FnMut(&str, &CompactionPlanMember) -> Result<()>,
+) -> Result<()> {
+    let rows = load_rows(tx)?;
+    validate_rows(&rows)?;
+    let union = plan
+        .members
         .iter()
-        .map(|r| {
-            let ended = r
-                .observed_ended_at_ms
-                .map(|v| {
-                    let mut b = vec![1];
-                    b.extend_from_slice(&v.to_be_bytes());
-                    b
-                })
-                .unwrap_or_else(|| vec![0]);
-            encode_fields(&[
-                r.session_id.as_bytes(),
-                r.disposition.as_bytes(),
-                r.observed_status.as_bytes(),
-                &ended,
-                &cutoff.to_be_bytes(),
-                r.closure_digest.as_deref().unwrap_or("").as_bytes(),
-                &r.member_count.to_be_bytes(),
-                &r.deletion_member_count.to_be_bytes(),
-            ])
+        .map(|member| {
+            (
+                (member.entity_kind.clone(), member.entity_key.clone()),
+                (member.disposition.clone(), member.deletion_authorized),
+            )
         })
+        .collect::<BTreeMap<_, _>>();
+    for root in &plan.selected_root_ids {
+        let closure = closure_for_root(&rows, root, plan.cutoff_ms)?;
+        let finalized = closure
+            .iter()
+            .map(|(key, (disposition, _))| {
+                (
+                    key.clone(),
+                    (
+                        disposition.clone(),
+                        union.get(key).is_some_and(|(_, deletion)| *deletion),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        for mut member in materialize_members(&rows, &finalized)? {
+            member.deletion_authorized = finalized
+                .get(&(member.entity_kind.clone(), member.entity_key.clone()))
+                .is_some_and(|(_, deletion)| *deletion);
+            visit(root, &member)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_plan_evidence(plan: &CompactionPlan) -> bool {
+    if plan.format != "ctx-compaction-plan"
+        || plan.format_version != 1
+        || plan.graph_algorithm != ALGORITHM
+        || plan.source_schema_version != SCHEMA_VERSION
+        || plan.members.windows(2).any(|pair| {
+            (&pair[0].entity_kind, &pair[0].entity_key)
+                >= (&pair[1].entity_kind, &pair[1].entity_key)
+        })
+        || plan.membership_digest != digest_plan_members("membership", &plan.members, false)
+    {
+        return false;
+    }
+    let selected = plan
+        .roots
+        .iter()
+        .filter(|root| root.disposition == "selected")
+        .map(|root| root.session_id.as_str())
+        .collect::<Vec<_>>();
+    if selected
+        != plan
+            .selected_root_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+    {
+        return false;
+    }
+    let deletion: Vec<_> = plan
+        .members
+        .iter()
+        .filter(|member| member.deletion_authorized)
         .collect();
-    digest_fields(
-        "root-set",
-        &tuples.iter().map(Vec::as_slice).collect::<Vec<_>>(),
-    )
+    let root_set = digest_roots(plan.cutoff_ms, &plan.roots);
+    let deletion_set = digest_plan_members_refs("deletion-set", &deletion, true);
+    let request = digest_fields(
+        "plan",
+        &[
+            ALGORITHM.as_bytes(),
+            &plan.cutoff_ms.to_be_bytes(),
+            root_set.as_bytes(),
+            plan.closure_digest.as_bytes(),
+            plan.membership_digest.as_bytes(),
+            deletion_set.as_bytes(),
+        ],
+    );
+    plan.root_set_digest == root_set
+        && plan.deletion_set_digest == deletion_set
+        && plan.deletion_authorized_count == deletion.len() as u64
+        && plan.plan_digest == request
+}
+
+pub(crate) fn validate_plan_header(plan: &CompactionPlan) -> bool {
+    plan.format == "ctx-compaction-plan"
+        && plan.format_version == 1
+        && plan.graph_algorithm == ALGORITHM
+        && plan.source_schema_version == SCHEMA_VERSION
+        && plan.plan_digest
+            == digest_fields(
+                "plan",
+                &[
+                    ALGORITHM.as_bytes(),
+                    &plan.cutoff_ms.to_be_bytes(),
+                    plan.root_set_digest.as_bytes(),
+                    plan.closure_digest.as_bytes(),
+                    plan.membership_digest.as_bytes(),
+                    plan.deletion_set_digest.as_bytes(),
+                ],
+            )
 }
 fn encode_canonical_values(values: &[CanonicalValue]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -1309,11 +1444,35 @@ fn encode_fields(parts: &[&[u8]]) -> Vec<u8> {
     out
 }
 fn digest_fields(domain: &str, parts: &[&[u8]]) -> String {
-    let mut h = Sha256::new();
-    let tag = format!("ctx-compaction/{domain}/v1");
-    h.update(tag);
-    h.update(encode_fields(parts));
-    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    let mut digest = FramedDigest::new(domain, parts.len());
+    for part in parts {
+        digest.part(part);
+    }
+    digest.finish()
+}
+
+struct FramedDigest(Sha256);
+
+impl FramedDigest {
+    fn new(domain: &str, count: usize) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(format!("ctx-compaction/{domain}/v1"));
+        hasher.update((count as u32).to_be_bytes());
+        Self(hasher)
+    }
+
+    fn part(&mut self, part: &[u8]) {
+        self.0.update((part.len() as u64).to_be_bytes());
+        self.0.update(part);
+    }
+
+    fn finish(self) -> String {
+        self.0
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
 }
 
 #[cfg(test)]

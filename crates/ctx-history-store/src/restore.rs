@@ -400,6 +400,11 @@ pub fn restore_archive_bundle(
     options: ArchiveVerifyOptions,
 ) -> Result<ArchiveRestoreReport> {
     let verified = verify_archive_bundle_internal(bundle, options)?; // no destination mutation before full verification
+    if verified.manifest.format != "ctx-archive" {
+        return Err(crate::StoreError::Archive(
+            "selective archive restore is not implemented".into(),
+        ));
+    }
     reject_nesting(bundle, target)?;
     absent(target)?;
     let parent = target

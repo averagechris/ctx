@@ -22,6 +22,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{Result, Store, StoreError};
+use crate::CompactionPlan;
 
 const STREAMS: [(&str, &str, &str); 15] = [
     ("capture_sources", "01-capture_sources.jsonl", "id"),
@@ -448,6 +449,7 @@ impl Default for ArchiveVerifyOptions {
 
 #[derive(Debug, Clone)]
 pub struct ArchiveVerificationReport {
+    pub format: String,
     pub path: PathBuf,
     pub entity_count: u64,
     pub object_count: u64,
@@ -461,6 +463,74 @@ impl Store {
         &mut self,
         target: impl AsRef<Path>,
         options: ArchiveOptions,
+    ) -> Result<ArchiveReport> {
+        self.create_archive_with_cutoff(target, options, None, None)
+    }
+
+    /// Create the exact closure of a fresh, read-only compaction plan. The
+    /// cutoff is the sole selection input and planning shares the export's
+    /// SQLite snapshot, so callers cannot substitute a stale membership.
+    pub fn create_selective_archive(
+        &mut self,
+        target: impl AsRef<Path>,
+        cutoff_ms: i64,
+        mut options: ArchiveOptions,
+    ) -> Result<ArchiveReport> {
+        let fresh = self.plan_compaction(cutoff_ms)?;
+        let digest = hex_bytes(&fresh.plan_digest)?;
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        bytes[6] = (bytes[6] & 0x0f) | 0x80;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        let request_id = Uuid::from_bytes(bytes);
+        if options.archive_id.is_some_and(|id| id != request_id) {
+            return Err(archive_error(
+                "selective archive_id conflicts with the plan digest",
+            ));
+        }
+        options.archive_id = Some(request_id);
+        options.created_at_ms = Some(cutoff_ms);
+        let target = target.as_ref();
+        if target.exists() {
+            let verified = verify_archive_bundle_internal(target, ArchiveVerifyOptions::default())?;
+            if verified.manifest.format != "ctx-selective-archive"
+                || verified.manifest.archive_id != request_id
+                || verified.manifest.selective_plan_digest.as_deref() != Some(&fresh.plan_digest)
+            {
+                return Err(archive_error(
+                    "published target conflicts with selective request",
+                ));
+            }
+            return Ok(ArchiveReport {
+                archive_id: request_id,
+                created_at_ms: cutoff_ms,
+                path: target.to_path_buf(),
+                streams: verified
+                    .manifest
+                    .streams
+                    .iter()
+                    .map(|stream| ArchiveStreamReport {
+                        name: stream.name.clone(),
+                        path: stream.path.clone(),
+                        count: stream.count,
+                        bytes: stream.bytes,
+                        sha256: stream.sha256.clone(),
+                    })
+                    .collect(),
+                object_count: verified.manifest.object_count,
+                object_bytes: verified.manifest.object_bytes,
+                entity_count: verified.manifest.entity_count,
+            });
+        }
+        self.create_archive_with_cutoff(target, options, Some(cutoff_ms), Some(fresh.plan_digest))
+    }
+
+    fn create_archive_with_cutoff(
+        &mut self,
+        target: impl AsRef<Path>,
+        options: ArchiveOptions,
+        cutoff_ms: Option<i64>,
+        expected_plan_digest: Option<String>,
     ) -> Result<ArchiveReport> {
         let target = target.as_ref().to_path_buf();
         let parent = target
@@ -482,6 +552,29 @@ impl Store {
                 .ok_or_else(|| archive_error("archive target must have a UTF-8 file name"))?,
             archive_id
         ));
+        if stage.exists() && expected_plan_digest.is_some() {
+            match verify_v1_bundle(&stage, ArchiveVerifyOptions::default(), false) {
+                Ok(verified)
+                    if verified.manifest.archive_id == archive_id
+                        && verified.manifest.selective_plan_digest.as_deref()
+                            == expected_plan_digest.as_deref() =>
+                {
+                    sync_tree(&stage)?;
+                    atomic_publish(&stage, &target)?;
+                    return Ok(report_from_verified(
+                        verified,
+                        archive_id,
+                        created_at_ms,
+                        target,
+                    ));
+                }
+                Ok(_) => return Err(archive_error("staging conflicts with selective request")),
+                Err(_) => {
+                    open_read_nofollow(&stage, true)?;
+                    fs::remove_dir_all(&stage)?;
+                }
+            }
+        }
         reject_existing_target(&stage)?;
         create_private_dir(&stage)?;
 
@@ -491,6 +584,7 @@ impl Store {
             archive_id,
             created_at_ms,
             &options.generator_version,
+            cutoff_ms.zip(expected_plan_digest.as_deref()),
         );
         if result.is_err() {
             let _ = fs::remove_dir_all(&stage);
@@ -505,6 +599,7 @@ impl Store {
         archive_id: Uuid,
         created_at_ms: i64,
         generator_version: &str,
+        selective_request: Option<(i64, &str)>,
     ) -> Result<ArchiveReport> {
         let streams_dir = stage.join("streams");
         let objects_dir = stage.join("objects");
@@ -520,12 +615,32 @@ impl Store {
             [],
             |row| row.get(0),
         )?;
+        let selective_plan = selective_request
+            .map(|(cutoff, _)| cutoff)
+            .map(|cutoff| super::compaction::plan(&tx, cutoff))
+            .transpose()?;
+        if selective_plan
+            .as_ref()
+            .map(|plan| plan.plan_digest.as_str())
+            != selective_request.map(|(_, digest)| digest)
+        {
+            return Err(archive_error("selective plan changed before export"));
+        }
+        let selected_members = selective_plan.as_ref().map(|plan| plan.members.as_slice());
+        let root_evidence = if let Some(plan) = &selective_plan {
+            let evidence_dir = stage.join("evidence");
+            create_private_dir(&evidence_dir)?;
+            Some(write_root_evidence(&tx, &evidence_dir, plan)?)
+        } else {
+            None
+        };
 
         let mut stream_reports = Vec::with_capacity(STREAMS.len());
 
         stream_reports.push(write_stream(
             &tx,
             &streams_dir,
+            selected_members.as_ref(),
             STREAMS[0],
             "SELECT id, kind, provider, machine_id, process_id, cwd, raw_source_path, external_session_id, started_at_ms, ended_at_ms, fidelity, visibility, sync_state, sync_version, metadata_json FROM capture_sources ORDER BY id",
             |row| {
@@ -555,6 +670,7 @@ impl Store {
         stream_reports.push(write_stream(
             &tx,
             &streams_dir,
+            selected_members.as_ref(),
             STREAMS[1],
             "SELECT id, kind, root_path, repo_fingerprint, primary_remote_url_normalized, host, owner, name, monorepo_subpath, created_at_ms, updated_at_ms, source_id, visibility, fidelity, sync_state, sync_version, deleted_at_ms, metadata_json FROM vcs_workspaces ORDER BY id",
             |row| {
@@ -583,6 +699,7 @@ impl Store {
         stream_reports.push(write_stream(
             &tx,
             &streams_dir,
+            selected_members.as_ref(),
             STREAMS[2],
             "SELECT id, title, summary, status, primary_vcs_workspace_id, started_at_ms, last_activity_at_ms, completed_at_ms, confidence, created_at_ms, updated_at_ms, source_id, visibility, fidelity, sync_state, sync_version, deleted_at_ms, metadata_json, body, tags_json, kind, workspace FROM history_records ORDER BY id",
             |row| {
@@ -615,6 +732,7 @@ impl Store {
         stream_reports.push(write_stream(
             &tx,
             &streams_dir,
+            selected_members.as_ref(),
             STREAMS[3],
             "SELECT id, kind, blob_hash, byte_size, media_type, preview_text, redaction_state, created_at_ms, updated_at_ms, source_id, visibility, fidelity, sync_state, sync_version, deleted_at_ms, metadata_json FROM artifacts ORDER BY id",
             |row| {
@@ -646,6 +764,7 @@ impl Store {
         stream_reports.push(write_stream(
             &tx,
             &streams_dir,
+            selected_members.as_ref(),
             STREAMS[4],
             "SELECT id, history_record_id, parent_session_id, root_session_id, capture_source_id, provider, external_session_id, external_agent_id, agent_type, role_hint, is_primary, status, fidelity, transcript_blob_id, started_at_ms, ended_at_ms, created_at_ms, updated_at_ms, visibility, sync_state, sync_version, deleted_at_ms, metadata_json FROM sessions ORDER BY id",
             |row| {
@@ -687,6 +806,7 @@ impl Store {
         stream_reports.push(write_stream(
             &tx,
             &streams_dir,
+            selected_members.as_ref(),
             STREAMS[5],
             "SELECT id, from_session_id, to_session_id, edge_type, confidence, created_at_ms, updated_at_ms, source_id, visibility, fidelity, sync_state, sync_version, deleted_at_ms, metadata_json FROM session_edges ORDER BY id",
             |row| {
@@ -711,6 +831,7 @@ impl Store {
         stream_reports.push(write_stream(
             &tx,
             &streams_dir,
+            selected_members.as_ref(),
             STREAMS[6],
             "SELECT id, history_record_id, session_id, run_type, status, started_at_ms, ended_at_ms, exit_code, cwd, command_preview, input_blob_id, output_blob_id, created_at_ms, updated_at_ms, source_id, visibility, fidelity, sync_state, sync_version, deleted_at_ms, metadata_json FROM runs ORDER BY id",
             |row| {
@@ -746,6 +867,7 @@ impl Store {
         stream_reports.push(write_stream(
             &tx,
             &streams_dir,
+            selected_members.as_ref(),
             STREAMS[7],
             "SELECT id, seq, history_record_id, session_id, run_id, event_type, role, occurred_at_ms, capture_source_id, payload_json, payload_blob_id, dedupe_key, visibility, redaction_state, fidelity, sync_state, sync_version, deleted_at_ms, metadata_json FROM events ORDER BY seq",
             |row| {
@@ -775,6 +897,7 @@ impl Store {
         stream_reports.push(write_stream(
             &tx,
             &streams_dir,
+            selected_members.as_ref(),
             STREAMS[8],
             "SELECT id, vcs_workspace_id, kind, change_id, parent_change_ids_json, branch_or_bookmark, tree_hash, author_time_ms, confidence, created_at_ms, updated_at_ms, source_id, visibility, fidelity, sync_state, sync_version, deleted_at_ms, metadata_json FROM vcs_changes ORDER BY id",
             |row| {
@@ -803,6 +926,7 @@ impl Store {
         stream_reports.push(write_stream(
             &tx,
             &streams_dir,
+            selected_members.as_ref(),
             STREAMS[9],
             "SELECT id, history_record_id, session_id, kind, model_or_source, text, citations_json, created_at_ms, updated_at_ms, source_id, visibility, fidelity, sync_state, sync_version, deleted_at_ms, metadata_json FROM summaries ORDER BY id",
             |row| {
@@ -829,6 +953,7 @@ impl Store {
         stream_reports.push(write_stream(
             &tx,
             &streams_dir,
+            selected_members.as_ref(),
             STREAMS[10],
             "SELECT id, history_record_id, run_id, event_id, vcs_workspace_id, path, change_kind, old_path, line_count_delta, confidence, created_at_ms, updated_at_ms, source_id, visibility, fidelity, sync_state, sync_version, deleted_at_ms, metadata_json FROM files_touched ORDER BY id",
             |row| {
@@ -858,6 +983,7 @@ impl Store {
         stream_reports.push(write_stream(
             &tx,
             &streams_dir,
+            selected_members.as_ref(),
             STREAMS[11],
             "SELECT id, name, kind, created_at_ms, updated_at_ms, metadata_json FROM tags ORDER BY id",
             |row| {
@@ -874,6 +1000,7 @@ impl Store {
         stream_reports.push(write_stream(
             &tx,
             &streams_dir,
+            selected_members.as_ref(),
             STREAMS[12],
             "SELECT history_record_id, tag_id, source_id, confidence, created_at_ms FROM history_record_tags ORDER BY history_record_id, tag_id",
             |row| {
@@ -889,6 +1016,7 @@ impl Store {
         stream_reports.push(write_stream(
             &tx,
             &streams_dir,
+            selected_members.as_ref(),
             STREAMS[13],
             "SELECT id, history_record_id, target_type, target_id, link_type, confidence, created_at_ms, updated_at_ms, source_id, visibility, fidelity, sync_state, sync_version, deleted_at_ms, metadata_json FROM history_record_links ORDER BY id",
             |row| {
@@ -914,6 +1042,7 @@ impl Store {
         stream_reports.push(write_stream(
             &tx,
             &streams_dir,
+            selected_members.as_ref(),
             STREAMS[14],
             "SELECT id, from_record_id, to_record_id, edge_type, confidence, created_at_ms, updated_at_ms, source_id, visibility, fidelity, sync_state, sync_version, deleted_at_ms, metadata_json FROM record_edges ORDER BY id",
             |row| {
@@ -935,7 +1064,12 @@ impl Store {
                 Ok(o.finish())
             },
         )?);
-        let object_report = copy_objects(&tx, &source_objects, &objects_dir)?;
+        let object_report = copy_objects(
+            &tx,
+            &source_objects,
+            &objects_dir,
+            selected_members.as_ref(),
+        )?;
         // Keep the SQLite snapshot open until both rows and the referenced
         // bytes have been captured. Blob files are outside SQLite's
         // transaction, so copy_objects re-hashes every chunk and aborts on a
@@ -955,6 +1089,8 @@ impl Store {
             object_count: object_report.0,
             object_bytes: object_report.1,
             entity_count,
+            selective_plan: selective_plan.as_ref(),
+            root_evidence: root_evidence.as_ref(),
         });
         if manifest.len() > MAX_MANIFEST_BYTES {
             return Err(archive_error("archive manifest exceeds the 16 MiB limit"));
@@ -988,9 +1124,38 @@ impl Store {
     }
 }
 
+fn report_from_verified(
+    verified: VerifiedArchive,
+    archive_id: Uuid,
+    created_at_ms: i64,
+    path: PathBuf,
+) -> ArchiveReport {
+    ArchiveReport {
+        archive_id,
+        created_at_ms,
+        path,
+        streams: verified
+            .manifest
+            .streams
+            .iter()
+            .map(|stream| ArchiveStreamReport {
+                name: stream.name.clone(),
+                path: stream.path.clone(),
+                count: stream.count,
+                bytes: stream.bytes,
+                sha256: stream.sha256.clone(),
+            })
+            .collect(),
+        object_count: verified.manifest.object_count,
+        object_bytes: verified.manifest.object_bytes,
+        entity_count: verified.manifest.entity_count,
+    }
+}
+
 fn write_stream<F>(
     tx: &Transaction<'_>,
     streams_dir: &Path,
+    selected_members: Option<&&[crate::CompactionPlanMember]>,
     descriptor: (&str, &str, &str),
     sql: &str,
     mut encode: F,
@@ -1033,7 +1198,27 @@ where
         let mut rows = statement.query(rusqlite::params_from_iter(bindings))?;
         let mut page_count = 0_u64;
         while let Some(row) = rows.next()? {
-            let record = encode(row)?;
+            let member_key = if descriptor.0 == "history_record_tags" {
+                format!("{}:{}", row.get::<_, String>(0)?, row.get::<_, String>(1)?)
+            } else {
+                row.get::<_, String>(0)?
+            };
+            let included = selected_members.map_or(true, |members| {
+                member_selected(members, descriptor.0, &member_key)
+            });
+            let record = if included { Some(encode(row)?) } else { None };
+            page_count = page_count
+                .checked_add(1)
+                .ok_or_else(|| archive_error("stream page count overflow"))?;
+            let Some(record) = record else {
+                match descriptor.2 {
+                    "id" => last_text = Some(row.get(0)?),
+                    "seq" => last_number = Some(row.get(1)?),
+                    "history_record_id, tag_id" => last_pair = Some((row.get(0)?, row.get(1)?)),
+                    _ => unreachable!(),
+                }
+                continue;
+            };
             let record_bytes = record.as_bytes();
             if record_bytes.len() > MAX_JSONL_LINE_BYTES {
                 return Err(archive_error(
@@ -1047,9 +1232,6 @@ where
             count = count
                 .checked_add(1)
                 .ok_or_else(|| archive_error("stream count overflow"))?;
-            page_count = page_count
-                .checked_add(1)
-                .ok_or_else(|| archive_error("stream page count overflow"))?;
             bytes = bytes
                 .checked_add(record_bytes.len() as u64 + 1)
                 .ok_or_else(|| archive_error("stream byte count overflow"))?;
@@ -1070,6 +1252,66 @@ where
     Ok(ArchiveStreamReport {
         name: descriptor.0.to_owned(),
         path: format!("streams/{}", descriptor.1),
+        count,
+        bytes,
+        sha256: hex_digest(hasher.finalize()),
+    })
+}
+
+fn member_selected(members: &[crate::CompactionPlanMember], kind: &str, key: &str) -> bool {
+    members
+        .binary_search_by(|member| {
+            (member.entity_kind.as_str(), member.entity_key.as_str()).cmp(&(kind, key))
+        })
+        .is_ok()
+}
+
+fn write_root_evidence(
+    tx: &Transaction<'_>,
+    dir: &Path,
+    plan: &CompactionPlan,
+) -> Result<ArchiveStreamReport> {
+    let path = dir.join("root-members.jsonl");
+    let mut file = private_open(&path)?;
+    let mut hasher = Sha256::new();
+    let mut count = 0_u64;
+    let mut bytes = 0_u64;
+    let mut write = |value: serde_json::Value| -> Result<()> {
+        let line = serde_json::to_vec(&value)?;
+        if line.len() > MAX_JSONL_LINE_BYTES {
+            return Err(archive_error(
+                "selective evidence line exceeds the JSONL limit",
+            ));
+        }
+        file.write_all(&line)?;
+        file.write_all(b"\n")?;
+        hasher.update(&line);
+        hasher.update(b"\n");
+        count = count
+            .checked_add(1)
+            .ok_or_else(|| archive_error("selective evidence count overflow"))?;
+        bytes = bytes
+            .checked_add(line.len() as u64 + 1)
+            .ok_or_else(|| archive_error("selective evidence byte overflow"))?;
+        Ok(())
+    };
+    for root in &plan.roots {
+        write(serde_json::json!({"kind":"root","root":root}))?;
+    }
+    for member in &plan.members {
+        write(serde_json::json!({"kind":"member","member":member}))?;
+    }
+    super::compaction::visit_root_members(tx, plan, |root, member| {
+        write(serde_json::json!({
+            "kind": "root_member",
+            "root_session_id": root,
+            "member": member,
+        }))
+    })?;
+    file.sync_all()?;
+    Ok(ArchiveStreamReport {
+        name: "root_members".into(),
+        path: "evidence/root-members.jsonl".into(),
         count,
         bytes,
         sha256: hex_digest(hasher.finalize()),
@@ -1147,6 +1389,8 @@ struct ManifestInput<'a> {
     object_count: u64,
     object_bytes: u64,
     entity_count: u64,
+    selective_plan: Option<&'a CompactionPlan>,
+    root_evidence: Option<&'a ArchiveStreamReport>,
 }
 
 fn manifest_bytes(input: ManifestInput<'_>) -> Vec<u8> {
@@ -1160,9 +1404,19 @@ fn manifest_bytes(input: ManifestInput<'_>) -> Vec<u8> {
         object_count,
         object_bytes,
         entity_count,
+        selective_plan,
+        root_evidence,
     } = input;
     let mut o = JsonWriter::new();
-    o.str_field("format", "ctx-archive".to_owned());
+    o.str_field(
+        "format",
+        if selective_plan.is_some() {
+            "ctx-selective-archive"
+        } else {
+            "ctx-archive"
+        }
+        .to_owned(),
+    );
     o.i64_field("format_version", 1);
     o.str_field("archive_id", archive_id.to_string());
     o.i64_field("created_at_ms", created_at_ms);
@@ -1177,7 +1431,15 @@ fn manifest_bytes(input: ManifestInput<'_>) -> Vec<u8> {
     if let Some(origin) = origin_device_id {
         o.str_field("origin_device_id", origin.to_owned());
     }
-    o.field("scope", "{\"kind\":\"full\"}".to_owned());
+    o.field(
+        "scope",
+        if selective_plan.is_some() {
+            "{\"kind\":\"selective\"}"
+        } else {
+            "{\"kind\":\"full\"}"
+        }
+        .to_owned(),
+    );
     let stream_json = streams
         .iter()
         .map(|stream| {
@@ -1204,6 +1466,27 @@ fn manifest_bytes(input: ManifestInput<'_>) -> Vec<u8> {
         "entity_count",
         i64::try_from(entity_count).unwrap_or(i64::MAX),
     );
+    if let Some(plan) = selective_plan {
+        let mut compact = serde_json::to_value(plan).expect("compaction plan is serializable");
+        let compact_object = compact.as_object_mut().expect("plan is an object");
+        compact_object.insert("roots".into(), serde_json::Value::Array(Vec::new()));
+        compact_object.insert("members".into(), serde_json::Value::Array(Vec::new()));
+        o.field(
+            "selective",
+            serde_json::to_string(&compact).expect("compaction plan is serializable"),
+        );
+        let evidence = root_evidence.expect("selective evidence was written");
+        o.field(
+            "evidence",
+            format!(
+                "{{\"root_members\":{{\"path\":{},\"count\":{},\"bytes\":{},\"sha256\":{}}}}}",
+                serde_json::to_string(&evidence.path).unwrap(),
+                evidence.count,
+                evidence.bytes,
+                serde_json::to_string(&evidence.sha256).unwrap(),
+            ),
+        );
+    }
     let mut bytes = o.finish().into_bytes();
     bytes.push(b'\n');
     bytes
@@ -1222,6 +1505,7 @@ fn copy_objects(
     tx: &Transaction<'_>,
     source_objects: &Path,
     destination_objects: &Path,
+    selected_members: Option<&&[crate::CompactionPlanMember]>,
 ) -> Result<(u64, u64)> {
     #[cfg(unix)]
     let source_root = AnchoredDir::open_path(source_objects)?;
@@ -1233,6 +1517,9 @@ fn copy_objects(
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
         let hash: String = row.get(0)?;
+        if selected_members.is_some_and(|members| !member_selected(members, "object_blob", &hash)) {
+            continue;
+        }
         let minimum_size: i64 = row.get(1)?;
         let maximum_size: i64 = row.get(2)?;
         if minimum_size != maximum_size || !is_sha256_hex(&hash) || minimum_size < 0 {
@@ -2148,12 +2435,16 @@ pub(super) struct StreamMeta {
 
 #[derive(Debug)]
 pub(super) struct ManifestInfo {
+    pub(super) format: String,
     pub(super) archive_id: Uuid,
     pub(super) source_schema_version: i64,
     pub(super) entity_count: u64,
     pub(super) object_count: u64,
     pub(super) object_bytes: u64,
     pub(super) streams: Vec<StreamMeta>,
+    pub(super) selective_plan_digest: Option<String>,
+    pub(super) selective_plan: Option<CompactionPlan>,
+    pub(super) root_evidence: Option<StreamMeta>,
 }
 
 fn named_schema(name: &str) -> Vec<FieldSpec> {
@@ -2170,6 +2461,8 @@ fn named_schema(name: &str) -> Vec<FieldSpec> {
             ("streams", false),
             ("objects", false),
             ("entity_count", false),
+            ("selective", true),
+            ("evidence", true),
         ],
         "stream" => &[
             ("name", false),
@@ -2179,6 +2472,13 @@ fn named_schema(name: &str) -> Vec<FieldSpec> {
             ("sha256", false),
         ],
         "objects" => &[("count", false), ("total_bytes", false)],
+        "evidence" => &[("root_members", false)],
+        "root_evidence" => &[
+            ("path", false),
+            ("count", false),
+            ("bytes", false),
+            ("sha256", false),
+        ],
         "generator" => &[("name", false), ("version", false)],
         "scope" => &[("kind", false)],
         "complete" => &[
@@ -2245,7 +2545,8 @@ fn parse_manifest(bytes: &[u8], options: ArchiveVerifyOptions) -> Result<Manifes
     let line = single_line(bytes, MAX_MANIFEST_BYTES, "manifest")?;
     let object = parse_json_object(line)?;
     validate_field_order(&object, &named_schema("manifest"))?;
-    if required_string(&object, "format")? != "ctx-archive" {
+    let format = required_string(&object, "format")?;
+    if !matches!(format.as_str(), "ctx-archive" | "ctx-selective-archive") {
         return Err(verification_error(
             ArchiveVerificationCode::FormatUnsupported,
             "unsupported archive format",
@@ -2278,12 +2579,114 @@ fn parse_manifest(bytes: &[u8], options: ArchiveVerifyOptions) -> Result<Manifes
     required_string(generator, "version")?;
     let scope = as_object(object_value(&object, "scope")?, "manifest scope")?;
     validate_field_order(scope, &named_schema("scope"))?;
-    if required_string(scope, "kind")? != "full" {
+    let scope_kind = required_string(scope, "kind")?;
+    let selective_node = object
+        .iter()
+        .find(|(name, _)| name == "selective")
+        .map(|(_, value)| value);
+    let evidence_node = object
+        .iter()
+        .find(|(name, _)| name == "evidence")
+        .map(|(_, value)| value);
+    if (format == "ctx-archive" && (scope_kind != "full" || selective_node.is_some()))
+        || (format == "ctx-selective-archive"
+            && (scope_kind != "selective" || selective_node.is_none() || evidence_node.is_none()))
+        || (format == "ctx-archive" && evidence_node.is_some())
+    {
         return Err(verification_error(
-            ArchiveVerificationCode::RecordMalformed,
-            "manifest scope is not full",
+            ArchiveVerificationCode::FormatUnsupported,
+            "archive family, scope, and selective evidence do not match",
         ));
     }
+    let mut selective_plan_digest = None;
+    let mut selective_plan = None;
+    if let Some(selective) = selective_node {
+        let evidence: serde_json::Value = serde_json::from_str(&canonical_json(selective))
+            .map_err(|_| {
+                verification_error(
+                    ArchiveVerificationCode::RecordMalformed,
+                    "selective evidence is malformed",
+                )
+            })?;
+        let evidence = evidence.as_object().ok_or_else(|| {
+            verification_error(
+                ArchiveVerificationCode::RecordMalformed,
+                "selective evidence is not an object",
+            )
+        })?;
+        let exact = |name: &str, expected: &str| {
+            evidence.get(name).and_then(serde_json::Value::as_str) == Some(expected)
+        };
+        if !exact("format", "ctx-compaction-plan")
+            || evidence
+                .get("format_version")
+                .and_then(serde_json::Value::as_u64)
+                != Some(1)
+            || !exact("graph_algorithm", "ctx-compaction-directional-closure/v1")
+            || [
+                "plan_digest",
+                "closure_digest",
+                "membership_digest",
+                "root_set_digest",
+                "deletion_set_digest",
+            ]
+            .iter()
+            .any(|name| {
+                !evidence
+                    .get(*name)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(is_sha256_hex)
+            })
+            || !evidence
+                .get("roots")
+                .is_some_and(serde_json::Value::is_array)
+            || !evidence
+                .get("members")
+                .is_some_and(serde_json::Value::is_array)
+        {
+            return Err(verification_error(
+                ArchiveVerificationCode::RecordMalformed,
+                "selective evidence identity or digest fields are invalid",
+            ));
+        }
+        let plan: CompactionPlan =
+            serde_json::from_value(serde_json::Value::Object(evidence.clone())).map_err(|_| {
+                verification_error(
+                    ArchiveVerificationCode::RecordMalformed,
+                    "selective evidence has unknown or malformed fields",
+                )
+            })?;
+        selective_plan_digest = Some(plan.plan_digest.clone());
+        selective_plan = Some(plan);
+    }
+    let root_evidence = if let Some(evidence) = evidence_node {
+        let evidence = as_object(evidence, "selective evidence index")?;
+        validate_field_order(evidence, &named_schema("evidence"))?;
+        let root = as_object(object_value(evidence, "root_members")?, "root evidence")?;
+        validate_field_order(root, &named_schema("root_evidence"))?;
+        let meta = StreamMeta {
+            name: "root_members".into(),
+            path: required_string(root, "path")?,
+            count: required_u64(root, "count")?,
+            bytes: required_u64(root, "bytes")?,
+            sha256: required_string(root, "sha256")?,
+        };
+        if meta.path != "evidence/root-members.jsonl" || !is_sha256_hex(&meta.sha256) {
+            return Err(verification_error(
+                ArchiveVerificationCode::LayoutMismatch,
+                "root evidence path or checksum is invalid",
+            ));
+        }
+        if meta.count > options.max_entities || meta.bytes > options.max_total_bytes {
+            return Err(verification_error(
+                ArchiveVerificationCode::SizeCapExceeded,
+                "selective evidence exceeds the selected verification cap",
+            ));
+        }
+        Some(meta)
+    } else {
+        None
+    };
     let streams = as_array(object_value(&object, "streams")?, "manifest streams")?;
     if streams.len() != STREAMS.len() {
         return Err(verification_error(
@@ -2349,12 +2752,16 @@ fn parse_manifest(bytes: &[u8], options: ArchiveVerifyOptions) -> Result<Manifes
         ));
     }
     Ok(ManifestInfo {
+        format,
         archive_id,
         source_schema_version,
         entity_count,
         object_count,
         object_bytes,
         streams: stream_meta,
+        selective_plan_digest,
+        selective_plan,
+        root_evidence,
     })
 }
 
@@ -2615,6 +3022,21 @@ fn verify_v1_bundle(
         .map_err(|error| {
         preserve_verification_error(error, ArchiveVerificationCode::RecordMalformed)
     })?;
+    if manifest.format == "ctx-selective-archive" {
+        let meta = manifest.root_evidence.as_ref().ok_or_else(|| {
+            verification_error(
+                ArchiveVerificationCode::LayoutMismatch,
+                "selective root evidence is missing",
+            )
+        })?;
+        verify_root_evidence(
+            stage,
+            #[cfg(unix)]
+            &root,
+            meta,
+            &state,
+        )?;
+    }
     let mut entities = 0_u64;
     for (index, descriptor) in STREAMS.iter().enumerate() {
         let (count, _) = verify_stream_file(
@@ -2659,8 +3081,17 @@ fn verify_v1_bundle(
             "manifest object totals mismatch",
         ));
     }
+    if manifest.format == "ctx-selective-archive" {
+        state.verify_selective_plan(
+            manifest
+                .selective_plan
+                .as_ref()
+                .expect("selective plan parsed"),
+        )?;
+    }
     Ok(VerifiedArchive {
         report: ArchiveVerificationReport {
+            format: manifest.format.clone(),
             path: stage.to_path_buf(),
             entity_count: entities,
             object_count,
@@ -2713,7 +3144,10 @@ fn verify_root_layout(_stage: &Path, #[cfg(unix)] root: &AnchoredDir) -> Result<
             }
         })?;
         root.for_each_name(|name| {
-            if matches!(name, "manifest.json" | "COMPLETE" | "streams" | "objects") {
+            if matches!(
+                name,
+                "manifest.json" | "COMPLETE" | "streams" | "objects" | "evidence"
+            ) {
                 Ok(())
             } else {
                 Err(verification_error(
@@ -2722,6 +3156,19 @@ fn verify_root_layout(_stage: &Path, #[cfg(unix)] root: &AnchoredDir) -> Result<
                 ))
             }
         })?;
+        if let Ok(evidence) = root.dir("evidence") {
+            evidence.file("root-members.jsonl")?;
+            evidence.for_each_name(|name| {
+                if name == "root-members.jsonl" {
+                    Ok(())
+                } else {
+                    Err(verification_error(
+                        ArchiveVerificationCode::LayoutMismatch,
+                        "unexpected evidence file",
+                    ))
+                }
+            })?;
+        }
         for (_, file, _) in STREAMS {
             streams.file(file).map_err(|error| {
                 if is_security_entry_error(&error) {
@@ -2760,7 +3207,8 @@ fn verify_root_layout(_stage: &Path, #[cfg(unix)] root: &AnchoredDir) -> Result<
             let valid = name == "manifest.json"
                 || name == "COMPLETE"
                 || name == "streams"
-                || name == "objects";
+                || name == "objects"
+                || name == "evidence";
             if !valid {
                 return Err(verification_error(
                     ArchiveVerificationCode::LayoutMismatch,
@@ -2967,6 +3415,154 @@ fn verify_stream_file(
     Ok((count, bytes))
 }
 
+fn verify_root_evidence(
+    _stage: &Path,
+    #[cfg(unix)] root: &AnchoredDir,
+    expected: &StreamMeta,
+    state: &VerifierState,
+) -> Result<()> {
+    #[cfg(unix)]
+    let file = root.dir("evidence")?.file("root-members.jsonl")?;
+    #[cfg(not(unix))]
+    let file = open_read_nofollow(&_stage.join("evidence/root-members.jsonl"), false)?;
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::with_capacity(64 * 1024);
+    let mut hasher = Sha256::new();
+    let mut count = 0_u64;
+    let mut bytes = 0_u64;
+    let mut phase = 0_u8;
+    let mut last_root = None::<String>;
+    let mut last_member = None::<(String, String)>;
+    let mut last_mapping = None::<(String, String, String)>;
+    loop {
+        let read = read_capped_line(&mut reader, &mut line)?;
+        if read == 0 {
+            break;
+        }
+        if !line.ends_with(b"\n") {
+            return Err(verification_error(
+                ArchiveVerificationCode::StreamTruncated,
+                "root evidence is truncated",
+            ));
+        }
+        hasher.update(&line);
+        bytes = bytes.checked_add(read as u64).ok_or_else(|| {
+            verification_error(
+                ArchiveVerificationCode::SizeCapExceeded,
+                "root evidence size overflow",
+            )
+        })?;
+        count = count.checked_add(1).ok_or_else(|| {
+            verification_error(
+                ArchiveVerificationCode::SizeCapExceeded,
+                "root evidence count overflow",
+            )
+        })?;
+        let value: serde_json::Value = serde_json::from_slice(&line[..line.len() - 1])?;
+        if serde_json::to_vec(&value)? != line[..line.len() - 1] {
+            return Err(verification_error(
+                ArchiveVerificationCode::RecordMalformed,
+                "root evidence is not canonical JSON",
+            ));
+        }
+        let object = value.as_object().ok_or_else(|| {
+            verification_error(
+                ArchiveVerificationCode::RecordMalformed,
+                "root evidence row is not an object",
+            )
+        })?;
+        match object.get("kind").and_then(serde_json::Value::as_str) {
+            Some("root") if object.len() == 2 && phase == 0 => {
+                let root: crate::CompactionRootDecision =
+                    serde_json::from_value(object["root"].clone()).map_err(|_| {
+                        verification_error(
+                            ArchiveVerificationCode::RecordMalformed,
+                            "root evidence is malformed",
+                        )
+                    })?;
+                if last_root
+                    .as_ref()
+                    .is_some_and(|last| last >= &root.session_id)
+                {
+                    return Err(verification_error(
+                        ArchiveVerificationCode::StreamUnsorted,
+                        "selective roots are not strictly ordered",
+                    ));
+                }
+                last_root = Some(root.session_id.clone());
+                state.insert_evidence_root(&root)?;
+            }
+            Some("member") if object.len() == 2 && phase <= 1 => {
+                phase = 1;
+                let member: crate::CompactionPlanMember =
+                    serde_json::from_value(object["member"].clone()).map_err(|_| {
+                        verification_error(
+                            ArchiveVerificationCode::RecordMalformed,
+                            "member evidence is malformed",
+                        )
+                    })?;
+                let key = (member.entity_kind.clone(), member.entity_key.clone());
+                if last_member.as_ref().is_some_and(|last| last >= &key) {
+                    return Err(verification_error(
+                        ArchiveVerificationCode::StreamUnsorted,
+                        "selective union members are not strictly ordered",
+                    ));
+                }
+                last_member = Some(key);
+                state.insert_evidence_member(&member)?;
+            }
+            Some("root_member") if object.len() == 3 => {
+                phase = 2;
+                let root_id = object["root_session_id"]
+                    .as_str()
+                    .ok_or_else(|| {
+                        verification_error(
+                            ArchiveVerificationCode::RecordMalformed,
+                            "root evidence id is malformed",
+                        )
+                    })?
+                    .to_owned();
+                let member: crate::CompactionPlanMember =
+                    serde_json::from_value(object["member"].clone()).map_err(|_| {
+                        verification_error(
+                            ArchiveVerificationCode::RecordMalformed,
+                            "root member evidence is malformed",
+                        )
+                    })?;
+                let key = (
+                    root_id.clone(),
+                    member.entity_kind.clone(),
+                    member.entity_key.clone(),
+                );
+                if last_mapping.as_ref().is_some_and(|last| last >= &key) {
+                    return Err(verification_error(
+                        ArchiveVerificationCode::StreamUnsorted,
+                        "selective root members are not strictly ordered",
+                    ));
+                }
+                last_mapping = Some(key);
+                state.insert_evidence_root_member(&root_id, &member)?;
+            }
+            _ => {
+                return Err(verification_error(
+                    ArchiveVerificationCode::UnknownField,
+                    "selective evidence fields are not exact",
+                ))
+            }
+        }
+    }
+    if count != expected.count
+        || bytes != expected.bytes
+        || hex_digest(hasher.finalize()) != expected.sha256
+    {
+        return Err(verification_error(
+            ArchiveVerificationCode::StreamIntegrityMismatch,
+            "root evidence checksum or count mismatch",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 enum SortKey {
     Text(String),
@@ -3009,7 +3605,15 @@ impl VerifierState {
             let database = temp_dir.join("state.sqlite");
             let conn = Connection::open(&database)?;
             restrict_private_file(&database)?;
-            conn.execute_batch("PRAGMA journal_mode = DELETE; PRAGMA synchronous = FULL; CREATE TABLE ids(id BLOB PRIMARY KEY, kind INTEGER NOT NULL); CREATE TABLE refs(kind INTEGER NOT NULL, id BLOB NOT NULL); CREATE TABLE unique_keys(kind TEXT NOT NULL, key BLOB NOT NULL, PRIMARY KEY(kind, key)); CREATE TABLE blobs(hash BLOB PRIMARY KEY, byte_size INTEGER NOT NULL); CREATE TABLE order_events(seq INTEGER PRIMARY KEY);")?;
+            conn.execute_batch("PRAGMA journal_mode = DELETE; PRAGMA synchronous = FULL; PRAGMA user_version = 1004; CREATE TABLE ids(id BLOB PRIMARY KEY, kind INTEGER NOT NULL); CREATE TABLE refs(kind INTEGER NOT NULL, id BLOB NOT NULL); CREATE TABLE unique_keys(kind TEXT NOT NULL, key BLOB NOT NULL, PRIMARY KEY(kind, key)); CREATE TABLE blobs(hash BLOB PRIMARY KEY, byte_size INTEGER NOT NULL); CREATE TABLE order_events(seq INTEGER PRIMARY KEY); CREATE TABLE evidence_roots(session_id TEXT PRIMARY KEY, disposition TEXT NOT NULL, rationale TEXT NOT NULL, observed_status TEXT NOT NULL, observed_ended_at_ms INTEGER, closure_digest TEXT, member_count INTEGER NOT NULL, deletion_member_count INTEGER NOT NULL) WITHOUT ROWID; CREATE TABLE evidence_members(kind TEXT NOT NULL, key TEXT NOT NULL, content_key TEXT NOT NULL, disposition TEXT NOT NULL, ownership TEXT NOT NULL, deletion_authorized INTEGER NOT NULL, PRIMARY KEY(kind,key)) WITHOUT ROWID; CREATE TABLE evidence_root_members(root_id TEXT NOT NULL, kind TEXT NOT NULL, key TEXT NOT NULL, content_key TEXT NOT NULL, disposition TEXT NOT NULL, ownership TEXT NOT NULL, deletion_authorized INTEGER NOT NULL, PRIMARY KEY(root_id,kind,key)) WITHOUT ROWID;")?;
+            for (table, _, columns) in super::compaction::STREAMS {
+                let definitions = columns
+                    .split(',')
+                    .map(|column| format!("\"{column}\""))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                conn.execute_batch(&format!("CREATE TABLE \"{table}\"({definitions});"))?;
+            }
             let remaining_entities = options.max_entities;
             Ok(Self {
                 temp_dir: temp_dir.clone(),
@@ -3041,6 +3645,263 @@ impl VerifierState {
         Ok(())
     }
 
+    fn observe_canonical_row(&self, stream: usize, object: &OrderedObject) -> Result<()> {
+        let fields = schema_for(stream);
+        let placeholders = (1..=fields.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let values = fields
+            .iter()
+            .map(|field| {
+                match object
+                    .iter()
+                    .find(|(name, _)| name == field.name)
+                    .map(|(_, value)| value)
+                {
+                    None => Ok(rusqlite::types::Value::Null),
+                    Some(JsonNode::String(value)) => {
+                        Ok(rusqlite::types::Value::Text(value.clone()))
+                    }
+                    Some(JsonNode::Number(value)) => value
+                        .as_i64()
+                        .map(rusqlite::types::Value::Integer)
+                        .ok_or_else(|| {
+                            verification_error(
+                                ArchiveVerificationCode::RecordMalformed,
+                                "canonical integer is out of range",
+                            )
+                        }),
+                    Some(JsonNode::Bool(value)) if field.name == "is_primary" => {
+                        Ok(rusqlite::types::Value::Integer(i64::from(*value)))
+                    }
+                    _ => Err(verification_error(
+                        ArchiveVerificationCode::RecordMalformed,
+                        "canonical field has unsupported type",
+                    )),
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.conn.execute(
+            &format!(
+                "INSERT INTO \"{}\" VALUES ({placeholders})",
+                STREAMS[stream].0
+            ),
+            rusqlite::params_from_iter(values),
+        )?;
+        Ok(())
+    }
+
+    fn insert_evidence_root(&self, root: &crate::CompactionRootDecision) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO evidence_roots VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                rusqlite::params![
+                    root.session_id,
+                    root.disposition,
+                    root.rationale,
+                    root.observed_status,
+                    root.observed_ended_at_ms,
+                    root.closure_digest,
+                    root.member_count,
+                    root.deletion_member_count
+                ],
+            )
+            .map_err(|_| {
+                verification_error(
+                    ArchiveVerificationCode::DuplicateId,
+                    "duplicate selective root evidence",
+                )
+            })?;
+        Ok(())
+    }
+
+    fn insert_evidence_member(&self, member: &crate::CompactionPlanMember) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO evidence_members VALUES (?1,?2,?3,?4,?5,?6)",
+                rusqlite::params![
+                    member.entity_kind,
+                    member.entity_key,
+                    member.content_key,
+                    member.disposition,
+                    member.ownership,
+                    member.deletion_authorized
+                ],
+            )
+            .map_err(|_| {
+                verification_error(
+                    ArchiveVerificationCode::DuplicateId,
+                    "duplicate selective member evidence",
+                )
+            })?;
+        Ok(())
+    }
+
+    fn insert_evidence_root_member(
+        &self,
+        root: &str,
+        member: &crate::CompactionPlanMember,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO evidence_root_members VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                rusqlite::params![
+                    root,
+                    member.entity_kind,
+                    member.entity_key,
+                    member.content_key,
+                    member.disposition,
+                    member.ownership,
+                    member.deletion_authorized
+                ],
+            )
+            .map_err(|_| {
+                verification_error(
+                    ArchiveVerificationCode::DuplicateId,
+                    "duplicate selective root membership",
+                )
+            })?;
+        Ok(())
+    }
+
+    fn verify_selective_plan(&mut self, declared: &CompactionPlan) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        let reconstructed = super::compaction::plan(&tx, declared.cutoff_ms).map_err(|error| {
+            verification_error(
+                ArchiveVerificationCode::StreamIntegrityMismatch,
+                format!("cannot reconstruct selective closure: {error}"),
+            )
+        })?;
+        if !super::compaction::validate_plan_header(declared)
+            || !super::compaction::validate_plan_evidence(&reconstructed)
+            || reconstructed.selected_root_ids != declared.selected_root_ids
+            || reconstructed.closure_digest != declared.closure_digest
+            || reconstructed.membership_digest != declared.membership_digest
+            || reconstructed.deletion_set_digest != declared.deletion_set_digest
+            || reconstructed.closure_counts_by_kind != declared.closure_counts_by_kind
+            || reconstructed.deletion_authorized_count != declared.deletion_authorized_count
+            || reconstructed.shared_retained_count != declared.shared_retained_count
+        {
+            return Err(verification_error(
+                ArchiveVerificationCode::StreamIntegrityMismatch,
+                "selective plan header does not match the reconstructed canonical graph",
+            ));
+        }
+
+        let evidence_member_count: u64 =
+            tx.query_row("SELECT count(*) FROM evidence_members", [], |row| {
+                row.get(0)
+            })?;
+        if evidence_member_count != reconstructed.members.len() as u64 {
+            return Err(verification_error(
+                ArchiveVerificationCode::StreamIntegrityMismatch,
+                "selective union membership count does not match reconstructed graph",
+            ));
+        }
+        for member in &reconstructed.members {
+            let found: i64 = tx.query_row(
+                "SELECT count(*) FROM evidence_members WHERE kind=?1 AND key=?2 AND content_key=?3 AND disposition=?4 AND ownership=?5 AND deletion_authorized=?6",
+                rusqlite::params![member.entity_kind, member.entity_key, member.content_key, member.disposition, member.ownership, member.deletion_authorized],
+                |row| row.get(0),
+            )?;
+            if found != 1 {
+                return Err(verification_error(
+                    ArchiveVerificationCode::StreamIntegrityMismatch,
+                    "selective union disposition, ownership, or deletion authorization was reassigned",
+                ));
+            }
+        }
+
+        let evidence_selected_count: u64 = tx.query_row(
+            "SELECT count(*) FROM evidence_roots WHERE disposition='selected'",
+            [],
+            |row| row.get(0),
+        )?;
+        if evidence_selected_count != reconstructed.selected_root_ids.len() as u64 {
+            return Err(verification_error(
+                ArchiveVerificationCode::StreamIntegrityMismatch,
+                "selective root selection does not match reconstructed graph",
+            ));
+        }
+        let evidence_root_count: u64 =
+            tx.query_row("SELECT count(*) FROM evidence_roots", [], |row| row.get(0))?;
+        let mut root_digest = super::compaction::RootDigest::new(
+            declared.cutoff_ms,
+            usize::try_from(evidence_root_count).map_err(|_| {
+                verification_error(
+                    ArchiveVerificationCode::SizeCapExceeded,
+                    "selective root count is out of range",
+                )
+            })?,
+        );
+        let mut statement = tx.prepare("SELECT session_id,disposition,rationale,observed_status,observed_ended_at_ms,closure_digest,member_count,deletion_member_count FROM evidence_roots ORDER BY session_id")?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            root_digest.push(&crate::CompactionRootDecision {
+                session_id: row.get(0)?,
+                disposition: row.get(1)?,
+                rationale: row.get(2)?,
+                observed_status: row.get(3)?,
+                observed_ended_at_ms: row.get(4)?,
+                closure_digest: row.get(5)?,
+                member_count: row.get(6)?,
+                deletion_member_count: row.get(7)?,
+            });
+        }
+        drop(rows);
+        drop(statement);
+        if root_digest.finish() != declared.root_set_digest {
+            return Err(verification_error(
+                ArchiveVerificationCode::StreamIntegrityMismatch,
+                "selective root evidence does not reproduce its authenticated digest",
+            ));
+        }
+        for root in &reconstructed.roots {
+            let found: i64 = tx.query_row(
+                "SELECT count(*) FROM evidence_roots WHERE session_id=?1 AND disposition=?2 AND rationale=?3 AND observed_status=?4 AND observed_ended_at_ms IS ?5 AND closure_digest IS ?6 AND member_count=?7 AND deletion_member_count=?8",
+                rusqlite::params![root.session_id, root.disposition, root.rationale, root.observed_status, root.observed_ended_at_ms, root.closure_digest, root.member_count, root.deletion_member_count],
+                |row| row.get(0),
+            )?;
+            if found != 1 {
+                return Err(verification_error(
+                    ArchiveVerificationCode::StreamIntegrityMismatch,
+                    "selective root eligibility or closure summary was reassigned",
+                ));
+            }
+        }
+
+        tx.execute_batch("CREATE TEMP TABLE reconstructed_root_members(root_id TEXT NOT NULL, kind TEXT NOT NULL, key TEXT NOT NULL, content_key TEXT NOT NULL, disposition TEXT NOT NULL, ownership TEXT NOT NULL, deletion_authorized INTEGER NOT NULL, PRIMARY KEY(root_id,kind,key)) WITHOUT ROWID;")?;
+        super::compaction::visit_root_members(&tx, &reconstructed, |root, member| {
+            tx.execute(
+                "INSERT INTO reconstructed_root_members VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                rusqlite::params![
+                    root,
+                    member.entity_kind,
+                    member.entity_key,
+                    member.content_key,
+                    member.disposition,
+                    member.ownership,
+                    member.deletion_authorized
+                ],
+            )?;
+            Ok(())
+        })?;
+        let mapping_mismatch: i64 = tx.query_row(
+            "SELECT (SELECT count(*) FROM evidence_root_members e LEFT JOIN reconstructed_root_members r USING(root_id,kind,key) WHERE r.key IS NULL OR (e.content_key,e.disposition,e.ownership,e.deletion_authorized)!=(r.content_key,r.disposition,r.ownership,r.deletion_authorized)) + (SELECT count(*) FROM reconstructed_root_members r LEFT JOIN evidence_root_members e USING(root_id,kind,key) WHERE e.key IS NULL)",
+            [],
+            |row| row.get(0),
+        )?;
+        if mapping_mismatch != 0 {
+            return Err(verification_error(
+                ArchiveVerificationCode::StreamIntegrityMismatch,
+                "per-root directional closure does not match reconstructed graph",
+            ));
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     fn reference(&self, kind: i64, id: &str) -> Result<()> {
         let id = uuid_bytes(id)?;
         self.conn.execute(
@@ -3059,6 +3920,7 @@ impl VerifierState {
             ),
             _ => SortKey::Text(required_string(object, "id")?),
         };
+        self.observe_canonical_row(stream, object)?;
         if stream != 12 {
             let id = required_string(object, "id")?;
             let id_bytes = uuid_bytes(&id)?;
@@ -3922,6 +4784,212 @@ mod tests {
                 fs::read(second.join(file)).unwrap()
             );
         }
+    }
+
+    #[test]
+    fn empty_selective_archive_is_exact_and_verifiable() {
+        let temp = root();
+        let mut store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let target = temp.path().join("selective.ctxar");
+        let report = store
+            .create_selective_archive(&target, 42, ArchiveOptions::default())
+            .unwrap();
+        assert_eq!(report.entity_count, 0);
+        assert_eq!(report.streams.len(), STREAMS.len());
+        assert!(report.streams.iter().all(|stream| stream.count == 0));
+        let verified =
+            verify_archive_bundle_with_options(&target, ArchiveVerifyOptions::default()).unwrap();
+        assert_eq!(verified.format, "ctx-selective-archive");
+        assert!(fs::read_to_string(target.join("manifest.json"))
+            .unwrap()
+            .contains("\"plan_digest\""));
+        let retry = store
+            .create_selective_archive(&target, 42, ArchiveOptions::default())
+            .unwrap();
+        assert_eq!(retry.archive_id, report.archive_id);
+    }
+
+    #[test]
+    fn selective_verifier_derives_content_from_rechecksummed_rows() {
+        let temp = root();
+        let mut store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let session_id = "70000000-0000-7000-8000-000000000001";
+        store.conn.execute(
+            "INSERT INTO sessions(id,provider,agent_type,is_primary,status,fidelity,started_at_ms,ended_at_ms,created_at_ms,updated_at_ms,visibility,sync_state,sync_version,metadata_json) VALUES (?1,'codex','primary',1,'completed','full',1,2,1,2,'local_only','local_only',0,'{}')",
+            [session_id],
+        ).unwrap();
+        let target = temp.path().join("tamper.ctxar");
+        let report = store
+            .create_selective_archive(&target, 2, ArchiveOptions::default())
+            .unwrap();
+        let stream = target.join("streams/05-sessions.jsonl");
+        let bytes = fs::read(&stream).unwrap();
+        let changed = String::from_utf8(bytes)
+            .unwrap()
+            .replace("\"status\":\"completed\"", "\"status\":\"failed\"");
+        fs::write(&stream, changed.as_bytes()).unwrap();
+        let old = &report.streams[4];
+        let mut manifest = fs::read(target.join("manifest.json")).unwrap();
+        let replace = |bytes: &mut Vec<u8>, old: &str, new: &str| {
+            let at = bytes
+                .windows(old.len())
+                .position(|part| part == old.as_bytes())
+                .unwrap();
+            bytes.splice(at..at + old.len(), new.bytes());
+        };
+        let old_meta = format!("\"bytes\":{},\"sha256\":\"{}\"", old.bytes, old.sha256);
+        let new_meta = format!(
+            "\"bytes\":{},\"sha256\":\"{}\"",
+            changed.len(),
+            hex_digest(Sha256::digest(changed.as_bytes()))
+        );
+        replace(&mut manifest, &old_meta, &new_meta);
+        fs::write(target.join("manifest.json"), &manifest).unwrap();
+        fs::write(target.join("COMPLETE"), completion_bytes(&manifest)).unwrap();
+        assert!(verify_archive_bundle(&target).is_err());
+    }
+
+    fn rechecksum_evidence(target: &Path, old: &[u8], changed: &[u8]) {
+        fs::write(target.join("evidence/root-members.jsonl"), changed).unwrap();
+        let mut manifest = fs::read(target.join("manifest.json")).unwrap();
+        let old_meta = format!(
+            "\"bytes\":{},\"sha256\":\"{}\"",
+            old.len(),
+            hex_digest(Sha256::digest(old))
+        );
+        let new_meta = format!(
+            "\"bytes\":{},\"sha256\":\"{}\"",
+            changed.len(),
+            hex_digest(Sha256::digest(changed))
+        );
+        let at = manifest
+            .windows(old_meta.len())
+            .rposition(|part| part == old_meta.as_bytes())
+            .unwrap();
+        manifest.splice(at..at + old_meta.len(), new_meta.bytes());
+        fs::write(target.join("manifest.json"), &manifest).unwrap();
+        fs::write(target.join("COMPLETE"), completion_bytes(&manifest)).unwrap();
+    }
+
+    #[test]
+    fn selective_verifier_reconstructs_reassigned_evidence_after_rechecksum() {
+        let temp = root();
+        let mut store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        store.conn.execute(
+            "INSERT INTO sessions(id,provider,agent_type,is_primary,status,fidelity,started_at_ms,ended_at_ms,created_at_ms,updated_at_ms,visibility,sync_state,sync_version,metadata_json) VALUES ('70000000-0000-7000-8000-000000000002','codex','primary',1,'completed','full',1,2,1,2,'local_only','local_only',0,'{}')",
+            [],
+        ).unwrap();
+        for (index, (old, new)) in [
+            (
+                "\"root_session_id\":\"70000000-0000-7000-8000-000000000002\"",
+                "\"root_session_id\":\"70000000-0000-7000-8000-000000000003\"",
+            ),
+            (
+                "\"disposition\":\"selected_root\"",
+                "\"disposition\":\"owned_child\"",
+            ),
+            (
+                "\"ownership\":\"exclusive\"",
+                "\"ownership\":\"shared_retained\"",
+            ),
+            (
+                "\"deletion_authorized\":true",
+                "\"deletion_authorized\":false",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let target = temp.path().join(format!("evidence-tamper-{index}.ctxar"));
+            store
+                .create_selective_archive(&target, 2, ArchiveOptions::default())
+                .unwrap();
+            let evidence = fs::read(target.join("evidence/root-members.jsonl")).unwrap();
+            let changed = String::from_utf8(evidence.clone())
+                .unwrap()
+                .replace(old, new)
+                .into_bytes();
+            assert_ne!(evidence, changed);
+            rechecksum_evidence(&target, &evidence, &changed);
+            assert!(verify_archive_bundle(&target).is_err());
+        }
+    }
+
+    #[test]
+    fn many_roots_with_heavily_shared_closure_verify_exactly() {
+        const ROOTS: usize = 96;
+        let temp = root();
+        let mut store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let source = "70000000-0000-7000-8000-000000000100";
+        store.conn.execute(
+            "INSERT INTO capture_sources(id,kind,provider,machine_id,started_at_ms,fidelity,visibility,sync_state,sync_version,metadata_json) VALUES (?1,'direct_cli','codex','test',1,'full','local_only','local_only',0,'{}')",
+            [source],
+        ).unwrap();
+        for index in 0..ROOTS {
+            let id =
+                Uuid::from_u128(0x70000000000070008000000000001000 + index as u128).to_string();
+            store.conn.execute(
+                "INSERT INTO sessions(id,capture_source_id,provider,agent_type,is_primary,status,fidelity,started_at_ms,ended_at_ms,created_at_ms,updated_at_ms,visibility,sync_state,sync_version,metadata_json) VALUES (?1,?2,'codex','primary',1,'completed','full',1,2,1,2,'local_only','local_only',0,'{}')",
+                rusqlite::params![id, source],
+            ).unwrap();
+        }
+        let target = temp.path().join("many-shared.ctxar");
+        let report = store
+            .create_selective_archive(&target, 2, ArchiveOptions::default())
+            .unwrap();
+        assert_eq!(report.entity_count, ROOTS as u64 + 1);
+        let evidence = fs::read_to_string(target.join("evidence/root-members.jsonl")).unwrap();
+        // Roots and union rows are emitted once; duplicated root membership is
+        // streamed one closure at a time rather than retained as ROOTS maps.
+        assert_eq!(evidence.lines().count(), ROOTS + (ROOTS + 1) + ROOTS * 2);
+        verify_archive_bundle(&target).unwrap();
+    }
+
+    #[test]
+    fn selective_verification_allows_unarchived_ineligible_root_decisions() {
+        let temp = root();
+        let mut store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        for (id, status, ended) in [
+            ("70000000-0000-7000-8000-000000000010", "completed", Some(2)),
+            ("70000000-0000-7000-8000-000000000011", "active", None),
+        ] {
+            store.conn.execute(
+                "INSERT INTO sessions(id,provider,agent_type,is_primary,status,fidelity,started_at_ms,ended_at_ms,created_at_ms,updated_at_ms,visibility,sync_state,sync_version,metadata_json) VALUES (?1,'codex','primary',1,?2,'full',1,?3,1,2,'local_only','local_only',0,'{}')",
+                rusqlite::params![id, status, ended],
+            ).unwrap();
+        }
+        let target = temp.path().join("mixed-roots.ctxar");
+        let report = store
+            .create_selective_archive(&target, 2, ArchiveOptions::default())
+            .unwrap();
+        assert_eq!(report.entity_count, 1);
+        verify_archive_bundle(&target).unwrap();
+    }
+
+    #[test]
+    fn selective_archive_carries_inbound_boundary_that_revokes_deletion() {
+        let temp = root();
+        let mut store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let selected = "70000000-0000-7000-8000-000000000020";
+        let active = "70000000-0000-7000-8000-000000000021";
+        for (id, parent, status, ended) in [
+            (selected, None, "completed", Some(2)),
+            (active, Some(selected), "active", None),
+        ] {
+            store.conn.execute(
+                "INSERT INTO sessions(id,parent_session_id,provider,agent_type,is_primary,status,fidelity,started_at_ms,ended_at_ms,created_at_ms,updated_at_ms,visibility,sync_state,sync_version,metadata_json) VALUES (?1,?2,'codex','primary',1,?3,'full',1,?4,1,2,'local_only','local_only',0,'{}')",
+                rusqlite::params![id, parent, status, ended],
+            ).unwrap();
+        }
+        let target = temp.path().join("inbound-boundary.ctxar");
+        let report = store
+            .create_selective_archive(&target, 2, ArchiveOptions::default())
+            .unwrap();
+        assert_eq!(report.entity_count, 2);
+        let evidence = fs::read_to_string(target.join("evidence/root-members.jsonl")).unwrap();
+        assert!(evidence.contains("\"disposition\":\"boundary_edge\""));
+        assert!(evidence.contains("\"deletion_authorized\":false"));
+        verify_archive_bundle(&target).unwrap();
     }
 
     #[test]

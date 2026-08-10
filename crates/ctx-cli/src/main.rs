@@ -354,6 +354,11 @@ struct ArchivePlanArgs {
 struct ArchiveCreateArgs {
     #[arg(help = "Absent destination directory, conventionally ending in .ctxar")]
     target: PathBuf,
+    #[arg(
+        long,
+        help = "Create a selective archive from a fresh plan at this inclusive cutoff"
+    )]
+    cutoff_ms: Option<i64>,
     #[arg(long)]
     json: bool,
 }
@@ -2590,7 +2595,11 @@ fn run_archive_create(args: ArchiveCreateArgs, data_root: PathBuf) -> Result<()>
     let db_path = database_path(data_root);
     let mut store = Store::open_read_only(&db_path)
         .with_context(|| format!("open ctx store read-only: {}", db_path.display()))?;
-    let report = store.create_archive(&args.target, ArchiveOptions::default())?;
+    let report = if let Some(cutoff) = args.cutoff_ms {
+        store.create_selective_archive(&args.target, cutoff, ArchiveOptions::default())?
+    } else {
+        store.create_archive(&args.target, ArchiveOptions::default())?
+    };
     if args.json {
         let streams = report
             .streams
@@ -2608,7 +2617,7 @@ fn run_archive_create(args: ArchiveCreateArgs, data_root: PathBuf) -> Result<()>
         println!(
             "{}",
             serde_json::to_string(&json!({
-                "format": "ctx-archive",
+                "format": if args.cutoff_ms.is_some() { "ctx-selective-archive" } else { "ctx-archive" },
                 "format_version": 1,
                 "archive_id": report.archive_id,
                 "created_at_ms": report.created_at_ms,
@@ -2674,7 +2683,7 @@ fn run_archive_verify(args: ArchiveVerifyArgs) -> Result<()> {
                 println!(
                     "{}",
                     serde_json::to_string(&json!({
-                        "format": "ctx-archive",
+                        "format": report.format,
                         "format_version": 1,
                         "path": report.path,
                         "verified": true,

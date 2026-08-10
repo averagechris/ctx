@@ -16,6 +16,35 @@ Related reading: [storage.md](storage.md) (data root layout, privacy truth),
 (large-index profiling), #188 (archive-first compaction), #189 (offline
 multi-machine merging).
 
+Selective compaction bundles are a distinct, exact family:
+`("ctx-selective-archive", 1)`. `ctx archive create --cutoff-ms N TARGET`
+computes a fresh #282 plan from the same read-only v1004 snapshot used by the
+writer and archives only that authenticated closure. The cutoff is the sole
+selection input. The bundle retains this v1 layout and all fifteen streams
+(including empty streams), but carries `scope.kind = "selective"` and the
+planner's root decisions, member dispositions, deletion authorization, and
+root/closure/membership/deletion/plan digests in `selective`. Full and
+selective family/scope mismatches are rejected; selective restore and deletion
+are intentionally not implemented by this command.
+
+Selective bundles keep large closure evidence out of `manifest.json`.
+`evidence/root-members.jsonl` is a private, checksummed, bounded-line canonical
+stream containing root decisions, union members/deletion dispositions, and
+per-root mappings. The manifest contains only its count, byte length, SHA-256,
+and the small plan/digest header. Verification streams the evidence and
+canonical entity files into private scratch state, derives content keys from
+the actual v1 column encoding (and object hashes), and rejects evidence that
+does not reproduce the authenticated plan or completed-child cutoff rules.
+The verifier reruns the directional-closure planner over canonical rows in
+that scratch database: evidence root assignment, member disposition, union
+ownership/shared status, and deletion authorization are comparison inputs,
+never graph truth. Inbound owners that revoke deletion are therefore archived
+as non-deletable boundary rows so the decision is independently
+reconstructible. Evidence parsing and equality use ordered scratch tables one
+row at a time; per-root closure export is recomputed and written one root at a
+time, so physically duplicated shared membership does not require an
+`O(root_count * closure_size)` in-memory map.
+
 ## Design constraints
 
 1. **Archives are secrets.** They contain verbatim agent history — prompts,
@@ -32,7 +61,7 @@ multi-machine merging).
 5. **No network.** Nothing in this format enables or requires transport,
    upload, discovery, or remote credentials. Transport is external tooling.
 6. **Independent versioning.** The archive format version is not the SQLite
-   `PRAGMA user_version` (currently 1002) and not the internal
+   `PRAGMA user_version` (currently 1004) and not the internal
    `SessionHistoryArchive` `schema_version` (1/2). See
    [Format identity](#format-identity-and-versioning).
 
@@ -124,7 +153,7 @@ stream set, record schemas, encoding rules, or verification semantics bumps
 Explicit non-couplings:
 
 - **SQLite schema version.** The manifest records the writer's
-  `PRAGMA user_version` as `source_schema_version` (currently 1002) for
+  `PRAGMA user_version` as `source_schema_version` (currently 1004) for
   diagnostics only. Readers must not gate on it: restore always materializes
   the current binary's schema via the normal store-creation path.
 - **`SessionHistoryArchive` versions 1/2.** That in-memory JSON structure is
@@ -177,7 +206,7 @@ verifiers must reject any deviation.
     v1 streams).
 11. **Enums.** Closed vocabularies (below) are normative; out-of-vocabulary
     values are fatal. The vocabularies mirror the SQLite CHECK constraints at
-    schema v1002. A future provider addition requires a store CHECK-rebuild
+    schema v1004. A future provider addition requires a store CHECK-rebuild
     migration **and** an archive `format_version` review; a v1 reader
     encountering an unknown provider string fails closed, which is correct
     (the reader binary could not have imported that provider either).
@@ -635,7 +664,7 @@ Protocol:
 2. Refuse if the target root exists at all, including an empty directory. Create
    a staging root `<target>.tmp-<restore-uuid>` (0700) beside the target.
 3. Initialize a normal store in the staging root via the standard creation
-   path (current schema version 1002+, WAL, 0700/0600, `objects/`
+   path (current schema version 1004, WAL, 0700/0600, `objects/`
    directory). The archive never dictates schema DDL.
 4. In **one write transaction**, insert streams in numbered order using
    dedicated verbatim restore INSERTs — **not** the import/upsert business

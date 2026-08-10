@@ -28,6 +28,7 @@ use ctx_history_store::{CatalogSession, Store, StoreError};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -62,6 +63,8 @@ pub enum CaptureError {
     InvalidPath(PathBuf),
     #[error("invalid provider transcript path {path:?}: {reason}")]
     InvalidProviderTranscriptPath { path: PathBuf, reason: &'static str },
+    #[error("source_changed_during_read")]
+    SourceChangedDuringRead,
     #[error("spool writer is already closed")]
     WriterClosed,
     #[error("line {line} in {path:?} is not a valid capture envelope: {source}")]
@@ -523,6 +526,43 @@ impl Default for OpenCodeSqliteImportOptions {
             history_record_id: None,
             allow_partial_failures: false,
         }
+    }
+}
+
+/// Metadata-only observation of an OpenCode SQLite consistency set.
+///
+/// The observation covers the main database and both SQLite sidecars in a
+/// fixed order. It contains no source path or file contents, so it is safe to
+/// pass to a caller that needs to decide whether a later import is still
+/// about the same source state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenCodeSqliteSourceObservation {
+    serialized_signature: String,
+    digest: [u8; 32],
+}
+
+impl OpenCodeSqliteSourceObservation {
+    /// The canonical metadata serialization used as the digest input.
+    pub fn serialized_signature(&self) -> &str {
+        &self.serialized_signature
+    }
+
+    /// The SHA-256 digest of [`Self::serialized_signature`].
+    pub fn digest(&self) -> &[u8; 32] {
+        &self.digest
+    }
+
+    /// A compact, stable representation suitable for CLI output.
+    pub fn digest_hex(&self) -> String {
+        self.digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    /// Whether two observations describe the same metadata state.
+    pub fn matches(&self, other: &Self) -> bool {
+        self == other
     }
 }
 
@@ -3459,23 +3499,36 @@ pub fn import_opencode_sqlite(
     store: &mut Store,
     options: OpenCodeSqliteImportOptions,
 ) -> Result<ProviderImportSummary> {
-    let path = path.as_ref();
+    import_opencode_sqlite_inner(path.as_ref(), store, options, None)
+}
+
+fn import_opencode_sqlite_inner(
+    path: &Path,
+    store: &mut Store,
+    options: OpenCodeSqliteImportOptions,
+    normalization_hook: Option<&dyn Fn(&Path)>,
+) -> Result<ProviderImportSummary> {
     let source_path = options
         .source_path
         .clone()
         .unwrap_or_else(|| path.to_path_buf());
-    let normalization = normalize_path_timed(
-        &OpenCodeSqliteAdapter,
-        path,
-        &ProviderAdapterContext {
-            machine_id: options.machine_id,
-            source_path: Some(source_path),
-            imported_at: options.imported_at,
-            tool_output_mode: CodexToolOutputMode::Full,
-            event_mode: CodexEventImportMode::Rich,
-            include_notices: true,
-        },
-    )?;
+    let context = ProviderAdapterContext {
+        machine_id: options.machine_id,
+        source_path: Some(source_path),
+        imported_at: options.imported_at,
+        tool_output_mode: CodexToolOutputMode::Full,
+        event_mode: CodexEventImportMode::Rich,
+        include_notices: true,
+    };
+    let before = observe_opencode_sqlite(path)?;
+    let started = Instant::now();
+    let mut normalization =
+        normalize_opencode_sqlite_with_hook(path, &context, normalization_hook)?;
+    normalization.summary.timing.record_normalization(started);
+    let after = observe_opencode_sqlite(path)?;
+    if !before.matches(&after) {
+        return Err(CaptureError::SourceChangedDuringRead);
+    }
 
     import_normalized_provider_captures(
         store,
@@ -6582,6 +6635,137 @@ fn open_provider_sqlite_readonly(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+#[derive(Debug, Serialize)]
+struct OpenCodeSqliteSourceSignature {
+    format: &'static str,
+    main: OpenCodeSqliteFileSignature,
+    wal: OpenCodeSqliteFileSignature,
+    shm: OpenCodeSqliteFileSignature,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenCodeSqliteFileSignature {
+    exists: bool,
+    size: u64,
+    modified: Option<PortableFileTime>,
+    identity: Option<StableFileIdentity>,
+}
+
+#[derive(Debug, Serialize)]
+struct PortableFileTime {
+    before_epoch: bool,
+    seconds: u64,
+    nanoseconds: u32,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind")]
+enum StableFileIdentity {
+    #[cfg(unix)]
+    Unix { device: u64, inode: u64 },
+    #[cfg(windows)]
+    Windows { volume_serial: u32, file_index: u64 },
+}
+
+/// Observe the OpenCode SQLite database without opening it or reading any
+/// contents. The main database and `-wal`/`-shm` sidecars are observed as one
+/// consistency set, so sidecar creation, removal, checkpointing, and growth
+/// all produce a different observation.
+pub fn observe_opencode_sqlite(path: impl AsRef<Path>) -> Result<OpenCodeSqliteSourceObservation> {
+    let path = path.as_ref();
+    let main = observe_opencode_sqlite_file(path)?;
+    let wal = observe_opencode_sqlite_file(&opencode_sqlite_sidecar_path(path, "-wal"))?;
+    let shm = observe_opencode_sqlite_file(&opencode_sqlite_sidecar_path(path, "-shm"))?;
+    let signature = OpenCodeSqliteSourceSignature {
+        format: "opencode-sqlite-source-v1",
+        main,
+        wal,
+        shm,
+    };
+    let serialized_signature = serde_json::to_string(&signature)?;
+    let digest = Sha256::digest(serialized_signature.as_bytes()).into();
+    Ok(OpenCodeSqliteSourceObservation {
+        serialized_signature,
+        digest,
+    })
+}
+
+fn opencode_sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut sidecar = path.as_os_str().to_os_string();
+    sidecar.push(suffix);
+    PathBuf::from(sidecar)
+}
+
+fn observe_opencode_sqlite_file(path: &Path) -> Result<OpenCodeSqliteFileSignature> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(OpenCodeSqliteFileSignature {
+                exists: false,
+                size: 0,
+                modified: None,
+                identity: None,
+            });
+        }
+        Err(error) => return Err(error.into()),
+    };
+    Ok(OpenCodeSqliteFileSignature {
+        exists: true,
+        size: metadata.len(),
+        modified: portable_file_time(&metadata),
+        identity: stable_file_identity(&metadata),
+    })
+}
+
+fn portable_file_time(metadata: &fs::Metadata) -> Option<PortableFileTime> {
+    let modified = metadata.modified().ok()?;
+    match modified.duration_since(UNIX_EPOCH) {
+        Ok(duration) => Some(PortableFileTime {
+            before_epoch: false,
+            seconds: duration.as_secs(),
+            nanoseconds: duration.subsec_nanos(),
+        }),
+        Err(error) => {
+            let duration = error.duration();
+            Some(PortableFileTime {
+                before_epoch: true,
+                seconds: duration.as_secs(),
+                nanoseconds: duration.subsec_nanos(),
+            })
+        }
+    }
+}
+
+#[cfg(unix)]
+fn stable_file_identity(metadata: &fs::Metadata) -> Option<StableFileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    Some(StableFileIdentity::Unix {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn stable_file_identity(metadata: &fs::Metadata) -> Option<StableFileIdentity> {
+    use std::os::windows::fs::MetadataExt;
+
+    let (Some(volume_serial), Some(file_index)) =
+        (metadata.volume_serial_number(), metadata.file_index())
+    else {
+        return None;
+    };
+    Some(StableFileIdentity::Windows {
+        volume_serial,
+        file_index,
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn stable_file_identity(_metadata: &fs::Metadata) -> Option<StableFileIdentity> {
+    None
+}
+
 fn provider_timestamp_seconds(value: Option<f64>, fallback: DateTime<Utc>) -> DateTime<Utc> {
     let Some(value) = value else {
         return fallback;
@@ -8431,12 +8615,23 @@ fn normalize_opencode_sqlite(
     path: &Path,
     context: &ProviderAdapterContext,
 ) -> Result<ProviderNormalizationResult> {
+    normalize_opencode_sqlite_with_hook(path, context, None)
+}
+
+fn normalize_opencode_sqlite_with_hook(
+    path: &Path,
+    context: &ProviderAdapterContext,
+    normalization_hook: Option<&dyn Fn(&Path)>,
+) -> Result<ProviderNormalizationResult> {
     let conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.pragma_update(None, "query_only", true)?;
+    if let Some(normalization_hook) = normalization_hook {
+        normalization_hook(path);
+    }
     let user_version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     let schema_fingerprint = opencode_schema_fingerprint(&conn)?;
     let sessions = opencode_sessions(&conn)?;
@@ -13356,6 +13551,88 @@ mod tests {
         assert_eq!(summary.imported_sessions, 1);
         assert_eq!(summary.imported_events, 1);
         assert!(summary.failures[0].error.contains("malformed JSONL"));
+    }
+
+    #[test]
+    fn opencode_sqlite_source_observation_is_stable_and_path_free() {
+        let temp = tempdir();
+        let path = temp.path().join("opencode.db");
+        let marker = "private-opencode-content";
+        fs::write(&path, marker).unwrap();
+
+        let first = observe_opencode_sqlite(&path).unwrap();
+        let second = observe_opencode_sqlite(&path).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.digest().len(), 32);
+        assert_eq!(first.digest_hex().len(), 64);
+        assert!(first.matches(&second));
+        assert!(!first.serialized_signature().contains(marker));
+        assert!(!first
+            .serialized_signature()
+            .contains(path.to_str().unwrap()));
+        assert!(!first.digest_hex().contains(marker));
+        assert!(!first.digest_hex().contains(path.to_str().unwrap()));
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"-main-change")
+            .unwrap();
+        assert_ne!(first, observe_opencode_sqlite(&path).unwrap());
+    }
+
+    #[test]
+    fn opencode_sqlite_source_observation_tracks_wal_and_shm_transitions() {
+        let temp = tempdir();
+        let path = temp.path().join("opencode.db");
+        fs::write(&path, b"main").unwrap();
+        let initial = observe_opencode_sqlite(&path).unwrap();
+
+        let wal = opencode_sqlite_sidecar_path(&path, "-wal");
+        fs::write(&wal, b"wal").unwrap();
+        let with_wal = observe_opencode_sqlite(&path).unwrap();
+        assert_ne!(initial, with_wal);
+        fs::remove_file(&wal).unwrap();
+        assert_eq!(initial, observe_opencode_sqlite(&path).unwrap());
+
+        let shm = opencode_sqlite_sidecar_path(&path, "-shm");
+        fs::write(&shm, b"shm").unwrap();
+        let with_shm = observe_opencode_sqlite(&path).unwrap();
+        assert_ne!(initial, with_shm);
+        fs::remove_file(&shm).unwrap();
+        assert_eq!(initial, observe_opencode_sqlite(&path).unwrap());
+    }
+
+    #[test]
+    fn native_opencode_rejects_source_changed_during_normalization_before_store_writes() {
+        let temp = tempdir();
+        let fixture = write_opencode_smoke_db(&temp, false);
+        let mut store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let before_sources = store.capture_source_count().unwrap();
+        let before_indexed = store.indexed_history_item_count().unwrap();
+        let hook = |path: &Path| {
+            fs::write(
+                opencode_sqlite_sidecar_path(path, "-wal"),
+                b"created during read",
+            )
+            .unwrap();
+        };
+
+        let error = import_opencode_sqlite_inner(
+            &fixture,
+            &mut store,
+            OpenCodeSqliteImportOptions::default(),
+            Some(&hook),
+        )
+        .unwrap_err();
+
+        assert!(matches!(&error, CaptureError::SourceChangedDuringRead));
+        assert_eq!(error.to_string(), "source_changed_during_read");
+        assert!(!error.to_string().contains(fixture.to_str().unwrap()));
+        assert_eq!(store.capture_source_count().unwrap(), before_sources);
+        assert_eq!(store.indexed_history_item_count().unwrap(), before_indexed);
+        assert!(store.list_capture_sources().unwrap().is_empty());
     }
 
     #[test]

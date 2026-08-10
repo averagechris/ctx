@@ -323,7 +323,9 @@ Importer suppression has two keys:
   the importer uses a content-derived identity that excludes path and local
   observation metadata; it must not invent one from a path.
 * `content_key` is the digest of the provider's canonical source material
-  after excluding path, machine-local observation, and volatile catalog fields.
+  after excluding provider-source/archive paths, machine-local observation,
+  and volatile catalog fields. Canonical `files_touched.path` and `old_path`
+  remain content and therefore participate in the digest.
   A provider that cannot produce either a stable identity or a path-independent
   content key is not suppressible and must report that fact rather than guess.
 
@@ -359,7 +361,9 @@ follow the style in `lib.rs`, but names, columns, checks, keys, and indexes are
 not optional. Ledger tables have no foreign keys to canonical content tables:
 compaction must remain auditable after hot rows are deleted. They do have
 foreign keys to the ledger archive table, with `ON DELETE RESTRICT`; ledger
-history is never cascaded away. The schema has eight ledger tables:
+history is never cascaded away. The v1005 implementation also has a bounded
+conflict ledger and canonical-restore marker table used by recovery. Core
+ledger tables are:
 `compaction_archives`, `compaction_archive_roots`,
 `compaction_archive_members`, `compaction_deletion_members`,
 `compaction_suppression_facts`, `compaction_archive_suppressions`,

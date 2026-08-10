@@ -417,16 +417,17 @@ query, or provider metadata.
 
 Writable opens migrate known v0-v15 stores through the fork chain — v1000
   (durable FTS rowid maps), v1001 (pagination indexes), v1002 (path-free
-  source health), v1003 (path-free refresh coordination), then v1004 (bounded
-  OpenCode incremental state) — and existing v1000–v1003 stores to v1004;
-  reserved versions 16-999 and versions above 1004 fail closed
+  source health), v1003 (path-free refresh coordination), v1004 (bounded
+  OpenCode incremental state), then v1005 (selective-archive suppression) —
+  and existing v1000–v1004 stores to v1005; reserved versions 16-999 and
+  versions above 1005 fail closed
 without mutation. Index creation and `user_version = 1001` are one
 transaction, and the step touches neither the rowid maps nor the FTS
 projections. The v1001 migration adds exactly
 `idx_sessions_provider_external_session_started` on
 `sessions(provider, external_session_id, started_at_ms DESC, id)` and
 `idx_events_session_seq_id` on `events(session_id, seq, id)`. Read-only
-search/show/locate/MCP opens require exactly v1004 and never migrate or write.
+search/show/locate/MCP opens require exactly v1005 and never migrate or write.
 Restart long-lived processes such as `ctx mcp` after upgrading so they reopen
 through the v1002 gate.
 

@@ -18,7 +18,7 @@ multi-machine merging).
 
 Selective compaction bundles are a distinct, exact family:
 `("ctx-selective-archive", 1)`. `ctx archive create --cutoff-ms N TARGET`
-computes a fresh #282 plan from the same read-only v1004 snapshot used by the
+computes a fresh #282 plan from the same read-only v1005 snapshot used by the
 writer and archives only that authenticated closure. The cutoff is the sole
 selection input. The bundle retains this v1 layout and all fifteen streams
 (including empty streams), but carries `scope.kind = "selective"` and the
@@ -61,7 +61,7 @@ time, so physically duplicated shared membership does not require an
 5. **No network.** Nothing in this format enables or requires transport,
    upload, discovery, or remote credentials. Transport is external tooling.
 6. **Independent versioning.** The archive format version is not the SQLite
-   `PRAGMA user_version` (currently 1004) and not the internal
+   `PRAGMA user_version` (currently 1005) and not the internal
    `SessionHistoryArchive` `schema_version` (1/2). See
    [Format identity](#format-identity-and-versioning).
 
@@ -153,7 +153,7 @@ stream set, record schemas, encoding rules, or verification semantics bumps
 Explicit non-couplings:
 
 - **SQLite schema version.** The manifest records the writer's
-  `PRAGMA user_version` as `source_schema_version` (currently 1004) for
+  `PRAGMA user_version` as `source_schema_version` (currently 1005) for
   diagnostics only. Readers must not gate on it: restore always materializes
   the current binary's schema via the normal store-creation path.
 - **`SessionHistoryArchive` versions 1/2.** That in-memory JSON structure is
@@ -206,7 +206,7 @@ verifiers must reject any deviation.
     v1 streams).
 11. **Enums.** Closed vocabularies (below) are normative; out-of-vocabulary
     values are fatal. The vocabularies mirror the SQLite CHECK constraints at
-    schema v1004. A future provider addition requires a store CHECK-rebuild
+    schema v1005. A future provider addition requires a store CHECK-rebuild
     migration **and** an archive `format_version` review; a v1 reader
     encountering an unknown provider string fails closed, which is correct
     (the reader binary could not have imported that provider either).
@@ -664,7 +664,7 @@ Protocol:
 2. Refuse if the target root exists at all, including an empty directory. Create
    a staging root `<target>.tmp-<restore-uuid>` (0700) beside the target.
 3. Initialize a normal store in the staging root via the standard creation
-   path (current schema version 1004, WAL, 0700/0600, `objects/`
+   path (current schema version 1005, WAL, 0700/0600, `objects/`
    directory). The archive never dictates schema DDL.
 4. In **one write transaction**, insert streams in numbered order using
    dedicated verbatim restore INSERTs — **not** the import/upsert business

@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::{
     AgentType, ArtifactKind, CaptureProvider, EventRole, EventType, Fidelity, RedactionState,
@@ -214,6 +214,107 @@ pub struct ProviderArtifactDescriptor {
     pub metadata: Value,
 }
 
+/// Normalize provider artifact descriptors for content identity.
+///
+/// Provider-local paths describe where an adapter observed an artifact, not
+/// the artifact itself.  The descriptor list is therefore treated as a set:
+/// descriptors, object keys, and nested arrays are put in canonical order.
+/// Sorting uses an explicitly framed representation rather than JSON text so
+/// values such as `"ab", "c"` cannot be confused with `"a", "bc"`.
+///
+/// This deliberately only removes `source_path` from each descriptor's
+/// top-level object.  A `path` in artifact metadata, and file-touch paths in
+/// the surrounding history model, retain their existing semantics.
+pub fn normalize_provider_artifacts<T: Serialize>(artifacts: &[T]) -> serde_json::Result<Value> {
+    Ok(normalize_provider_artifacts_value(serde_json::to_value(
+        artifacts,
+    )?))
+}
+
+/// Value form of [`normalize_provider_artifacts`], used by archive readers
+/// whose rows already contain decoded JSON.
+pub fn normalize_provider_artifacts_value(value: Value) -> Value {
+    let Value::Array(artifacts) = value else {
+        return value;
+    };
+
+    let mut artifacts = artifacts
+        .into_iter()
+        .map(|mut artifact| {
+            if let Value::Object(fields) = &mut artifact {
+                fields.remove("source_path");
+            }
+            canonicalize_json_value(artifact)
+        })
+        .collect::<Vec<_>>();
+    artifacts.sort_by_key(framed_json);
+    Value::Array(artifacts)
+}
+
+fn canonicalize_json_value(value: Value) -> Value {
+    match value {
+        Value::Object(fields) => {
+            let mut entries = fields
+                .into_iter()
+                .map(|(key, value)| (key, canonicalize_json_value(value)))
+                .collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            Value::Object(entries.into_iter().collect::<Map<_, _>>())
+        }
+        Value::Array(values) => {
+            let mut values = values
+                .into_iter()
+                .map(canonicalize_json_value)
+                .collect::<Vec<_>>();
+            values.sort_by_key(framed_json);
+            Value::Array(values)
+        }
+        value => value,
+    }
+}
+
+fn framed_json(value: &Value) -> Vec<u8> {
+    fn append(value: &Value, output: &mut Vec<u8>) {
+        match value {
+            Value::Null => output.extend_from_slice(b"n"),
+            Value::Bool(value) => output.extend_from_slice(if *value { b"b1" } else { b"b0" }),
+            Value::Number(value) => {
+                output.extend_from_slice(b"d");
+                let text = value.to_string();
+                output.extend_from_slice(&(text.len() as u64).to_be_bytes());
+                output.extend_from_slice(text.as_bytes());
+            }
+            Value::String(value) => {
+                output.extend_from_slice(b"s");
+                output.extend_from_slice(&(value.len() as u64).to_be_bytes());
+                output.extend_from_slice(value.as_bytes());
+            }
+            Value::Array(values) => {
+                output.extend_from_slice(b"a");
+                output.extend_from_slice(&(values.len() as u64).to_be_bytes());
+                for value in values {
+                    append(value, output);
+                }
+            }
+            Value::Object(values) => {
+                output.extend_from_slice(b"o");
+                output.extend_from_slice(&(values.len() as u64).to_be_bytes());
+                let mut fields = values.iter().collect::<Vec<_>>();
+                fields.sort_by_key(|(name, _)| *name);
+                for (name, value) in fields {
+                    output.extend_from_slice(&(name.len() as u64).to_be_bytes());
+                    output.extend_from_slice(name.as_bytes());
+                    append(value, output);
+                }
+            }
+        }
+    }
+
+    let mut output = Vec::new();
+    append(value, &mut output);
+    output
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderSourceEnvelope {
     pub source_format: String,
@@ -382,7 +483,8 @@ mod tests {
     use std::{collections::BTreeSet, fs, path::PathBuf};
 
     use super::{
-        ProviderCaptureEnvelope, ProviderId, ProviderSupportMatrixDocument, ProviderSupportStatus,
+        normalize_provider_artifacts, ProviderCaptureEnvelope, ProviderId,
+        ProviderSupportMatrixDocument, ProviderSupportStatus,
     };
 
     fn workspace_file(path: &str) -> PathBuf {
@@ -515,5 +617,60 @@ mod tests {
                 .map(|event| event.redaction_state.as_str()),
             Some("redacted")
         );
+    }
+
+    #[test]
+    fn provider_artifact_normalization_is_order_and_path_independent() {
+        let first = vec![
+            serde_json::json!({
+                "provider_artifact_id": "b",
+                "kind": "markdown",
+                "source_path": "/old/export.md",
+                "metadata": {
+                    "path": "workspace/description.md",
+                    "labels": ["z", "a"],
+                    "nested": {"second": 2, "first": 1}
+                }
+            }),
+            serde_json::json!({
+                "provider_artifact_id": "a",
+                "kind": "binary",
+                "source_path": "/old/image.bin",
+                "metadata": {"nested": {"first": 1, "second": 2}}
+            }),
+        ];
+        let second = vec![
+            serde_json::json!({
+                "metadata": {"nested": {"second": 2, "first": 1}},
+                "source_path": "/new/image.bin",
+                "kind": "binary",
+                "provider_artifact_id": "a"
+            }),
+            serde_json::json!({
+                "metadata": {
+                    "nested": {"first": 1, "second": 2},
+                    "labels": ["a", "z"],
+                    "path": "workspace/description.md"
+                },
+                "kind": "markdown",
+                "provider_artifact_id": "b",
+                "source_path": "/new/export.md"
+            }),
+        ];
+
+        assert_eq!(
+            normalize_provider_artifacts(&first).unwrap(),
+            normalize_provider_artifacts(&second).unwrap()
+        );
+        assert_eq!(
+            normalize_provider_artifacts(&first).unwrap()[1]["metadata"]["path"],
+            "workspace/description.md"
+        );
+        assert!(normalize_provider_artifacts(&first)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|artifact| artifact.get("source_path").is_none()));
     }
 }

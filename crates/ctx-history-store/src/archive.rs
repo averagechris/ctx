@@ -21,7 +21,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::{Result, Store, StoreError};
+use super::{Result, Store, StoreError, SCHEMA_VERSION};
 use crate::CompactionPlan;
 
 const STREAMS: [(&str, &str, &str); 15] = [
@@ -2909,8 +2909,312 @@ fn open_read_nofollow(path: &Path, directory: bool) -> Result<File> {
 pub(super) struct VerifiedArchive {
     pub(super) report: ArchiveVerificationReport,
     pub(super) manifest: ManifestInfo,
+    pub(super) manifest_sha256: String,
     #[cfg(unix)]
     pub(super) root: AnchoredDir,
+}
+
+impl VerifiedArchive {
+    pub(super) fn selective_suppression_facts(&self) -> Result<Vec<crate::SuppressionIdentity>> {
+        let plan = self
+            .manifest
+            .selective_plan
+            .as_ref()
+            .ok_or_else(|| archive_error("selective evidence is missing"))?;
+        let selected = plan
+            .members
+            .iter()
+            .filter(|member| {
+                member.entity_kind == "sessions"
+                    && matches!(member.disposition.as_str(), "selected_root" | "owned_child")
+            })
+            .map(|member| member.entity_key.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let members = plan
+            .members
+            .iter()
+            .map(|member| {
+                (
+                    (member.entity_kind.as_str(), member.entity_key.as_str()),
+                    (),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        let read_stream = |name: &str| -> Result<Vec<serde_json::Value>> {
+            #[cfg(unix)]
+            let file = self.root.dir("streams")?.file(name)?;
+            #[cfg(not(unix))]
+            let file = File::open(self.report.path.join("streams").join(name))?;
+            BufReader::new(file)
+                .lines()
+                .map(|line| Ok(serde_json::from_str(&line?)?))
+                .collect()
+        };
+        let source_rows = read_stream("01-capture_sources.jsonl")?;
+        let event_rows = read_stream("08-events.jsonl")?;
+        let edge_rows = read_stream("06-session_edges.jsonl")?;
+        let file_rows = read_stream("11-files_touched.jsonl")?;
+        let event_sessions = event_rows
+            .iter()
+            .filter_map(|row| Some((row.get("id")?.as_str()?, row.get("session_id")?.as_str()?)))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut facts = Vec::new();
+        for row in read_stream("05-sessions.jsonl")? {
+            let id = row
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if !selected.contains(id) {
+                continue;
+            }
+            let provider = row.get("provider").and_then(serde_json::Value::as_str);
+            let external = row
+                .get("external_session_id")
+                .and_then(serde_json::Value::as_str);
+            let Some((provider, external)) = provider.zip(external) else {
+                continue;
+            };
+            let session_metadata = decoded_archive_json_field(&row, "metadata_json");
+            let Some(source_format) = session_metadata
+                .as_ref()
+                .and_then(|value| value.get("source_format"))
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let Some(source_id) = row
+                .get("capture_source_id")
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let Some(source) = source_rows.iter().find(|source| {
+                source.get("id").and_then(serde_json::Value::as_str) == Some(source_id)
+                    && members.contains_key(&("capture_sources", source_id))
+            }) else {
+                continue;
+            };
+            let source_metadata = decoded_archive_json_field(source, "metadata_json");
+            let source_meta = source_metadata
+                .as_ref()
+                .and_then(serde_json::Value::as_object);
+            let session_meta = session_metadata
+                .as_ref()
+                .and_then(serde_json::Value::as_object);
+            let mut normalized_session_metadata = session_meta
+                .and_then(|m| m.get("metadata"))
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            normalized_session_metadata = crate::suppression_metadata(normalized_session_metadata);
+            let custom_edges = normalized_session_metadata
+                .as_object_mut()
+                .and_then(|metadata| metadata.remove("ctx_suppression_edges_v2"))
+                .and_then(|value| value.as_array().cloned())
+                .unwrap_or_default();
+            let mut writes = vec![
+                crate::SuppressionWrite {
+                    kind: "capture_source",
+                    key: external.to_owned(),
+                    value: serde_json::json!({
+                        "fidelity": source.get("fidelity").cloned().unwrap_or(serde_json::Value::Null),
+                        "raw_retention": source_meta.and_then(|m| m.get("raw_retention")).cloned().unwrap_or(serde_json::Value::Null),
+                        "redaction_boundary": source_meta.and_then(|m| m.get("redaction_boundary")).cloned().unwrap_or(serde_json::Value::Null),
+                        "source_format": source_format,
+                        "source_metadata": crate::suppression_metadata(source_meta.and_then(|m| m.get("source_metadata")).cloned().unwrap_or_else(|| serde_json::json!({}))),
+                        "source_trust": source_meta.and_then(|m| m.get("source_trust")).cloned().unwrap_or(serde_json::Value::Null),
+                    }),
+                },
+                crate::SuppressionWrite {
+                    kind: "session_payload",
+                    key: external.to_owned(),
+                    value: serde_json::json!({
+                        "artifacts": ctx_history_core::normalize_provider_artifacts_value(session_meta.and_then(|m| m.get("artifacts")).cloned().unwrap_or_else(|| serde_json::json!([]))),
+                        "fidelity": row.get("fidelity").cloned().unwrap_or(serde_json::Value::Null),
+                        "metadata": normalized_session_metadata,
+                        "parent_provider_session_id": session_meta.and_then(|m| m.get("parent_provider_session_id")).cloned().unwrap_or(serde_json::Value::Null),
+                        "root_provider_session_id": session_meta.and_then(|m| m.get("root_provider_session_id")).cloned().unwrap_or(serde_json::Value::Null),
+                    }),
+                },
+            ];
+            for edge in &custom_edges {
+                let key = format!(
+                    "{}:{}:{}",
+                    edge.get("edge_type")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown"),
+                    edge.get("from_provider_session_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or(""),
+                    edge.get("to_provider_session_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                );
+                writes.push(crate::SuppressionWrite {
+                    kind: "session_edge",
+                    key,
+                    value: edge.clone(),
+                });
+            }
+            for edge in custom_edges
+                .is_empty()
+                .then_some(&edge_rows)
+                .into_iter()
+                .flatten()
+            {
+                let edge_id = edge
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                if !members.contains_key(&("session_edges", edge_id))
+                    || edge
+                        .get("to_session_id")
+                        .and_then(serde_json::Value::as_str)
+                        != Some(id)
+                    || edge.get("edge_type").and_then(serde_json::Value::as_str)
+                        != Some("parent_child")
+                {
+                    continue;
+                }
+                let parent_external = session_meta
+                    .and_then(|m| m.get("parent_provider_session_id"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                writes.push(crate::SuppressionWrite {
+                    kind: "session_edge",
+                    key: "parent_child".into(),
+                    value: serde_json::json!({"from": parent_external, "to": external, "type": "parent_child"}),
+                });
+            }
+            for event in &event_rows {
+                let event_id = event
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                if !members.contains_key(&("events", event_id))
+                    || event.get("session_id").and_then(serde_json::Value::as_str) != Some(id)
+                {
+                    continue;
+                }
+                let payload_value = decoded_archive_json_field(event, "payload_json");
+                let metadata_value = decoded_archive_json_field(event, "metadata_json");
+                let payload = payload_value
+                    .as_ref()
+                    .and_then(serde_json::Value::as_object);
+                let metadata = metadata_value
+                    .as_ref()
+                    .and_then(serde_json::Value::as_object);
+                let Some(index) = payload
+                    .and_then(|m| m.get("provider_event_index"))
+                    .and_then(serde_json::Value::as_u64)
+                else {
+                    continue;
+                };
+                writes.push(crate::SuppressionWrite {
+                    kind: "event",
+                    key: format!("{index:020}"),
+                    value: serde_json::json!({
+                        "artifacts": ctx_history_core::normalize_provider_artifacts_value(payload.and_then(|m| m.get("artifacts")).cloned().unwrap_or_else(|| serde_json::json!([]))),
+                        "event_type": event.get("event_type").cloned().unwrap_or(serde_json::Value::Null),
+                        "fidelity": event.get("fidelity").cloned().unwrap_or(serde_json::Value::Null),
+                        "metadata": crate::suppression_metadata(metadata.and_then(|m| m.get("metadata")).cloned().unwrap_or_else(|| serde_json::json!({}))),
+                        "occurred_at_ms": event.get("occurred_at_ms").cloned().unwrap_or(serde_json::Value::Null),
+                        "payload": payload.and_then(|m| m.get("body")).cloned().unwrap_or_else(|| serde_json::json!({})),
+                        "provider_event_hash": payload.and_then(|m| m.get("provider_event_hash")).cloned().unwrap_or(serde_json::Value::Null),
+                        "provider_event_index": index,
+                        "redaction_state": event.get("redaction_state").cloned().unwrap_or(serde_json::Value::Null),
+                        "role": event.get("role").cloned().unwrap_or(serde_json::Value::Null),
+                    }),
+                });
+            }
+            for file in &file_rows {
+                let file_id = file
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                if !members.contains_key(&("files_touched", file_id)) {
+                    continue;
+                }
+                let metadata_value = decoded_archive_json_field(file, "metadata_json");
+                let metadata = metadata_value
+                    .as_ref()
+                    .and_then(serde_json::Value::as_object);
+                let belongs = metadata
+                    .and_then(|m| m.get("session_id"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(id)
+                    || file
+                        .get("event_id")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|event| event_sessions.get(event).copied())
+                        == Some(id);
+                if !belongs {
+                    continue;
+                }
+                let Some(index) = metadata
+                    .and_then(|m| m.get("provider_touch_index"))
+                    .and_then(serde_json::Value::as_u64)
+                else {
+                    continue;
+                };
+                writes.push(crate::SuppressionWrite {
+                    kind: "file_touch",
+                    key: format!("{index:020}"),
+                    value: serde_json::json!({
+                        "change_kind": file.get("change_kind").cloned().unwrap_or(serde_json::Value::Null),
+                        "confidence": file.get("confidence").cloned().unwrap_or(serde_json::Value::Null),
+                        "line_count_delta": file.get("line_count_delta").cloned().unwrap_or(serde_json::Value::Null),
+                        "metadata": crate::suppression_metadata(metadata.and_then(|m| m.get("metadata")).cloned().unwrap_or_else(|| serde_json::json!({}))),
+                        "occurred_at_ms": file.get("created_at_ms").cloned().unwrap_or(serde_json::Value::Null),
+                        "old_path": file.get("old_path").cloned().unwrap_or(serde_json::Value::Null),
+                        "path": file.get("path").cloned().unwrap_or(serde_json::Value::Null),
+                        "provider_event_index": metadata.and_then(|m| m.get("provider_event_index")).cloned().unwrap_or(serde_json::Value::Null),
+                        "provider_touch_index": index,
+                    }),
+                });
+            }
+            facts.push(crate::SuppressionIdentity::normalized_write_set(
+                crate::ProviderSuppressionSession {
+                    provider,
+                    source_format,
+                    external_id: external,
+                    external_agent_id: row
+                        .get("external_agent_id")
+                        .and_then(serde_json::Value::as_str),
+                    agent_type: row
+                        .get("agent_type")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown"),
+                    role_hint: row.get("role_hint").and_then(serde_json::Value::as_str),
+                    is_primary: row
+                        .get("is_primary")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                    status: row
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("imported"),
+                    started_at_ms: row
+                        .get("started_at_ms")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0),
+                    ended_at_ms: row.get("ended_at_ms").and_then(serde_json::Value::as_i64),
+                },
+                writes,
+            ));
+        }
+        facts.sort_by(|a, b| {
+            (&a.identity_key, &a.content_key).cmp(&(&b.identity_key, &b.content_key))
+        });
+        facts.dedup();
+        Ok(facts)
+    }
+}
+
+fn decoded_archive_json_field(row: &serde_json::Value, key: &str) -> Option<serde_json::Value> {
+    match row.get(key)? {
+        serde_json::Value::String(encoded) => serde_json::from_str(encoded).ok(),
+        value => Some(value.clone()),
+    }
 }
 
 fn verify_v1_bundle(
@@ -3081,13 +3385,15 @@ fn verify_v1_bundle(
             "manifest object totals mismatch",
         ));
     }
+    let mut manifest = manifest;
     if manifest.format == "ctx-selective-archive" {
-        state.verify_selective_plan(
+        let reconstructed = state.verify_selective_plan(
             manifest
                 .selective_plan
                 .as_ref()
                 .expect("selective plan parsed"),
         )?;
+        manifest.selective_plan = Some(reconstructed);
     }
     Ok(VerifiedArchive {
         report: ArchiveVerificationReport {
@@ -3098,6 +3404,7 @@ fn verify_v1_bundle(
             object_bytes,
         },
         manifest,
+        manifest_sha256: marker_manifest_sha256.to_owned(),
         #[cfg(unix)]
         root,
     })
@@ -3605,7 +3912,7 @@ impl VerifierState {
             let database = temp_dir.join("state.sqlite");
             let conn = Connection::open(&database)?;
             restrict_private_file(&database)?;
-            conn.execute_batch("PRAGMA journal_mode = DELETE; PRAGMA synchronous = FULL; PRAGMA user_version = 1004; CREATE TABLE ids(id BLOB PRIMARY KEY, kind INTEGER NOT NULL); CREATE TABLE refs(kind INTEGER NOT NULL, id BLOB NOT NULL); CREATE TABLE unique_keys(kind TEXT NOT NULL, key BLOB NOT NULL, PRIMARY KEY(kind, key)); CREATE TABLE blobs(hash BLOB PRIMARY KEY, byte_size INTEGER NOT NULL); CREATE TABLE order_events(seq INTEGER PRIMARY KEY); CREATE TABLE evidence_roots(session_id TEXT PRIMARY KEY, disposition TEXT NOT NULL, rationale TEXT NOT NULL, observed_status TEXT NOT NULL, observed_ended_at_ms INTEGER, closure_digest TEXT, member_count INTEGER NOT NULL, deletion_member_count INTEGER NOT NULL) WITHOUT ROWID; CREATE TABLE evidence_members(kind TEXT NOT NULL, key TEXT NOT NULL, content_key TEXT NOT NULL, disposition TEXT NOT NULL, ownership TEXT NOT NULL, deletion_authorized INTEGER NOT NULL, PRIMARY KEY(kind,key)) WITHOUT ROWID; CREATE TABLE evidence_root_members(root_id TEXT NOT NULL, kind TEXT NOT NULL, key TEXT NOT NULL, content_key TEXT NOT NULL, disposition TEXT NOT NULL, ownership TEXT NOT NULL, deletion_authorized INTEGER NOT NULL, PRIMARY KEY(root_id,kind,key)) WITHOUT ROWID;")?;
+            conn.execute_batch(&format!("PRAGMA journal_mode = DELETE; PRAGMA synchronous = FULL; PRAGMA user_version = {SCHEMA_VERSION}; CREATE TABLE ids(id BLOB PRIMARY KEY, kind INTEGER NOT NULL); CREATE TABLE refs(kind INTEGER NOT NULL, id BLOB NOT NULL); CREATE TABLE unique_keys(kind TEXT NOT NULL, key BLOB NOT NULL, PRIMARY KEY(kind, key)); CREATE TABLE blobs(hash BLOB PRIMARY KEY, byte_size INTEGER NOT NULL); CREATE TABLE order_events(seq INTEGER PRIMARY KEY); CREATE TABLE evidence_roots(session_id TEXT PRIMARY KEY, disposition TEXT NOT NULL, rationale TEXT NOT NULL, observed_status TEXT NOT NULL, observed_ended_at_ms INTEGER, closure_digest TEXT, member_count INTEGER NOT NULL, deletion_member_count INTEGER NOT NULL) WITHOUT ROWID; CREATE TABLE evidence_members(kind TEXT NOT NULL, key TEXT NOT NULL, content_key TEXT NOT NULL, disposition TEXT NOT NULL, ownership TEXT NOT NULL, deletion_authorized INTEGER NOT NULL, PRIMARY KEY(kind,key)) WITHOUT ROWID; CREATE TABLE evidence_root_members(root_id TEXT NOT NULL, kind TEXT NOT NULL, key TEXT NOT NULL, content_key TEXT NOT NULL, disposition TEXT NOT NULL, ownership TEXT NOT NULL, deletion_authorized INTEGER NOT NULL, PRIMARY KEY(root_id,kind,key)) WITHOUT ROWID;"))?;
             for (table, _, columns) in super::compaction::STREAMS {
                 let definitions = columns
                     .split(',')
@@ -3765,7 +4072,7 @@ impl VerifierState {
         Ok(())
     }
 
-    fn verify_selective_plan(&mut self, declared: &CompactionPlan) -> Result<()> {
+    fn verify_selective_plan(&mut self, declared: &CompactionPlan) -> Result<CompactionPlan> {
         let tx = self.conn.transaction()?;
         let reconstructed = super::compaction::plan(&tx, declared.cutoff_ms).map_err(|error| {
             verification_error(
@@ -3899,7 +4206,7 @@ impl VerifierState {
             ));
         }
         tx.commit()?;
-        Ok(())
+        Ok(reconstructed)
     }
 
     fn reference(&self, kind: i64, id: &str) -> Result<()> {

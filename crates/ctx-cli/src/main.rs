@@ -148,6 +148,13 @@ fn test_refresh_lease_barrier(token: &str) -> Result<()> {
     Ok(())
 }
 
+fn test_refresh_transaction_fault(phase: &str) -> Result<()> {
+    if env::var("CTX_TEST_REFRESH_TX_FAULT").ok().as_deref() == Some(phase) {
+        return Err(anyhow!("injected refresh transaction fault: {phase}"));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "ctx", version, about = "Search local agent history")]
 struct Cli {
@@ -337,6 +344,33 @@ enum ArchiveCommand {
     Verify(ArchiveVerifyArgs),
     #[command(about = "Restore a verified archive into a strictly absent data root")]
     Restore(ArchiveRestoreArgs),
+    #[command(about = "Verify and atomically register selective reimport suppression")]
+    Register(ArchiveRegisterArgs),
+    #[command(about = "Explicitly override one audited archive suppression")]
+    Override(ArchiveOverrideArgs),
+    #[command(about = "Show bounded path-free suppression counts")]
+    SuppressionStatus(JsonArgs),
+}
+
+#[derive(Debug, Args)]
+struct ArchiveRegisterArgs {
+    bundle: PathBuf,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ArchiveOverrideArgs {
+    #[arg(long)]
+    archive_id: Option<String>,
+    #[arg(long)]
+    identity_key: String,
+    #[arg(long)]
+    content_key: String,
+    #[arg(long)]
+    reason: String,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -2508,7 +2542,65 @@ fn run_archive(args: ArchiveArgs, data_root: PathBuf) -> Result<()> {
         ArchiveCommand::Create(create) => run_archive_create(create, data_root),
         ArchiveCommand::Verify(verify) => run_archive_verify(verify),
         ArchiveCommand::Restore(restore) => run_archive_restore(restore),
+        ArchiveCommand::Register(register) => run_archive_register(register, data_root),
+        ArchiveCommand::Override(override_args) => run_archive_override(override_args, data_root),
+        ArchiveCommand::SuppressionStatus(status) => run_suppression_status(status, data_root),
     }
+}
+
+fn run_archive_register(args: ArchiveRegisterArgs, data_root: PathBuf) -> Result<()> {
+    let mut store = Store::open(database_path(data_root))?;
+    let report = store.register_selective_archive(&args.bundle)?;
+    if args.json {
+        println!("{}", serde_json::to_string(&report)?);
+    } else {
+        println!(
+            "registered archive {}: {} members, {} suppressions, {} unsuppressible{}",
+            report.archive_id,
+            report.member_count,
+            report.suppression_count,
+            report.unsuppressible_count,
+            if report.duplicate {
+                " (already registered)"
+            } else {
+                ""
+            }
+        );
+    }
+    Ok(())
+}
+
+fn run_archive_override(args: ArchiveOverrideArgs, data_root: PathBuf) -> Result<()> {
+    let mut store = Store::open(database_path(data_root))?;
+    let report = store.override_suppression(
+        args.archive_id.as_deref(),
+        &args.identity_key,
+        &args.content_key,
+        &args.reason,
+    )?;
+    if args.json {
+        println!("{}", serde_json::to_string(&report)?);
+    } else {
+        println!(
+            "overrode {} suppression association; effective state {}",
+            report.affected_associations, report.effective_state
+        );
+    }
+    Ok(())
+}
+
+fn run_suppression_status(args: JsonArgs, data_root: PathBuf) -> Result<()> {
+    let store = Store::open_read_only(database_path(data_root))?;
+    let status = store.suppression_status()?;
+    if args.json {
+        println!("{}", serde_json::to_string(&status)?);
+    } else {
+        println!(
+            "suppression: {} active, {} conflicts, {} restored, {} overridden",
+            status.active, status.conflict, status.restored, status.overridden
+        );
+    }
+    Ok(())
 }
 
 fn run_archive_plan(args: ArchivePlanArgs, data_root: PathBuf) -> Result<()> {
@@ -3839,6 +3931,7 @@ struct ImportSourceFailure {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 enum ImportSourceRun {
     Imported(ImportSourceOutcome),
     Failed(ImportSourceFailure),
@@ -3898,6 +3991,9 @@ fn source_import_json(
         "imported_events": summary.imported_events,
         "imported_edges": summary.imported_edges,
         "skipped": summary.skipped,
+        "suppressed": summary.suppressed,
+        "suppression_conflicts": summary.suppression_conflicts,
+        "unsuppressible": summary.unsuppressible,
         "skipped_reasons": skipped_reasons_json(summary),
         "failed": summary.failed,
         "malformed_or_unsupported_count": summary.failed,
@@ -3929,6 +4025,9 @@ fn custom_format_import_json(
         "imported_events": summary.imported_events,
         "imported_edges": summary.imported_edges,
         "skipped": summary.skipped,
+        "suppressed": summary.suppressed,
+        "suppression_conflicts": summary.suppression_conflicts,
+        "unsuppressible": summary.unsuppressible,
         "skipped_reasons": skipped_reasons_json(summary),
         "failed": summary.failed,
         "malformed_or_unsupported_count": summary.failed,
@@ -3963,6 +4062,9 @@ fn history_source_plugin_import_json_with_source_only(
         "imported_events": summary.imported_events,
         "imported_edges": summary.imported_edges,
         "skipped": summary.skipped,
+        "suppressed": summary.suppressed,
+        "suppression_conflicts": summary.suppression_conflicts,
+        "unsuppressible": summary.unsuppressible,
         "skipped_reasons": skipped_reasons_json(summary),
         "failed": summary.failed,
         "malformed_or_unsupported_count": summary.failed,
@@ -6297,6 +6399,14 @@ fn refresh_sources_for_search(
             totals.refresh_in_progress_sources += 1;
             continue;
         };
+        // The process lock proves any durable SQLite lease belongs to a
+        // process that can no longer commit its refresh transaction.
+        refresh_store.recover_source_refresh_lease(
+            source.provider.as_str(),
+            source.source_format,
+            &source.path,
+            "",
+        )?;
         let observed = observe_opencode_sqlite(&source.path)?;
         let claim = refresh_store.claim_source_refresh(
             source.provider.as_str(),
@@ -6338,8 +6448,12 @@ fn refresh_sources_for_search(
         )?;
         let record = import_record_for_source(&source);
         let record_id = record.id;
-        refresh_store.upsert_record(&record)?;
         let (summary, next_cursor) = loop {
+            refresh_store.begin_immediate_batch()?;
+            if let Err(err) = refresh_store.upsert_record(&record) {
+                let _ = refresh_store.rollback_batch();
+                return Err(err.into());
+            }
             match import_opencode_sqlite_incremental(
                 &source.path,
                 &mut refresh_store,
@@ -6347,6 +6461,7 @@ fn refresh_sources_for_search(
                     source_path: Some(source.path.clone()),
                     history_record_id: Some(record_id),
                     allow_partial_failures: true,
+                    wrap_transaction: false,
                     ..OpenCodeSqliteImportOptions::default()
                 },
                 prior_cursor.as_deref(),
@@ -6375,10 +6490,12 @@ fn refresh_sources_for_search(
                 Err(err)
                     if !retried_changed_source && error_is_source_changed_during_read(&err) =>
                 {
+                    let _ = refresh_store.rollback_batch();
                     retried_changed_source = true;
                     attempt_observation = observe_opencode_sqlite(&source.path)?;
                 }
                 Err(err) => {
+                    let _ = refresh_store.rollback_batch();
                     let code = if error_is_source_changed_during_read(&err) {
                         SourceRefreshErrorCode::SourceChangedDuringRead
                     } else if error_is_unsupported_incremental_mutation(&err) {
@@ -6399,6 +6516,59 @@ fn refresh_sources_for_search(
                 }
             }
         };
+        if let Err(err) = test_refresh_transaction_fault("after_import") {
+            let _ = refresh_store.rollback_batch();
+            return Err(err);
+        }
+        let health = classify_import_health(&stats, &summary);
+        if summary.suppressed > 0 || summary.suppression_conflicts > 0 {
+            if !refresh_store.fail_source_refresh(
+                source.provider.as_str(),
+                source.source_format,
+                &source.path,
+                "",
+                &token,
+                attempt_observation.digest(),
+                SourceRefreshErrorCode::SuppressionBlocked,
+            )? {
+                let _ = refresh_store.rollback_batch();
+                return Err(anyhow!(
+                    "OpenCode refresh lease was reclaimed before suppression completion"
+                ));
+            }
+            if let Err(err) = test_refresh_transaction_fault("after_lease") {
+                let _ = refresh_store.rollback_batch();
+                return Err(err);
+            }
+            if let Err(err) = test_refresh_transaction_fault("health_failure").and_then(|()| {
+                persist_source_health(
+                    &refresh_store,
+                    source.provider.as_str(),
+                    source.source_format,
+                    &source.path,
+                    "",
+                    &health,
+                    true,
+                )
+            }) {
+                let _ = refresh_store.rollback_batch();
+                return Err(err);
+            }
+            test_refresh_transaction_fault("after_health").inspect_err(|_| {
+                let _ = refresh_store.rollback_batch();
+            })?;
+            if let Err(err) = refresh_store.commit_batch() {
+                let _ = refresh_store.rollback_batch();
+                return Err(err.into());
+            }
+            totals.add_with_health(&summary, &stats, &health);
+            let health_started = Instant::now();
+            totals
+                .phase_timings
+                .health_persistence
+                .record(health_started, 1);
+            continue;
+        }
         if !refresh_store.complete_source_refresh(
             source.provider.as_str(),
             source.source_format,
@@ -6408,25 +6578,38 @@ fn refresh_sources_for_search(
             attempt_observation.digest(),
             next_cursor.as_deref(),
         )? {
+            let _ = refresh_store.rollback_batch();
             return Err(anyhow!(
                 "OpenCode refresh lease was reclaimed before completion"
             ));
         }
-        let health = classify_import_health(&stats, &summary);
-        totals.add_with_health(&summary, &stats, &health);
-        let health_started = Instant::now();
-        if let Err(err) = persist_source_health(
-            &refresh_store,
-            source.provider.as_str(),
-            source.source_format,
-            &source.path,
-            "",
-            &health,
-            true,
-        ) {
-            totals.health_persistence_failures += 1;
-            emit_health_persistence_warning(progress_arg, &err);
+        if let Err(err) = test_refresh_transaction_fault("after_lease") {
+            let _ = refresh_store.rollback_batch();
+            return Err(err);
         }
+        let health_started = Instant::now();
+        if let Err(err) = test_refresh_transaction_fault("health_failure").and_then(|()| {
+            persist_source_health(
+                &refresh_store,
+                source.provider.as_str(),
+                source.source_format,
+                &source.path,
+                "",
+                &health,
+                true,
+            )
+        }) {
+            let _ = refresh_store.rollback_batch();
+            return Err(err);
+        }
+        test_refresh_transaction_fault("after_health").inspect_err(|_| {
+            let _ = refresh_store.rollback_batch();
+        })?;
+        if let Err(err) = refresh_store.commit_batch() {
+            let _ = refresh_store.rollback_batch();
+            return Err(err.into());
+        }
+        totals.add_with_health(&summary, &stats, &health);
         totals
             .phase_timings
             .health_persistence
@@ -7475,6 +7658,17 @@ fn import_manifested_source(
                 if pending_file.file_size_bytes == 0 {
                     file_summary.empty_files = 1;
                 }
+                if file_summary.suppressed > 0 || file_summary.suppression_conflicts > 0 {
+                    store.mark_source_import_file_failed(
+                        source.provider,
+                        &source_root,
+                        &pending_file.source_path,
+                        "suppression_blocked",
+                        utc_now().timestamp_millis(),
+                    )?;
+                    merge_provider_import_summary(&mut summary, file_summary);
+                    continue;
+                }
                 let health = classify_import_health(&file_stats, &file_summary);
                 if health.zero_yield_anomaly() {
                     file_summary.zero_yield_anomalies = 1;
@@ -7562,6 +7756,9 @@ fn merge_provider_import_summary(
     summary.imported += other.imported;
     summary.skipped += other.skipped;
     summary.failed += other.failed;
+    summary.suppressed += other.suppressed;
+    summary.suppression_conflicts += other.suppression_conflicts;
+    summary.unsuppressible += other.unsuppressible;
     summary.redacted += other.redacted;
     summary.imported_sessions += other.imported_sessions;
     summary.skipped_sessions += other.skipped_sessions;
@@ -7902,6 +8099,16 @@ fn mark_catalog_sessions_indexed_or_anomalous(
     let existing_external_session_ids =
         store.existing_external_session_ids(CaptureProvider::Codex, &external_session_ids)?;
     for session in sessions {
+        if summary.suppressed > 0 || summary.suppression_conflicts > 0 {
+            store.mark_catalog_source_failed(
+                CaptureProvider::Codex,
+                &session.source_root,
+                &session.source_path,
+                "suppression_blocked",
+                indexed_at_ms,
+            )?;
+            continue;
+        }
         if session.file_size_bytes == 0 {
             mark_catalog_session_indexed(store, session, None, indexed_at_ms)?;
             empty_files += 1;

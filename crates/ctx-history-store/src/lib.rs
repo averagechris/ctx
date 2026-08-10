@@ -43,6 +43,7 @@ mod restore;
 mod secure_output;
 #[cfg(not(unix))]
 mod secure_output_nonunix;
+mod suppression;
 pub use archive::{
     archive_verification_error_code, verify_archive_bundle, verify_archive_bundle_with_options,
     ArchiveOptions, ArchiveReport, ArchiveStreamReport, ArchiveVerificationCode,
@@ -56,6 +57,11 @@ pub use restore::{restore_archive_bundle, ArchiveRestoreReport};
 pub use secure_output::{write_secure_output, SecureOutputCode, SecureOutputError};
 #[cfg(not(unix))]
 pub use secure_output_nonunix::{write_secure_output, SecureOutputCode, SecureOutputError};
+pub use suppression::{
+    suppression_metadata, ArchiveRegistrationReport, ProviderSuppressionSession,
+    SuppressionDecision, SuppressionIdentity, SuppressionOverrideReport, SuppressionStatus,
+    SuppressionWrite,
+};
 #[cfg(not(unix))]
 #[derive(Debug, Clone)]
 pub struct ArchiveRestoreReport {
@@ -968,7 +974,8 @@ impl IdPrefixAmbiguity {
 /// decision 9) so fork migrations can never collide with upstream's chain.
 /// v1000 is the landed rowid-map migration; v1001 adds bounded pagination
 /// indexes, v1002 adds the path-free source-health ledger, and v1003 adds
-/// path-free automatic-refresh coordination state.
+/// path-free automatic-refresh coordination state, v1004 adds bounded
+/// incremental provider state, and v1005 adds the path-free compaction ledger.
 ///
 /// Any binary whose chain ends at v15 refuses to *open* a fork-versioned
 /// store, both read-only (exact-version check in [`Store::open_read_only`])
@@ -980,7 +987,7 @@ impl IdPrefixAmbiguity {
 /// open connection can keep writing until it restarts, which is why release
 /// guidance says to restart long-lived ctx processes after upgrading and
 /// why map entries are verified before every point delete.
-const SCHEMA_VERSION: i64 = 1004;
+const SCHEMA_VERSION: i64 = 1005;
 /// First schema version of this fork's migration chain (the v1000 rowid-map
 /// migration). Writable opens migrate every reviewed version at or above
 /// this up to [`SCHEMA_VERSION`]; the fork chain has no gaps.
@@ -994,7 +1001,7 @@ const UPSTREAM_SCHEMA_VERSION_MAX: i64 = 15;
 /// True when a writable open of this binary can migrate the given on-disk
 /// schema version to the current one: everything at or below the ported
 /// upstream chain (≤ v15) migrates, and so does every reviewed fork version
-/// (currently v1000 through v1002, upgraded without touching rowid maps or FTS
+/// (currently v1000 through v1004, upgraded without touching rowid maps or FTS
 /// projections). Versions in the (15, 1000)
 /// gap and versions above [`SCHEMA_VERSION`] belong to other (newer or
 /// unreviewed) binaries and are rejected rather than migrated; callers
@@ -2803,6 +2810,9 @@ impl Store {
         if user_version < 1004 {
             migrate_to_v1004(&self.conn)?;
         }
+        if user_version < 1005 {
+            migrate_to_v1005(&self.conn)?;
+        }
         create_fts_tables_if_supported(&self.conn)?;
         // Recreate dropped rowid map tables empty on open; an empty map is
         // always safe (writes degrade to the legacy full-scan path and each
@@ -3735,6 +3745,23 @@ impl Store {
         logical_id: &str,
     ) -> Result<String> {
         self.source_identity_key(provider, format, logical_path, logical_id)
+    }
+
+    /// Reconcile a lease left by a process that exited after obtaining the
+    /// external source-refresh process lock. Callers must hold that lock for
+    /// this exact source key, which proves no live owner can still commit.
+    pub fn recover_source_refresh_lease(
+        &self,
+        provider: &str,
+        format: &str,
+        logical_path: &Path,
+        logical_id: &str,
+    ) -> Result<bool> {
+        let source_key = self.source_identity_key(provider, format, logical_path, logical_id)?;
+        Ok(self.conn.execute(
+            "UPDATE source_refresh_state SET lease_token=NULL,lease_expires_at_ms=NULL WHERE source_key=?1 AND lease_token IS NOT NULL",
+            [source_key],
+        )? == 1)
     }
 
     /// Atomically decides whether an automatic source refresh may proceed.
@@ -8450,6 +8477,38 @@ fn migrate_to_v1004(conn: &Connection) -> Result<()> {
     }
 }
 
+/// Adds the path-free compaction ledger. This migration deliberately has no
+/// SELECT from canonical tables and does not touch FTS or either rowid map.
+fn migrate_to_v1005(conn: &Connection) -> Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let schema = include_str!("schema_v1005.sql");
+    let (first, second) = schema
+        .split_once("-- v1005-atomic-boundary")
+        .expect("v1005 migration boundary");
+    let migration = conn.execute_batch(first).and_then(|()| {
+        #[cfg(test)]
+        if V1005_FAIL_AFTER_FIRST_DDL.with(|fail| fail.replace(false)) {
+            return Err(rusqlite::Error::ExecuteReturnedResults);
+        }
+        conn.execute_batch(second)
+    });
+    match migration {
+        Ok(()) => {
+            conn.execute_batch("COMMIT;")?;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(StoreError::Sql(err))
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static V1005_FAIL_AFTER_FIRST_DDL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceRefreshClaim {
     Acquired { token: String },
@@ -8463,6 +8522,7 @@ pub enum SourceRefreshErrorCode {
     SourceChangedDuringRead,
     ProviderReadFailed,
     UnsupportedIncrementalMutation,
+    SuppressionBlocked,
 }
 
 impl SourceRefreshErrorCode {
@@ -8471,6 +8531,7 @@ impl SourceRefreshErrorCode {
             Self::SourceChangedDuringRead => "source_changed_during_read",
             Self::ProviderReadFailed => "provider_read_failed",
             Self::UnsupportedIncrementalMutation => "unsupported_incremental_mutation",
+            Self::SuppressionBlocked => "suppression_blocked",
         }
     }
 }
@@ -15479,7 +15540,7 @@ mod search_rowid_map_tests {
         );
 
         let store = Store::open(&path).unwrap();
-        assert_eq!(user_version(&store), 1004);
+        assert_eq!(user_version(&store), 1005);
         assert_eq!(user_version(&store), SCHEMA_VERSION);
 
         // The maps exist and start empty: no backfill.
@@ -15534,7 +15595,7 @@ mod search_rowid_map_tests {
         let temp = tempdir();
         let store = Store::open(temp.path().join("work.sqlite")).unwrap();
         assert_eq!(user_version(&store), SCHEMA_VERSION);
-        assert_eq!(user_version(&store), 1004);
+        assert_eq!(user_version(&store), 1005);
         // The upstream chain ran first: its v13+ stable views exist.
         assert_eq!(
             count(
@@ -15588,15 +15649,15 @@ mod search_rowid_map_tests {
         drop(Store::open(&future_path).unwrap());
         Connection::open(&future_path)
             .unwrap()
-            .execute_batch("PRAGMA user_version = 1005;")
+            .execute_batch("PRAGMA user_version = 1006;")
             .unwrap();
         assert!(matches!(
             Store::open(&future_path),
-            Err(StoreError::UnsupportedSchemaVersion(1005))
+            Err(StoreError::UnsupportedSchemaVersion(1006))
         ));
         assert!(matches!(
             Store::open_read_only(&future_path),
-            Err(StoreError::UnsupportedSchemaVersion(1005))
+            Err(StoreError::UnsupportedSchemaVersion(1006))
         ));
 
         // Read-only open also requires the exact current version for fork
@@ -15647,7 +15708,7 @@ mod search_rowid_map_tests {
         // persistent PRAGMA (journal_mode = WAL) applied before the version
         // gate would show up as mutated bytes, a changed journal mode, or
         // WAL sidecar files.
-        for version in [16i64, 999, 1005] {
+        for version in [16i64, 999, 1006] {
             let path = temp.path().join(format!("foreign-{version}.sqlite"));
             {
                 let conn = Connection::open(&path).unwrap();
@@ -15735,6 +15796,16 @@ mod search_rowid_map_tests {
             conn.execute_batch(
                 r#"
                 BEGIN IMMEDIATE;
+                DROP TABLE compaction_operation_objects;
+                DROP TABLE compaction_operations;
+                DROP TABLE compaction_restore_markers;
+                DROP TABLE compaction_suppression_conflicts;
+                DROP TABLE compaction_archive_suppressions;
+                DROP TABLE compaction_suppression_facts;
+                DROP TABLE compaction_deletion_members;
+                DROP TABLE compaction_archive_members;
+                DROP TABLE compaction_archive_roots;
+                DROP TABLE compaction_archives;
                 DROP INDEX source_refresh_retry_idx;
                 DROP INDEX source_refresh_lease_idx;
                 DROP TABLE source_refresh_state;
@@ -15763,7 +15834,7 @@ mod search_rowid_map_tests {
         // v1001 pagination indexes): data intact, maps recreated empty,
         // lazy healing resumes.
         let store = Store::open(&path).unwrap();
-        assert_eq!(user_version(&store), 1004);
+        assert_eq!(user_version(&store), 1005);
         assert_eq!(
             count(&store, "SELECT COUNT(*) FROM record_search_rowids"),
             0
@@ -15873,6 +15944,16 @@ mod search_rowid_map_tests {
             conn.execute_batch(
                 r#"
                 BEGIN IMMEDIATE;
+                DROP TABLE compaction_operation_objects;
+                DROP TABLE compaction_operations;
+                DROP TABLE compaction_restore_markers;
+                DROP TABLE compaction_suppression_conflicts;
+                DROP TABLE compaction_archive_suppressions;
+                DROP TABLE compaction_suppression_facts;
+                DROP TABLE compaction_deletion_members;
+                DROP TABLE compaction_archive_members;
+                DROP TABLE compaction_archive_roots;
+                DROP TABLE compaction_archives;
                 DROP INDEX source_refresh_retry_idx;
                 DROP INDEX source_refresh_lease_idx;
                 DROP TABLE source_refresh_state;
@@ -15905,7 +15986,7 @@ mod search_rowid_map_tests {
 
         // A writable open migrates v1000 → v1001 in place.
         let store = Store::open(&path).unwrap();
-        assert_eq!(user_version(&store), 1004);
+        assert_eq!(user_version(&store), 1005);
         for index in [
             "idx_sessions_provider_external_session_started",
             "idx_events_session_seq_id",
@@ -16922,7 +17003,7 @@ mod catalog_tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(user_version, 1004);
+        assert_eq!(user_version, 1005);
         let event_plan = store
             .conn
             .prepare("EXPLAIN QUERY PLAN SELECT id FROM events WHERE session_id = ?1 AND (seq, id) > (?2, ?3) ORDER BY seq, id LIMIT ?4")
@@ -16983,7 +17064,7 @@ mod catalog_tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(migrated_version, 1004);
+        assert_eq!(migrated_version, 1005);
         for index in [
             "idx_events_session_seq_id",
             "idx_sessions_provider_external_session_started",
@@ -17223,7 +17304,17 @@ mod catalog_tests {
         store
             .conn
             .execute_batch(
-                "ALTER TABLE source_refresh_state DROP COLUMN incremental_cursor;
+                "DROP TABLE compaction_operation_objects;
+                 DROP TABLE compaction_operations;
+                 DROP TABLE compaction_restore_markers;
+                 DROP TABLE compaction_suppression_conflicts;
+                 DROP TABLE compaction_archive_suppressions;
+                 DROP TABLE compaction_suppression_facts;
+                 DROP TABLE compaction_deletion_members;
+                 DROP TABLE compaction_archive_members;
+                 DROP TABLE compaction_archive_roots;
+                 DROP TABLE compaction_archives;
+                 ALTER TABLE source_refresh_state DROP COLUMN incremental_cursor;
                  PRAGMA user_version = 1003;",
             )
             .unwrap();
@@ -17238,7 +17329,7 @@ mod catalog_tests {
         drop(store);
         let migrated = Store::open(&path).unwrap();
         let after = migration_snapshot(&migrated.conn);
-        assert_eq!(after.user_version, 1004);
+        assert_eq!(after.user_version, 1005);
         assert_migration_content_unchanged(&before, &after);
         let sql: String = migrated
             .conn
@@ -17260,7 +17351,19 @@ mod catalog_tests {
         seed_migration_search_rows(&store);
         store
             .conn
-            .execute_batch("PRAGMA user_version = 1003;")
+            .execute_batch(
+                "DROP TABLE compaction_operation_objects;
+                 DROP TABLE compaction_operations;
+                 DROP TABLE compaction_restore_markers;
+                 DROP TABLE compaction_suppression_conflicts;
+                 DROP TABLE compaction_archive_suppressions;
+                 DROP TABLE compaction_suppression_facts;
+                 DROP TABLE compaction_deletion_members;
+                 DROP TABLE compaction_archive_members;
+                 DROP TABLE compaction_archive_roots;
+                 DROP TABLE compaction_archives;
+                 PRAGMA user_version = 1003;",
+            )
             .unwrap();
         let before = migration_snapshot(&store.conn);
         assert_eq!(before.user_version, 1003);
@@ -17286,8 +17389,68 @@ mod catalog_tests {
     }
 
     #[test]
+    fn schema_v1005_mid_ddl_failure_is_exactly_atomic_and_retryable() {
+        let temp = tempdir();
+        let path = temp.path().join("v1004-seeded.sqlite");
+        let store = Store::open(&path).unwrap();
+        seed_migration_search_rows(&store);
+        store
+            .conn
+            .execute_batch(
+                "DROP TABLE compaction_operation_objects;
+             DROP TABLE compaction_operations;
+             DROP TABLE compaction_restore_markers;
+             DROP TABLE compaction_suppression_conflicts;
+             DROP TABLE compaction_archive_suppressions;
+             DROP TABLE compaction_suppression_facts;
+             DROP TABLE compaction_deletion_members;
+             DROP TABLE compaction_archive_members;
+             DROP TABLE compaction_archive_roots;
+             DROP TABLE compaction_archives;
+             PRAGMA user_version=1004;",
+            )
+            .unwrap();
+        let before = migration_snapshot(&store.conn);
+        assert_eq!(before.user_version, 1004);
+        assert!(!before.history_records.is_empty());
+        assert!(!before.events.is_empty());
+        assert!(!before.record_fts.is_empty());
+        assert!(!before.event_fts.is_empty());
+        assert!(!before.record_search_rowids.is_empty());
+        assert!(!before.event_search_rowids.is_empty());
+        drop(store);
+
+        assert!(matches!(
+            Store::open_read_only(&path),
+            Err(StoreError::UnsupportedSchemaVersion(1004))
+        ));
+        V1005_FAIL_AFTER_FIRST_DDL.with(|fail| fail.set(true));
+        assert!(Store::open(&path).is_err());
+        let conn = Connection::open(&path).unwrap();
+        let failed = migration_snapshot(&conn);
+        assert_eq!(failed, before);
+        let leaked: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name LIKE 'compaction_%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(leaked, 0);
+        drop(conn);
+
+        let migrated = Store::open(&path).unwrap();
+        let after = migration_snapshot(&migrated.conn);
+        assert_eq!(after.user_version, 1005);
+        assert_migration_content_unchanged(&before, &after);
+        drop(migrated);
+        assert!(Store::open_read_only(&path).is_ok());
+        assert!(Store::open(&path).is_ok());
+    }
+
+    #[test]
     fn writable_open_rejects_in_between_fork_schema_versions_without_mutation() {
-        for version in [16_i64, 999, 1005] {
+        for version in [16_i64, 999, 1006] {
             let temp = tempdir();
             let db = temp.path().join(format!("v{version}.sqlite"));
             let conn = Connection::open(&db).unwrap();
@@ -18991,6 +19154,16 @@ mod catalog_tests {
                 .execute_batch(
                     "DROP INDEX source_refresh_retry_idx;
                      DROP INDEX source_refresh_lease_idx;
+                     DROP TABLE compaction_operation_objects;
+                     DROP TABLE compaction_operations;
+                     DROP TABLE compaction_restore_markers;
+                     DROP TABLE compaction_suppression_conflicts;
+                     DROP TABLE compaction_archive_suppressions;
+                     DROP TABLE compaction_suppression_facts;
+                     DROP TABLE compaction_deletion_members;
+                     DROP TABLE compaction_archive_members;
+                     DROP TABLE compaction_archive_roots;
+                     DROP TABLE compaction_archives;
                      DROP TABLE source_refresh_state;
                      PRAGMA user_version = 14;",
                 )

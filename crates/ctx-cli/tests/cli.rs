@@ -30,7 +30,7 @@ fn archive_plan_cli_is_private_deterministic_and_does_not_mutate_data_root() {
     let second = json_output(ctx(&temp).args(["archive", "plan", "--cutoff-ms", "1000", "--json"]));
     assert_eq!(first, second);
     assert_eq!(first["private"], true);
-    assert_eq!(first["source_schema_version"], 1004);
+    assert_eq!(first["source_schema_version"], 1005);
     assert_eq!(first["selected_root_ids"], json!([]));
     let rendered = serde_json::to_string(&first).unwrap();
     for forbidden in [
@@ -51,7 +51,7 @@ fn archive_plan_unsupported_schema_fails_without_mutation() {
     let db = temp.path().join("work.sqlite");
     Connection::open(&db)
         .unwrap()
-        .pragma_update(None, "user_version", 1005)
+        .pragma_update(None, "user_version", 1006)
         .unwrap();
     warm_read_only(&db);
     let before = snapshot_tree(temp.path());
@@ -60,9 +60,65 @@ fn archive_plan_unsupported_schema_fails_without_mutation() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "unsupported history store schema version: 1005",
+            "unsupported history store schema version: 1006",
         ));
     assert_eq!(before, snapshot_tree(temp.path()));
+}
+
+#[test]
+fn archive_register_cli_suppresses_nonempty_reimport() {
+    let temp = tempdir();
+    let source = temp.path().join("source.jsonl");
+    let moved = temp.path().join("moved.jsonl");
+    let bundle = temp.path().join("selected.ctxar");
+    let content = [
+        r#"{"record_type":"manifest","schema_version":"ctx-history-jsonl-v1"}"#,
+        r#"{"record_type":"source","source_id":"source","provider_key":"agent","source_format":"agent-jsonl","observed_at":"2026-01-02T00:00:00Z","machine_id":"machine-a","cursor":{"after":{"stream":"agent:source","cursor":"5","observed_at":"2026-01-02T00:00:00Z"}}}"#,
+        r#"{"record_type":"session","source_id":"source","session_id":"session","native_session_id":"native-session","started_at":"2026-01-01T00:00:00Z","ended_at":"2026-01-01T00:01:00Z","agent_type":"primary","is_primary":true,"status":"completed"}"#,
+        r#"{"record_type":"event","source_id":"source","session_id":"session","event_index":0,"event_type":"message","role":"user","occurred_at":"2026-01-01T00:00:01Z","payload":{"text":"archived transcript"}}"#,
+    ].join("\n");
+    fs::write(&source, &content).unwrap();
+    let import = |path: &Path| {
+        json_output(ctx(&temp).args([
+            "import",
+            "--format",
+            "ctx-history-jsonl-v1",
+            "--path",
+            path.to_str().unwrap(),
+            "--json",
+            "--progress",
+            "none",
+        ]))
+    };
+    let first = import(&source);
+    assert_eq!(first["totals"]["imported_events"], 1, "{first}");
+    json_output(ctx(&temp).args([
+        "archive",
+        "create",
+        bundle.to_str().unwrap(),
+        "--cutoff-ms",
+        "1767398400000",
+        "--json",
+    ]));
+    let registration =
+        json_output(ctx(&temp).args(["archive", "register", bundle.to_str().unwrap(), "--json"]));
+    assert_eq!(registration["suppression_count"], 1, "{registration}");
+    fs::write(
+        &moved,
+        content
+            .replace("machine-a", "machine-b")
+            .replace("\"cursor\":\"5\"", "\"cursor\":\"6\""),
+    )
+    .unwrap();
+    let second = import(&moved);
+    assert_eq!(second["sources"][0]["suppressed"], 1, "{second}");
+    assert_eq!(second["sources"][0]["suppression_conflicts"], 0, "{second}");
+    let conn = Connection::open(temp.path().join("work.sqlite")).unwrap();
+    let cursor: String = conn
+        .query_row("SELECT cursor FROM sync_cursors", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(cursor, "5");
+    assert_eq!(sqlite_count(&conn, "SELECT count(*) FROM source_health"), 2);
 }
 
 fn warm_read_only(path: &Path) {
@@ -4500,10 +4556,10 @@ fn read_only_commands_direct_old_schemas_to_a_writable_migration() {
 
 #[test]
 fn read_only_commands_reject_foreign_schemas_without_impossible_migration_advice() {
-    // 16 sits in the unreviewed upstream gap; 1005 is newer than this
+    // 16 sits in the unreviewed upstream gap; 1006 is newer than this
     // binary. Neither can be migrated by it, so the guidance must say
     // upgrade/restore rather than suggesting a migration command.
-    for version in [16i64, 1005] {
+    for version in [16i64, 1006] {
         let temp = tempdir();
         let db_path = write_bare_store_with_user_version(&temp, version);
         let before = fs::read(&db_path).unwrap();
@@ -4537,7 +4593,7 @@ fn read_only_commands_reject_foreign_schemas_without_impossible_migration_advice
 #[test]
 fn mcp_status_reports_version_guidance_for_foreign_schema() {
     let temp = tempdir();
-    write_bare_store_with_user_version(&temp, 1005);
+    write_bare_store_with_user_version(&temp, 1006);
     let responses = mcp_roundtrip(
         &temp,
         &[
@@ -4569,7 +4625,7 @@ fn mcp_status_reports_version_guidance_for_foreign_schema() {
     assert_eq!(result["isError"], true);
     let error = result["structuredContent"]["error"].as_str().unwrap();
     assert!(
-        error.contains("schema version 1005 is newer than or incompatible with this ctx binary"),
+        error.contains("schema version 1006 is newer than or incompatible with this ctx binary"),
         "{error}"
     );
     assert!(error.contains("upgrade ctx"), "{error}");
@@ -4578,7 +4634,7 @@ fn mcp_status_reports_version_guidance_for_foreign_schema() {
 
 #[test]
 fn mcp_non_status_tools_report_version_guidance_without_mutating() {
-    for version in [15i64, 16, 1005] {
+    for version in [15i64, 16, 1006] {
         let temp = tempdir();
         let db_path = write_bare_store_with_user_version(&temp, version);
         let bytes_before = fs::read(&db_path).unwrap();
@@ -7719,6 +7775,86 @@ fn search_refresh_crash_releases_process_lock_and_fences_reclaimed_lease() {
         1,
         "only the reclaimed owner may leave imported canonical state"
     );
+}
+
+#[test]
+fn opencode_refresh_transaction_faults_converge_all_durable_state() {
+    for phase in ["after_import", "after_lease", "health_failure"] {
+        let temp = tempdir();
+        let query = format!("opencode-refresh-atomic-{phase}");
+        let source = PathBuf::from(write_native_opencode_fixture(&temp, &query));
+        let discovered = temp.path().join(".local/share/opencode/opencode.db");
+        fs::create_dir_all(discovered.parent().unwrap()).unwrap();
+        fs::copy(source, &discovered).unwrap();
+
+        let stderr = failure_stderr(ctx(&temp).env("CTX_TEST_REFRESH_TX_FAULT", phase).args([
+            "search",
+            &query,
+            "--provider",
+            "opencode",
+            "--refresh",
+            "strict",
+            "--json",
+        ]));
+        assert!(
+            stderr.contains("injected refresh transaction fault"),
+            "{phase}: {stderr}"
+        );
+        let conn = Connection::open(temp.path().join("work.sqlite")).unwrap();
+        for table in [
+            "history_records",
+            "sessions",
+            "events",
+            "ctx_history_search",
+            "event_search",
+            "record_search_rowids",
+            "event_search_rowids",
+            "source_health",
+        ] {
+            assert_eq!(
+                sqlite_count(&conn, &format!("SELECT count(*) FROM {table}")),
+                0,
+                "{phase}: {table}"
+            );
+        }
+        assert_eq!(
+            sqlite_count(&conn, "SELECT count(*) FROM compaction_suppression_facts"),
+            0
+        );
+        let interrupted: (i64, Option<String>, i64) = conn.query_row(
+            "SELECT lease_token IS NOT NULL, incremental_cursor, successful_signature IS NULL FROM source_refresh_state",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(interrupted, (1, None, 1), "{phase}");
+        drop(conn);
+
+        let result = json_output(ctx(&temp).args([
+            "search",
+            &query,
+            "--provider",
+            "opencode",
+            "--refresh",
+            "strict",
+            "--json",
+        ]));
+        assert!(
+            !result["results"].as_array().unwrap().is_empty(),
+            "{phase}: {result}"
+        );
+        let conn = Connection::open(temp.path().join("work.sqlite")).unwrap();
+        assert!(sqlite_count(&conn, "SELECT count(*) FROM sessions") > 0);
+        assert!(sqlite_count(&conn, "SELECT count(*) FROM events") > 0);
+        assert!(sqlite_count(&conn, "SELECT count(*) FROM event_search") > 0);
+        assert!(sqlite_count(&conn, "SELECT count(*) FROM event_search_rowids") > 0);
+        assert_eq!(sqlite_count(&conn, "SELECT count(*) FROM source_health"), 1);
+        let converged: (i64, i64, i64) = conn.query_row(
+            "SELECT lease_token IS NULL, incremental_cursor IS NOT NULL, successful_signature IS NOT NULL FROM source_refresh_state",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(converged, (1, 0, 1), "{phase}");
+    }
 }
 
 #[test]

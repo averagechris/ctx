@@ -222,7 +222,19 @@ Schema v1004 adds only a nullable, 4096-byte-bounded `incremental_cursor` to
 that table. The atomic migration performs no backfill and does not read or
 modify content, FTS projections, or rowid maps.
 
-Read-only commands require exactly v1004 and direct older stores to run one
+Schema v1005 adds the path-free selective-archive and reimport-suppression
+ledger. It performs no backfill and does not read or modify canonical content,
+FTS projections, or either durable rowid map. Ledger identities contain no
+source paths or local observation metadata.
+
+Selective restore remains deferred to #286. That implementation must call
+`record_restore_suppression_marker` in the same transaction as its canonical
+rows, FTS projections, rowid maps, and restore verification, then call
+`handoff_restored_suppression`. The latter is an idempotent recovery step: it
+requires the committed marker and atomically commits the audited operation and
+derived suppression transition. Repeating an identical handoff succeeds.
+
+Read-only commands require exactly v1005 and direct older stores to run one
 writable command first.
 
 Downgrading a fork-versioned store back to an older ctx binary is
@@ -238,6 +250,19 @@ v1000):
 cp ~/.ctx/work.sqlite ~/.ctx/work.sqlite.bak
 sqlite3 ~/.ctx/work.sqlite <<'SQL'
 BEGIN IMMEDIATE;
+DROP TABLE IF EXISTS compaction_operation_objects;
+DROP TABLE IF EXISTS compaction_operations;
+DROP TABLE IF EXISTS compaction_restore_markers;
+DROP TABLE IF EXISTS compaction_suppression_conflicts;
+DROP TABLE IF EXISTS compaction_archive_suppressions;
+DROP TABLE IF EXISTS compaction_suppression_facts;
+DROP TABLE IF EXISTS compaction_deletion_members;
+DROP TABLE IF EXISTS compaction_archive_members;
+DROP TABLE IF EXISTS compaction_archive_roots;
+DROP TABLE IF EXISTS compaction_archives;
+DROP INDEX IF EXISTS source_refresh_retry_idx;
+DROP INDEX IF EXISTS source_refresh_lease_idx;
+DROP TABLE IF EXISTS source_refresh_state;
 DROP INDEX IF EXISTS idx_sessions_provider_external_session_started;
 DROP INDEX IF EXISTS idx_events_session_seq_id;
 PRAGMA user_version = 1000;

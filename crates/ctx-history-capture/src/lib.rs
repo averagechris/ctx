@@ -12,17 +12,18 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use ctx_history_core::{
-    inbox_dir as core_inbox_dir, new_id, utc_now, AgentType, CaptureEnvelope, CaptureProvider,
-    CaptureSource, CaptureSourceDescriptor, CaptureSourceKind, Confidence,
-    CtxHistoryJsonlEdgeRecord, CtxHistoryJsonlEventRecord, CtxHistoryJsonlFileTouchRecord,
-    CtxHistoryJsonlRecord, CtxHistoryJsonlSessionRecord, CtxHistoryJsonlSourceRecord,
-    EntityTimestamps, Event, EventRole, EventType, Fidelity, FileChangeKind, FileTouched,
-    HistoryRecord, ProviderCaptureEnvelope, ProviderCursorCheckpoint, ProviderCursorRange,
-    ProviderEventEnvelope, ProviderRawRetention, ProviderRedactionBoundary,
-    ProviderSessionEnvelope, ProviderSourceEnvelope, ProviderSourceTrust, RedactionState, Run,
-    RunStatus, RunType, Session, SessionEdge, SessionEdgeType, SessionHistoryArchive,
-    SessionStatus, SyncCursor, SyncMetadata, SyncState, Visibility,
-    CTX_HISTORY_JSONL_V1_SCHEMA_VERSION, PROVIDER_CAPTURE_ENVELOPE_SCHEMA_VERSION,
+    inbox_dir as core_inbox_dir, new_id, normalize_provider_artifacts, utc_now, AgentType,
+    CaptureEnvelope, CaptureProvider, CaptureSource, CaptureSourceDescriptor, CaptureSourceKind,
+    Confidence, CtxHistoryJsonlEdgeRecord, CtxHistoryJsonlEventRecord,
+    CtxHistoryJsonlFileTouchRecord, CtxHistoryJsonlRecord, CtxHistoryJsonlSessionRecord,
+    CtxHistoryJsonlSourceRecord, EntityTimestamps, Event, EventRole, EventType, Fidelity,
+    FileChangeKind, FileTouched, HistoryRecord, ProviderArtifactDescriptor,
+    ProviderCaptureEnvelope, ProviderCursorCheckpoint, ProviderCursorRange, ProviderEventEnvelope,
+    ProviderRawRetention, ProviderRedactionBoundary, ProviderSessionEnvelope,
+    ProviderSourceEnvelope, ProviderSourceTrust, RedactionState, Run, RunStatus, RunType, Session,
+    SessionEdge, SessionEdgeType, SessionHistoryArchive, SessionStatus, SyncCursor, SyncMetadata,
+    SyncState, Visibility, CTX_HISTORY_JSONL_V1_SCHEMA_VERSION,
+    PROVIDER_CAPTURE_ENVELOPE_SCHEMA_VERSION,
 };
 use ctx_history_store::{CatalogSession, Store, StoreError};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
@@ -296,6 +297,16 @@ pub struct ProviderImportSummary {
     pub imported: usize,
     pub skipped: usize,
     pub failed: usize,
+    #[serde(default)]
+    pub suppressed: usize,
+    #[serde(default)]
+    pub suppression_conflicts: usize,
+    #[serde(default)]
+    pub unsuppressible: usize,
+    #[serde(skip)]
+    pub blocked_session_ids: BTreeSet<Uuid>,
+    #[serde(skip)]
+    pub blocked_suppression_identities: Vec<ctx_history_store::SuppressionIdentity>,
     pub redacted: usize,
     pub imported_sessions: usize,
     pub skipped_sessions: usize,
@@ -517,6 +528,10 @@ pub struct OpenCodeSqliteImportOptions {
     pub imported_at: DateTime<Utc>,
     pub history_record_id: Option<Uuid>,
     pub allow_partial_failures: bool,
+    /// Whether this importer owns the canonical write transaction. Automatic
+    /// refresh sets this false so import, lease completion, cursor and health
+    /// commit as one Store transaction.
+    pub wrap_transaction: bool,
 }
 
 impl Default for OpenCodeSqliteImportOptions {
@@ -527,6 +542,7 @@ impl Default for OpenCodeSqliteImportOptions {
             imported_at: utc_now(),
             history_record_id: None,
             allow_partial_failures: false,
+            wrap_transaction: true,
         }
     }
 }
@@ -836,6 +852,8 @@ pub struct ProviderSessionDto {
     pub cwd: Option<String>,
     #[serde(default = "default_metadata")]
     pub metadata: Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<ProviderArtifactDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -854,6 +872,8 @@ pub struct ProviderEventDto {
     pub payload: Value,
     #[serde(default = "default_metadata")]
     pub metadata: Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<ProviderArtifactDescriptor>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1853,6 +1873,12 @@ impl ProviderImportSummary {
         self.imported += other.imported;
         self.skipped += other.skipped;
         self.failed += other.failed;
+        self.suppressed += other.suppressed;
+        self.suppression_conflicts += other.suppression_conflicts;
+        self.unsuppressible += other.unsuppressible;
+        self.blocked_session_ids.extend(other.blocked_session_ids);
+        self.blocked_suppression_identities
+            .extend(other.blocked_suppression_identities);
         self.redacted += other.redacted;
         self.imported_sessions += other.imported_sessions;
         self.skipped_sessions += other.skipped_sessions;
@@ -2077,30 +2103,49 @@ pub fn import_custom_history_jsonl_v1(
         .summary
         .timing
         .record_normalization(normalization_started);
+    attach_custom_suppression_edges(&mut normalization.provider, &normalization.edges);
     if normalization.provider.summary.failed > 0 && !options.allow_partial_failures {
         return Ok(normalization.provider.summary);
     }
 
-    let mut summary = import_normalized_provider_captures(
-        store,
-        normalization.provider,
-        NormalizedProviderImportOptions {
-            history_record_id: options.history_record_id,
-            allow_partial_failures: options.allow_partial_failures,
-            persist_cursors: true,
-            wrap_transaction: true,
-            fast_event_inserts: true,
-        },
-    )?;
-    import_custom_history_edges(
-        store,
-        &normalization.edges,
-        options.history_record_id,
-        options.allow_partial_failures,
-        &mut summary,
-    )?;
-    import_custom_history_source_cursors(store, &normalization.source_cursors)?;
-    Ok(summary)
+    store.begin_immediate_batch()?;
+    let result = (|| -> Result<ProviderImportSummary> {
+        let mut summary = import_normalized_provider_captures(
+            store,
+            normalization.provider,
+            NormalizedProviderImportOptions {
+                history_record_id: options.history_record_id,
+                allow_partial_failures: options.allow_partial_failures,
+                persist_cursors: true,
+                wrap_transaction: false,
+                fast_event_inserts: true,
+            },
+        )?;
+        let blocked = summary.blocked_session_ids.clone();
+        import_custom_history_edges(
+            store,
+            &normalization.edges,
+            options.history_record_id,
+            options.allow_partial_failures,
+            &mut summary,
+            false,
+            &blocked,
+        )?;
+        if summary.suppressed == 0 && summary.suppression_conflicts == 0 {
+            import_custom_history_source_cursors(store, &normalization.source_cursors)?;
+        }
+        Ok(summary)
+    })();
+    match result {
+        Ok(summary) => {
+            store.commit_batch()?;
+            Ok(summary)
+        }
+        Err(error) => {
+            let _ = store.rollback_batch();
+            Err(error)
+        }
+    }
 }
 
 pub fn import_custom_history_jsonl_v1_reader(
@@ -2125,30 +2170,49 @@ pub fn import_custom_history_jsonl_v1_reader(
         .summary
         .timing
         .record_normalization(normalization_started);
+    attach_custom_suppression_edges(&mut normalization.provider, &normalization.edges);
     if normalization.provider.summary.failed > 0 && !options.allow_partial_failures {
         return Ok(normalization.provider.summary);
     }
 
-    let mut summary = import_normalized_provider_captures(
-        store,
-        normalization.provider,
-        NormalizedProviderImportOptions {
-            history_record_id: options.history_record_id,
-            allow_partial_failures: options.allow_partial_failures,
-            persist_cursors: true,
-            wrap_transaction: true,
-            fast_event_inserts: true,
-        },
-    )?;
-    import_custom_history_edges(
-        store,
-        &normalization.edges,
-        options.history_record_id,
-        options.allow_partial_failures,
-        &mut summary,
-    )?;
-    import_custom_history_source_cursors(store, &normalization.source_cursors)?;
-    Ok(summary)
+    store.begin_immediate_batch()?;
+    let result = (|| -> Result<ProviderImportSummary> {
+        let mut summary = import_normalized_provider_captures(
+            store,
+            normalization.provider,
+            NormalizedProviderImportOptions {
+                history_record_id: options.history_record_id,
+                allow_partial_failures: options.allow_partial_failures,
+                persist_cursors: true,
+                wrap_transaction: false,
+                fast_event_inserts: true,
+            },
+        )?;
+        let blocked = summary.blocked_session_ids.clone();
+        import_custom_history_edges(
+            store,
+            &normalization.edges,
+            options.history_record_id,
+            options.allow_partial_failures,
+            &mut summary,
+            false,
+            &blocked,
+        )?;
+        if summary.suppressed == 0 && summary.suppression_conflicts == 0 {
+            import_custom_history_source_cursors(store, &normalization.source_cursors)?;
+        }
+        Ok(summary)
+    })();
+    match result {
+        Ok(summary) => {
+            store.commit_batch()?;
+            Ok(summary)
+        }
+        Err(error) => {
+            let _ = store.rollback_batch();
+            Err(error)
+        }
+    }
 }
 
 pub fn validate_custom_history_jsonl_v1(path: impl AsRef<Path>) -> Result<ProviderImportSummary> {
@@ -2213,7 +2277,7 @@ pub fn import_codex_session_jsonl(
     options: CodexSessionImportOptions,
 ) -> Result<ProviderImportSummary> {
     let path = path.as_ref();
-    if options.fast_event_inserts {
+    if options.fast_event_inserts && !store.suppression_guard_required()? {
         return import_codex_session_paths_fast(vec![path.to_path_buf()], store, options, 0);
     }
     let source_path = options
@@ -2253,6 +2317,11 @@ pub fn import_codex_session_jsonl_tail(
     options: CodexSessionImportOptions,
 ) -> Result<ProviderImportSummary> {
     let path = path.as_ref();
+    if store.suppression_guard_required()? {
+        // A tail does not contain the complete session write set. Re-read the
+        // bounded transcript so the v2 digest cannot miss an archived prefix.
+        return import_codex_session_jsonl(path, store, options);
+    }
     if start_offset == 0 {
         return import_codex_session_jsonl(path, store, options);
     }
@@ -2452,7 +2521,7 @@ pub fn import_codex_session_paths(
     for path in &paths {
         ensure_regular_provider_transcript_file(path)?;
     }
-    if options.fast_event_inserts && paths.len() <= 1 {
+    if options.fast_event_inserts && paths.len() <= 1 && !store.suppression_guard_required()? {
         return import_codex_session_paths_fast(paths, store, options, 0);
     }
 
@@ -2472,7 +2541,7 @@ pub fn import_codex_session_tree(
         options.max_session_files,
         options.max_total_bytes,
     )?;
-    if options.fast_event_inserts && paths.len() <= 1 {
+    if options.fast_event_inserts && paths.len() <= 1 && !store.suppression_guard_required()? {
         return import_codex_session_paths_fast(paths, store, options, skipped_by_bounds);
     }
 
@@ -3642,11 +3711,13 @@ pub fn import_opencode_sqlite_incremental(
             history_record_id: options.history_record_id,
             allow_partial_failures: options.allow_partial_failures,
             persist_cursors: true,
-            wrap_transaction: true,
+            wrap_transaction: options.wrap_transaction,
             fast_event_inserts: true,
         },
     )?;
-    if summary.failed > 0 || !summary.failures.is_empty() {
+    if summary.failed > summary.suppression_conflicts
+        || summary.failures.len() > summary.suppression_conflicts
+    {
         return Err(CaptureError::InvalidPayload(
             "OpenCode import was partial; incremental cursor was not advanced".into(),
         ));
@@ -3663,8 +3734,12 @@ pub fn import_opencode_sqlite_incremental(
     }
     let scanned = plan.as_ref().map_or((0, 0, 0, 0), |value| value.scanned);
     Ok(OpenCodeIncrementalImportResult {
+        cursor_json: if summary.suppressed == 0 && summary.suppression_conflicts == 0 {
+            Some(serde_json::to_string(&next)?)
+        } else {
+            None
+        },
         summary,
-        cursor_json: Some(serde_json::to_string(&next)?),
         mode: if incremental {
             OpenCodeRefreshScanMode::Incremental
         } else {
@@ -4222,7 +4297,7 @@ fn import_opencode_sqlite_inner(
             history_record_id: options.history_record_id,
             allow_partial_failures: options.allow_partial_failures,
             persist_cursors: true,
-            wrap_transaction: true,
+            wrap_transaction: options.wrap_transaction,
             fast_event_inserts: true,
         },
     )
@@ -5363,12 +5438,16 @@ fn import_custom_history_edges(
     history_record_id: Option<Uuid>,
     allow_partial_failures: bool,
     summary: &mut ProviderImportSummary,
+    wrap_transaction: bool,
+    blocked_sessions: &BTreeSet<Uuid>,
 ) -> Result<()> {
     if edges.is_empty() {
         return Ok(());
     }
 
-    store.begin_immediate_batch()?;
+    if wrap_transaction {
+        store.begin_immediate_batch()?;
+    }
     for (line_number, edge) in edges {
         let edge_id = if edge.edge_type == SessionEdgeType::ParentChild {
             provider_edge_uuid(
@@ -5393,6 +5472,12 @@ fn import_custom_history_edges(
             provider_session_uuid(CaptureProvider::Custom, &edge.from_provider_session_id);
         let to_session_id =
             provider_session_uuid(CaptureProvider::Custom, &edge.to_provider_session_id);
+        if blocked_sessions.contains(&from_session_id) || blocked_sessions.contains(&to_session_id)
+        {
+            summary.skipped_edges += 1;
+            summary.skipped += 1;
+            continue;
+        }
         let source_id = provider_source_uuid(CaptureProvider::Custom, &edge.to_provider_session_id);
         let mut exists_cache = BTreeMap::<Uuid, bool>::new();
         if !provider_session_exists_cached(store, from_session_id, &mut exists_cache)?
@@ -5404,7 +5489,9 @@ fn import_custom_history_edges(
                 "edge endpoint session was not imported".to_owned(),
             );
             if !allow_partial_failures {
-                let _ = store.rollback_batch();
+                if wrap_transaction {
+                    let _ = store.rollback_batch();
+                }
                 return Ok(());
             }
             continue;
@@ -5445,11 +5532,54 @@ fn import_custom_history_edges(
             summary.imported += 1;
         }
     }
-    if let Err(err) = store.commit_batch() {
-        let _ = store.rollback_batch();
-        return Err(err.into());
+    if wrap_transaction {
+        if let Err(err) = store.commit_batch() {
+            let _ = store.rollback_batch();
+            return Err(err.into());
+        }
     }
     Ok(())
+}
+
+fn attach_custom_suppression_edges(
+    normalization: &mut ProviderNormalizationResult,
+    edges: &[(usize, CustomHistoryJsonlV1EdgeImport)],
+) {
+    for (_, capture) in &mut normalization.captures {
+        let session_id = &capture.session.provider_session_id;
+        let mut relevant = edges
+            .iter()
+            .filter(|(_, edge)| {
+                edge.from_provider_session_id == *session_id
+                    || edge.to_provider_session_id == *session_id
+            })
+            .map(|(_, edge)| {
+                json!({
+                    "confidence": edge.confidence,
+                    "edge_id": edge.edge_id,
+                    "edge_type": edge.edge_type,
+                    "fidelity": edge.fidelity,
+                    "from_provider_session_id": edge.from_provider_session_id,
+                    "metadata": edge.metadata,
+                    "occurred_at_ms": edge.occurred_at.timestamp_millis(),
+                    "to_provider_session_id": edge.to_provider_session_id,
+                })
+            })
+            .collect::<Vec<_>>();
+        relevant.sort_by_key(Value::to_string);
+        if relevant.is_empty() {
+            continue;
+        }
+        if !capture.session.metadata.is_object() {
+            capture.session.metadata = json!({"value": capture.session.metadata});
+        }
+        capture
+            .session
+            .metadata
+            .as_object_mut()
+            .expect("metadata was normalized to an object")
+            .insert("ctx_suppression_edges_v2".into(), Value::Array(relevant));
+    }
 }
 
 fn import_custom_history_source_cursors(
@@ -11325,16 +11455,14 @@ fn import_provider_capture_lines(
     captures: Vec<(usize, ProviderCaptureEnvelope)>,
     mut files_touched: Vec<(usize, ProviderFileTouchedEnvelope)>,
 ) -> Result<ProviderImportSummary> {
-    let mut caches = ProviderImportCaches::default();
     let supplied_file_touch_lines = files_touched
         .iter()
         .map(|(line_number, _)| *line_number)
         .collect::<BTreeSet<_>>();
     for (line_number, capture) in &captures {
-        if capture.provider == CaptureProvider::Codex {
-            continue;
-        }
-        if supplied_file_touch_lines.contains(line_number) {
+        if capture.provider == CaptureProvider::Codex
+            || supplied_file_touch_lines.contains(line_number)
+        {
             continue;
         }
         if let Some(event) = &capture.event {
@@ -11347,15 +11475,99 @@ fn import_provider_capture_lines(
             ));
         }
     }
-    let has_captures = !captures.is_empty() || !files_touched.is_empty();
-
+    // All normalized native adapters, custom manifests, and plugin output
+    // converge here. The guard and every resulting canonical/cursor write use
+    // one IMMEDIATE transaction, so a crash cannot separate a conflict fact
+    // from the write set it blocked.
+    let has_input = !captures.is_empty() || !files_touched.is_empty();
+    if has_input && options.wrap_transaction {
+        store.begin_immediate_batch()?;
+    }
+    let mut blocked_sessions = BTreeSet::new();
+    let mut decided_sessions = BTreeSet::new();
+    for (_, capture) in &captures {
+        let external_id = capture.session.provider_session_id.trim();
+        if external_id.is_empty() {
+            summary.unsuppressible += 1;
+            continue;
+        }
+        let session_id = provider_session_uuid(capture.provider, external_id);
+        if !decided_sessions.insert(session_id) {
+            continue;
+        }
+        let session_captures = captures
+            .iter()
+            .filter(|(_, candidate)| {
+                candidate.provider == capture.provider
+                    && candidate.session.provider_session_id == external_id
+            })
+            .map(|(_, candidate)| candidate)
+            .collect::<Vec<_>>();
+        let session_files = files_touched
+            .iter()
+            .filter(|(_, file)| {
+                file.provider == capture.provider && file.provider_session_id == external_id
+            })
+            .map(|(_, file)| file)
+            .collect::<Vec<_>>();
+        let key = normalized_suppression_identity(capture, &session_captures, &session_files)?;
+        match store.guard_import(&key)? {
+            ctx_history_store::SuppressionDecision::Suppress => {
+                summary.blocked_suppression_identities.push(key.clone());
+                blocked_sessions.insert(session_id);
+                summary.suppressed += 1;
+                summary.skipped += 1;
+                summary.skipped_sessions += 1;
+            }
+            ctx_history_store::SuppressionDecision::Conflict => {
+                summary.blocked_suppression_identities.push(key.clone());
+                blocked_sessions.insert(session_id);
+                summary.suppression_conflicts += 1;
+                summary.failed += 1;
+                summary.failures.push(ProviderImportFailure {
+                    line: 0,
+                    error: "suppression_content_conflict".into(),
+                });
+            }
+            ctx_history_store::SuppressionDecision::Allow
+            | ctx_history_store::SuppressionDecision::AllowAudited => {}
+        }
+    }
+    let any_blocked = !blocked_sessions.is_empty();
+    summary
+        .blocked_session_ids
+        .extend(blocked_sessions.iter().copied());
+    let captures = captures
+        .into_iter()
+        .filter(|(_, capture)| {
+            !blocked_sessions.contains(&provider_session_uuid(
+                capture.provider,
+                &capture.session.provider_session_id,
+            ))
+        })
+        .collect::<Vec<_>>();
+    files_touched.retain(|(_, file)| {
+        !blocked_sessions.contains(&provider_session_uuid(
+            file.provider,
+            &file.provider_session_id,
+        ))
+    });
+    let mut options = options;
+    // A stream cursor is a high-water mark. Advancing it when any session was
+    // blocked could make a later explicit override unreachable.
+    if any_blocked {
+        options.persist_cursors = false;
+    }
+    let mut caches = ProviderImportCaches::default();
     if summary.failed > 0 && !options.allow_partial_failures {
+        if has_input && options.wrap_transaction {
+            // Keep the bounded conflict fact durable; no canonical writes have
+            // occurred yet.
+            store.commit_batch()?;
+        }
         return Ok(summary);
     }
 
-    if has_captures && options.wrap_transaction {
-        store.begin_immediate_batch()?;
-    }
     for (line_number, capture) in captures {
         match import_provider_capture_line(store, &capture, &options, line_number, &mut caches) {
             Ok(line_summary) => summary.merge(line_summary),
@@ -11369,7 +11581,7 @@ fn import_provider_capture_lines(
         }
     }
     if let Err(err) = resolve_pending_provider_edges(store, &mut summary, &mut caches) {
-        if has_captures && options.wrap_transaction {
+        if has_input && options.wrap_transaction {
             let _ = store.rollback_batch();
         }
         return Err(err);
@@ -11384,12 +11596,12 @@ fn import_provider_capture_lines(
         }
     }
     if summary.failed > 0 && !options.allow_partial_failures {
-        if has_captures && options.wrap_transaction {
+        if has_input && options.wrap_transaction {
             let _ = store.rollback_batch();
         }
         return Ok(summary);
     }
-    if has_captures && options.wrap_transaction {
+    if has_input && options.wrap_transaction {
         if let Err(err) = store.commit_batch() {
             let _ = store.rollback_batch();
             return Err(err.into());
@@ -11397,6 +11609,148 @@ fn import_provider_capture_lines(
     }
 
     Ok(summary)
+}
+
+fn normalized_suppression_identity(
+    capture: &ProviderCaptureEnvelope,
+    captures: &[&ProviderCaptureEnvelope],
+    files: &[&ProviderFileTouchedEnvelope],
+) -> Result<ctx_history_store::SuppressionIdentity> {
+    let session = &capture.session;
+    let source = &capture.source;
+    let (source_metadata, _) = sanitize_value(source.metadata.clone());
+    let source_metadata = ctx_history_store::suppression_metadata(source_metadata);
+    let (mut session_metadata, _) = sanitize_value(session.metadata.clone());
+    session_metadata = ctx_history_store::suppression_metadata(session_metadata);
+    let custom_edges = session_metadata
+        .as_object_mut()
+        .and_then(|metadata| metadata.remove("ctx_suppression_edges_v2"))
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    let artifacts = normalized_suppression_artifacts(&session.artifacts)?;
+    let mut writes = vec![
+        ctx_history_store::SuppressionWrite {
+            kind: "capture_source",
+            key: session.provider_session_id.clone(),
+            value: json!({
+                "fidelity": source.fidelity,
+                "raw_retention": source.raw_retention,
+                "redaction_boundary": source.redaction_boundary,
+                "source_format": source.source_format,
+                "source_metadata": source_metadata,
+                "source_trust": source.trust,
+            }),
+        },
+        ctx_history_store::SuppressionWrite {
+            kind: "session_payload",
+            key: session.provider_session_id.clone(),
+            value: json!({
+                "artifacts": artifacts,
+                "fidelity": session.fidelity,
+                "metadata": session_metadata,
+                "parent_provider_session_id": session.parent_provider_session_id,
+                "root_provider_session_id": session.root_provider_session_id,
+            }),
+        },
+    ];
+    if session.parent_provider_session_id.is_some() {
+        writes.push(ctx_history_store::SuppressionWrite {
+            kind: "session_edge",
+            key: "parent_child".into(),
+            value: json!({
+                "from": session.parent_provider_session_id,
+                "to": session.provider_session_id,
+                "type": "parent_child",
+            }),
+        });
+    }
+    for edge in custom_edges {
+        let key = format!(
+            "{}:{}:{}",
+            edge.get("edge_type")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            edge.get("from_provider_session_id")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            edge.get("to_provider_session_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+        );
+        writes.push(ctx_history_store::SuppressionWrite {
+            kind: "session_edge",
+            key,
+            value: edge,
+        });
+    }
+    for candidate in captures {
+        let Some(event) = &candidate.event else {
+            continue;
+        };
+        let (payload, redacted_payload) = sanitize_value(event.payload.clone());
+        let (metadata, redacted_metadata) = sanitize_value(event.metadata.clone());
+        let metadata = ctx_history_store::suppression_metadata(metadata);
+        let event_hash = event
+            .provider_event_hash
+            .clone()
+            .unwrap_or(compute_payload_hash(&payload)?);
+        writes.push(ctx_history_store::SuppressionWrite {
+            kind: "event",
+            key: format!("{:020}", event.provider_event_index),
+            value: json!({
+                "artifacts": normalized_suppression_artifacts(&event.artifacts)?,
+                "event_type": event.event_type,
+                "fidelity": event.fidelity,
+                "metadata": metadata,
+                "occurred_at_ms": event.occurred_at.timestamp_millis(),
+                "payload": payload,
+                "provider_event_hash": event_hash,
+                "provider_event_index": event.provider_event_index,
+                "redaction_state": effective_event_redaction_state(event.redaction_state, redacted_payload || redacted_metadata),
+                "role": event.role,
+            }),
+        });
+    }
+    for file in files {
+        let (metadata, _) = sanitize_value(file.metadata.clone());
+        let metadata = ctx_history_store::suppression_metadata(metadata);
+        writes.push(ctx_history_store::SuppressionWrite {
+            kind: "file_touch",
+            key: format!("{:020}", file.provider_touch_index),
+            value: json!({
+                "change_kind": file.change_kind,
+                "confidence": file.confidence,
+                "line_count_delta": file.line_count_delta,
+                "metadata": metadata,
+                "occurred_at_ms": file.occurred_at.timestamp_millis(),
+                "old_path": file.old_path,
+                "path": file.path,
+                "provider_event_index": file.provider_event_index,
+                "provider_touch_index": file.provider_touch_index,
+            }),
+        });
+    }
+    Ok(
+        ctx_history_store::SuppressionIdentity::normalized_write_set(
+            ctx_history_store::ProviderSuppressionSession {
+                provider: capture.provider.as_str(),
+                source_format: &source.source_format,
+                external_id: &session.provider_session_id,
+                external_agent_id: session.external_agent_id.as_deref(),
+                agent_type: session.agent_type.as_str(),
+                role_hint: session.role_hint.as_deref(),
+                is_primary: session.is_primary,
+                status: session.status.as_str(),
+                started_at_ms: session.started_at.timestamp_millis(),
+                ended_at_ms: session.ended_at.map(|value| value.timestamp_millis()),
+            },
+            writes,
+        ),
+    )
+}
+
+fn normalized_suppression_artifacts<T: Serialize>(artifacts: &[T]) -> Result<Value> {
+    Ok(normalize_provider_artifacts(artifacts)?)
 }
 
 fn import_provider_file_touched_line(
@@ -11949,7 +12303,7 @@ fn fixture_line_to_capture(
                 fixture.provider.as_str(),
                 fixture.session.provider_session_id
             )),
-            artifacts: Vec::new(),
+            artifacts: fixture.session.artifacts.clone(),
             metadata: fixture.session.metadata.clone(),
         },
         event: fixture.event.as_ref().map(|event| ProviderEventEnvelope {
@@ -11967,7 +12321,7 @@ fn fixture_line_to_capture(
                 fixture.session.provider_session_id,
                 event.provider_event_index
             )),
-            artifacts: Vec::new(),
+            artifacts: event.artifacts.clone(),
             payload: event.payload.clone(),
             metadata: event.metadata.clone(),
         }),
@@ -13121,6 +13475,307 @@ mod tests {
         assert_eq!(from_session_id, parent_id.to_string());
         assert_eq!(to_session_id, child_id.to_string());
         assert_eq!(edge_type, "parent_child");
+    }
+
+    #[test]
+    fn verified_archive_suppresses_complete_nonempty_normalized_write_set() {
+        let temp = tempdir();
+        let db = temp.path().join("work.sqlite");
+        let fixture = temp.path().join("original.jsonl");
+        let moved = temp.path().join("moved.jsonl");
+        let archive = temp.path().join("session.ctxar");
+        let archive2 = temp.path().join("session-2.ctxar");
+        let line = |text: &str, index: u64, reorder_artifacts: bool, change_artifact: bool| {
+            let mut artifacts = vec![
+                serde_json::json!({
+                    "provider_artifact_id": "artifact-b",
+                    "kind": "markdown",
+                    "media_type": "text/markdown",
+                    "source_path": "/provider/old/export.md",
+                    "preview_text": "stable artifact",
+                    "metadata": {
+                        "path": "workspace/description.md",
+                        "labels": ["z", "a"],
+                        "nested": {"second": 2, "first": 1}
+                    }
+                }),
+                serde_json::json!({
+                    "provider_artifact_id": "artifact-a",
+                    "kind": "binary",
+                    "media_type": "application/octet-stream",
+                    "source_path": "/provider/old/image.bin",
+                    "preview_text": if change_artifact { "changed artifact" } else { "stable image" },
+                    "metadata": {"nested": {"first": 1, "second": 2}}
+                }),
+            ];
+            if reorder_artifacts {
+                artifacts.reverse();
+                for artifact in &mut artifacts {
+                    artifact["source_path"] = serde_json::Value::String(
+                        artifact["source_path"]
+                            .as_str()
+                            .unwrap()
+                            .replace("/old/", "/new/"),
+                    );
+                }
+            }
+            serde_json::json!({
+                "provider": "codex",
+                "session": {
+                    "provider_session_id": "archived-session",
+                    "agent_type": "primary",
+                    "is_primary": true,
+                    "status": "completed",
+                    "started_at": "2026-01-01T00:00:00Z",
+                    "ended_at": "2026-01-01T00:01:00Z",
+                    "artifacts": artifacts.clone(),
+                    "metadata": {"stable": true}
+                },
+                "event": {
+                    "provider_event_index": index,
+                    "event_type": "message",
+                    "role": if index == 0 { "user" } else { "assistant" },
+                    "occurred_at": format!("2026-01-01T00:00:0{}Z", index + 1),
+                    "artifacts": artifacts,
+                    "payload": {"text": text},
+                    "metadata": {"stable": true}
+                }
+            })
+            .to_string()
+        };
+        fs::write(
+            &fixture,
+            format!(
+                "{}\n{}\n",
+                line("question", 0, false, false),
+                line("answer", 1, false, false)
+            ),
+        )
+        .unwrap();
+        let mut store = Store::open(&db).unwrap();
+        let options = ProviderFixtureImportOptions {
+            expected_provider: Some(CaptureProvider::Codex),
+            source_format: "digest-test-v1".into(),
+            machine_id: "machine-a".into(),
+            source_path: Some(fixture.clone()),
+            imported_at: DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            ..ProviderFixtureImportOptions::default()
+        };
+        let first = import_provider_fixture_jsonl(&fixture, &mut store, options.clone()).unwrap();
+        assert_eq!(first.imported_events, 2);
+        drop(store);
+
+        let mut readonly = Store::open_read_only(&db).unwrap();
+        let plan = readonly
+            .plan_compaction(
+                DateTime::parse_from_rfc3339("2026-01-03T00:00:00Z")
+                    .unwrap()
+                    .timestamp_millis(),
+            )
+            .unwrap();
+        assert_eq!(plan.selected_root_ids.len(), 1, "{plan:?}");
+        assert!(!plan.members.is_empty(), "{plan:?}");
+        readonly
+            .create_selective_archive(
+                &archive,
+                DateTime::parse_from_rfc3339("2026-01-03T00:00:00Z")
+                    .unwrap()
+                    .timestamp_millis(),
+                ctx_history_store::ArchiveOptions::default(),
+            )
+            .unwrap();
+        readonly
+            .create_selective_archive(
+                &archive2,
+                DateTime::parse_from_rfc3339("2026-01-04T00:00:00Z")
+                    .unwrap()
+                    .timestamp_millis(),
+                ctx_history_store::ArchiveOptions::default(),
+            )
+            .unwrap();
+        drop(readonly);
+        let mut store = Store::open(&db).unwrap();
+        let registration = store.register_selective_archive(&archive).unwrap();
+        assert_eq!(registration.suppression_count, 1, "{registration:?}");
+        let identity = registration.suppressions[0].clone();
+
+        // Input ordering, machine, source path, and import observation differ.
+        fs::write(
+            &moved,
+            format!(
+                "{}\n{}\n",
+                line("answer", 1, true, false),
+                line("question", 0, true, false)
+            ),
+        )
+        .unwrap();
+        let exact = import_provider_fixture_jsonl(
+            &moved,
+            &mut store,
+            ProviderFixtureImportOptions {
+                machine_id: "machine-b".into(),
+                source_path: Some(moved.clone()),
+                imported_at: DateTime::parse_from_rfc3339("2026-02-02T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                ..options.clone()
+            },
+        )
+        .unwrap();
+        assert_eq!(exact.suppressed, 1, "{exact:?}");
+        assert_eq!(exact.suppression_conflicts, 0, "{exact:?}");
+        assert_eq!(exact.blocked_suppression_identities, vec![identity.clone()]);
+        let overridden = store
+            .override_suppression(
+                Some(&registration.archive_id),
+                &identity.identity_key,
+                &identity.content_key,
+                "test override",
+            )
+            .unwrap();
+        assert_eq!(overridden.effective_state, "overridden");
+        assert_eq!(
+            store.suppression_decision(&identity).unwrap(),
+            ctx_history_store::SuppressionDecision::AllowAudited
+        );
+        let second_registration = store.register_selective_archive(&archive2).unwrap();
+        assert_eq!(
+            store.suppression_decision(&identity).unwrap(),
+            ctx_history_store::SuppressionDecision::Suppress
+        );
+
+        fs::write(
+            &moved,
+            format!(
+                "{}\n{}\n",
+                line("answer", 1, true, true),
+                line("question", 0, true, true)
+            ),
+        )
+        .unwrap();
+        let changed = import_provider_fixture_jsonl(&moved, &mut store, options).unwrap();
+        assert_eq!(changed.suppression_conflicts, 1, "{changed:?}");
+        assert_eq!(store.suppression_status().unwrap().conflict, 1);
+        let conflict = store.suppression_status().unwrap();
+        assert_eq!(conflict.conflict, 1);
+        let changed_identity = changed.blocked_suppression_identities[0].clone();
+        assert_ne!(changed_identity.content_key, identity.content_key);
+        store
+            .override_suppression(
+                None,
+                &changed_identity.identity_key,
+                &changed_identity.content_key,
+                "resolve conflict",
+            )
+            .unwrap();
+        assert_eq!(
+            store.suppression_decision(&changed_identity).unwrap(),
+            ctx_history_store::SuppressionDecision::AllowAudited
+        );
+        let restore_marker = "a".repeat(64);
+        store
+            .record_restore_suppression_marker(
+                &second_registration.archive_id,
+                &identity.identity_key,
+                &identity.content_key,
+                &restore_marker,
+            )
+            .unwrap();
+        let restored = store
+            .handoff_restored_suppression(
+                &second_registration.archive_id,
+                &identity.identity_key,
+                &identity.content_key,
+                &restore_marker,
+                "restore committed",
+            )
+            .unwrap();
+        assert_eq!(restored.effective_state, "restored");
+        assert_eq!(
+            store.suppression_decision(&identity).unwrap(),
+            ctx_history_store::SuppressionDecision::AllowAudited
+        );
+    }
+
+    #[test]
+    fn file_touch_path_and_old_path_each_change_suppression_content() {
+        for (needle, replacement) in [
+            ("src/new.rs", "src/renamed.rs"),
+            ("src/old.rs", "src/older.rs"),
+        ] {
+            let temp = tempdir();
+            let db = temp.path().join("work.sqlite");
+            let source = temp.path().join("source.jsonl");
+            let changed_source = temp.path().join("relocated.jsonl");
+            let archive = temp.path().join("selected.ctxar");
+            let content = [
+                r#"{"record_type":"manifest","schema_version":"ctx-history-jsonl-v1"}"#,
+                r#"{"record_type":"source","source_id":"source","provider_key":"agent","source_format":"agent-jsonl","observed_at":"2026-01-02T00:00:00Z","machine_id":"machine-a"}"#,
+                r#"{"record_type":"session","source_id":"source","session_id":"session","started_at":"2026-01-01T00:00:00Z","ended_at":"2026-01-01T00:01:00Z","agent_type":"primary","is_primary":true,"status":"completed"}"#,
+                r#"{"record_type":"event","source_id":"source","session_id":"session","event_index":0,"event_type":"message","role":"user","occurred_at":"2026-01-01T00:00:01Z","payload":{"text":"file touch transcript"}}"#,
+                r#"{"record_type":"file_touch","source_id":"source","session_id":"session","touch_index":0,"event_index":0,"path":"src/new.rs","old_path":"src/old.rs","change_kind":"renamed","confidence":"explicit","occurred_at":"2026-01-01T00:00:02Z"}"#,
+            ].join("\n");
+            fs::write(&source, &content).unwrap();
+            let mut store = Store::open(&db).unwrap();
+            let options = CustomHistoryJsonlV1ImportOptions {
+                source_path: Some(source.clone()),
+                imported_at: "2026-01-02T00:00:00Z".parse().unwrap(),
+                ..CustomHistoryJsonlV1ImportOptions::default()
+            };
+            let first =
+                import_custom_history_jsonl_v1(&source, &mut store, options.clone()).unwrap();
+            assert_eq!(first.imported_events, 1);
+            drop(store);
+            let mut readonly = Store::open_read_only(&db).unwrap();
+            readonly
+                .create_selective_archive(
+                    &archive,
+                    "2026-01-03T00:00:00Z"
+                        .parse::<DateTime<Utc>>()
+                        .unwrap()
+                        .timestamp_millis(),
+                    ctx_history_store::ArchiveOptions::default(),
+                )
+                .unwrap();
+            drop(readonly);
+            let mut store = Store::open(&db).unwrap();
+            assert_eq!(
+                store
+                    .register_selective_archive(&archive)
+                    .unwrap()
+                    .suppression_count,
+                1
+            );
+
+            // Relocating the provider archive remains exact.
+            fs::write(&changed_source, &content).unwrap();
+            let exact = import_custom_history_jsonl_v1(
+                &changed_source,
+                &mut store,
+                CustomHistoryJsonlV1ImportOptions {
+                    machine_id: "machine-b".into(),
+                    source_path: Some(changed_source.clone()),
+                    imported_at: "2026-02-02T00:00:00Z".parse().unwrap(),
+                    ..options.clone()
+                },
+            )
+            .unwrap();
+            assert_eq!(exact.suppressed, 1, "{needle}: {exact:?}");
+
+            fs::write(&changed_source, content.replace(needle, replacement)).unwrap();
+            let changed = import_custom_history_jsonl_v1(
+                &changed_source,
+                &mut store,
+                CustomHistoryJsonlV1ImportOptions {
+                    source_path: Some(changed_source.clone()),
+                    ..options
+                },
+            )
+            .unwrap();
+            assert_eq!(changed.suppression_conflicts, 1, "{needle}: {changed:?}");
+        }
     }
 
     #[test]

@@ -1123,6 +1123,34 @@ fn json_output(command: &mut Command) -> Value {
     serde_json::from_slice(&output).unwrap()
 }
 
+fn assert_freshness_phase_contract(freshness: &Value) {
+    let phases = freshness["phases"].as_object().expect("freshness phases");
+    for name in [
+        "native_plugin_discovery",
+        "provider_observation_catalog",
+        "provider_normalization",
+        "ctx_import_decision",
+        "health_persistence",
+    ] {
+        let phase = phases
+            .get(name)
+            .unwrap_or_else(|| panic!("missing phase {name}"));
+        assert!(
+            phase["duration_ms"].is_u64(),
+            "invalid {name} duration: {phase}"
+        );
+        assert!(phase["count"].is_u64(), "invalid {name} count: {phase}");
+    }
+}
+
+fn assert_zero_freshness_phases(freshness: &Value) {
+    assert_freshness_phase_contract(freshness);
+    for phase in freshness["phases"].as_object().unwrap().values() {
+        assert_eq!(phase["duration_ms"], 0);
+        assert_eq!(phase["count"], 0);
+    }
+}
+
 fn success_output(command: &mut Command) -> (String, String) {
     let output = command.assert().success().get_output().clone();
     (
@@ -2414,6 +2442,7 @@ fn search_refresh_off_reports_additive_freshness_without_plugins_or_writes() {
     assert!(search["freshness"]["index_age_seconds"].is_number());
     assert_eq!(search["freshness"]["totals"]["unchanged_sources"], 0);
     assert_eq!(search["freshness"]["totals"]["imported_events"], 0);
+    assert_zero_freshness_phases(&search["freshness"]);
     assert!(!search["results"].as_array().unwrap().is_empty());
     assert!(!plugin.run_marker.exists());
     assert_eq!(fs::metadata(&db_path).unwrap().modified().unwrap(), before);
@@ -2427,7 +2456,17 @@ fn search_refresh_off_reports_additive_freshness_without_plugins_or_writes() {
         .clone();
     let stdout = String::from_utf8(stdout).unwrap();
     assert!(stdout.contains("freshness: refresh skipped"), "{stdout}");
+    assert!(stdout.contains("freshness phases:"), "{stdout}");
     assert!(stdout.contains("unchanged 0"), "{stdout}");
+
+    fs::write(
+        temp.path().join("config.toml"),
+        "[search]\nrefresh = \"off\"\n",
+    )
+    .unwrap();
+    let configured = json_output(ctx(&temp).args(["search", "onboarding", "--json"]));
+    assert_eq!(configured["freshness"]["reason"], "refresh_off");
+    assert_zero_freshness_phases(&configured["freshness"]);
 }
 
 #[test]
@@ -7334,6 +7373,33 @@ fn search_refreshes_discovered_codex_sessions_before_query() {
     assert_eq!(search["freshness"]["status"], "completed");
     assert_eq!(search["freshness"]["source_count"], 1);
     assert_eq!(search["freshness"]["totals"]["imported_sessions"], 2);
+    assert_freshness_phase_contract(&search["freshness"]);
+    for name in [
+        "native_plugin_discovery",
+        "provider_observation_catalog",
+        "provider_normalization",
+        "ctx_import_decision",
+        "health_persistence",
+    ] {
+        assert!(
+            search["freshness"]["phases"][name]["count"]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "phase {name} was not attributed: {search:#}"
+        );
+    }
+    let freshness_text = serde_json::to_string(&search["freshness"]).unwrap();
+    let private_values = [
+        discovered.to_string_lossy().into_owned(),
+        "codex-session-root".to_owned(),
+        "private transcript text".to_owned(),
+    ];
+    for private_value in &private_values {
+        assert!(
+            !freshness_text.contains(private_value),
+            "leaked {private_value}: {freshness_text}"
+        );
+    }
 
     let status = json_output(ctx(&temp).args(["status", "--json"]));
     assert_eq!(status["cataloged_sessions"], 2);
@@ -7632,6 +7698,16 @@ fn search_refresh_manifested_source_noop_then_one_change_reports_freshness_count
     assert_eq!(second["freshness"]["totals"]["imported_events"], 0);
     assert_eq!(second["freshness"]["totals"]["skipped"], 0);
     assert_eq!(second["freshness"]["totals"]["unchanged_sources"], 1);
+    assert_freshness_phase_contract(&second["freshness"]);
+    assert_eq!(
+        second["freshness"]["phases"]["provider_normalization"]["count"],
+        0
+    );
+    assert!(
+        second["freshness"]["phases"]["ctx_import_decision"]["count"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
 
     {
         let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
@@ -7651,6 +7727,11 @@ fn search_refresh_manifested_source_noop_then_one_change_reports_freshness_count
     assert_eq!(third["freshness"]["totals"]["imported_sessions"], 1);
     assert_eq!(third["freshness"]["totals"]["imported_events"], 1);
     assert_eq!(third["freshness"]["totals"]["unchanged_sources"], 0);
+    assert!(
+        third["freshness"]["phases"]["provider_normalization"]["count"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
     assert_search_provider_oracle(&third, "pi", "pi-noop-one-change", 1, "message");
 }
 

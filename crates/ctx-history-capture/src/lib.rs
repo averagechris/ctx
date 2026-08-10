@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
     thread,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use chrono::{DateTime, Utc};
@@ -228,6 +228,64 @@ impl Default for CustomHistoryJsonlV1ImportOptions {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderImportTiming {
+    pub observation_catalog_duration_ms: u64,
+    pub observation_catalog_count: u64,
+    pub normalization_duration_ms: u64,
+    pub normalization_count: u64,
+    pub import_decision_duration_ms: u64,
+    pub import_decision_count: u64,
+}
+
+impl ProviderImportTiming {
+    fn add(&mut self, other: &Self) {
+        self.observation_catalog_duration_ms = self
+            .observation_catalog_duration_ms
+            .saturating_add(other.observation_catalog_duration_ms);
+        self.observation_catalog_count = self
+            .observation_catalog_count
+            .saturating_add(other.observation_catalog_count);
+        self.normalization_duration_ms = self
+            .normalization_duration_ms
+            .saturating_add(other.normalization_duration_ms);
+        self.normalization_count = self
+            .normalization_count
+            .saturating_add(other.normalization_count);
+        self.import_decision_duration_ms = self
+            .import_decision_duration_ms
+            .saturating_add(other.import_decision_duration_ms);
+        self.import_decision_count = self
+            .import_decision_count
+            .saturating_add(other.import_decision_count);
+    }
+
+    pub fn record_normalization(&mut self, started: Instant) {
+        self.normalization_duration_ms = self
+            .normalization_duration_ms
+            .saturating_add(elapsed_millis(started));
+        self.normalization_count = self.normalization_count.saturating_add(1);
+    }
+
+    pub fn record_observation_catalog(&mut self, started: Instant) {
+        self.observation_catalog_duration_ms = self
+            .observation_catalog_duration_ms
+            .saturating_add(elapsed_millis(started));
+        self.observation_catalog_count = self.observation_catalog_count.saturating_add(1);
+    }
+
+    pub fn record_import_decision(&mut self, started: Instant) {
+        self.import_decision_duration_ms = self
+            .import_decision_duration_ms
+            .saturating_add(elapsed_millis(started));
+        self.import_decision_count = self.import_decision_count.saturating_add(1);
+    }
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u64::MAX as u128) as u64
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderImportSummary {
     pub imported: usize,
@@ -254,6 +312,8 @@ pub struct ProviderImportSummary {
     /// `ctx import --json` output.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
+    #[serde(skip)]
+    pub timing: ProviderImportTiming,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -833,6 +893,21 @@ pub trait ProviderCaptureAdapter {
         path: &Path,
         context: &ProviderAdapterContext,
     ) -> Result<ProviderNormalizationResult>;
+}
+
+fn normalize_path_timed<A: ProviderCaptureAdapter>(
+    adapter: &A,
+    path: &Path,
+    context: &ProviderAdapterContext,
+) -> Result<ProviderNormalizationResult> {
+    let started = Instant::now();
+    match adapter.normalize_path(path, context) {
+        Ok(mut normalization) => {
+            normalization.summary.timing.record_normalization(started);
+            Ok(normalization)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1702,6 +1777,7 @@ impl ProviderImportSummary {
         self.empty_sources += other.empty_sources;
         self.empty_files += other.empty_files;
         self.notes.extend(other.notes);
+        self.timing.add(&other.timing);
     }
 }
 
@@ -1854,12 +1930,13 @@ pub fn import_provider_fixture_jsonl(
         .source_path
         .clone()
         .unwrap_or_else(|| path.to_path_buf());
-    let normalization = ProviderFixtureJsonlAdapter {
+    let adapter = ProviderFixtureJsonlAdapter {
         expected_provider: options.expected_provider,
         source_format: options.source_format.clone(),
         fidelity: options.fidelity,
-    }
-    .normalize_path(
+    };
+    let normalization = normalize_path_timed(
+        &adapter,
         path,
         &ProviderAdapterContext {
             machine_id: options.machine_id,
@@ -1894,7 +1971,8 @@ pub fn import_custom_history_jsonl_v1(
         .source_path
         .clone()
         .unwrap_or_else(|| path.to_path_buf());
-    let normalization = normalize_custom_history_jsonl_v1(
+    let normalization_started = Instant::now();
+    let mut normalization = normalize_custom_history_jsonl_v1(
         path,
         &ProviderAdapterContext {
             machine_id: options.machine_id,
@@ -1905,6 +1983,11 @@ pub fn import_custom_history_jsonl_v1(
             include_notices: true,
         },
     )?;
+    normalization
+        .provider
+        .summary
+        .timing
+        .record_normalization(normalization_started);
     if normalization.provider.summary.failed > 0 && !options.allow_partial_failures {
         return Ok(normalization.provider.summary);
     }
@@ -1936,7 +2019,8 @@ pub fn import_custom_history_jsonl_v1_reader(
     store: &mut Store,
     options: CustomHistoryJsonlV1ImportOptions,
 ) -> Result<ProviderImportSummary> {
-    let normalization = normalize_custom_history_jsonl_v1_reader(
+    let normalization_started = Instant::now();
+    let mut normalization = normalize_custom_history_jsonl_v1_reader(
         reader,
         &ProviderAdapterContext {
             machine_id: options.machine_id,
@@ -1947,6 +2031,11 @@ pub fn import_custom_history_jsonl_v1_reader(
             include_notices: true,
         },
     )?;
+    normalization
+        .provider
+        .summary
+        .timing
+        .record_normalization(normalization_started);
     if normalization.provider.summary.failed > 0 && !options.allow_partial_failures {
         return Ok(normalization.provider.summary);
     }
@@ -2003,7 +2092,8 @@ pub fn import_codex_history_jsonl(
         .source_path
         .clone()
         .unwrap_or_else(|| path.to_path_buf());
-    let normalization = CodexHistoryJsonlAdapter.normalize_path(
+    let normalization = normalize_path_timed(
+        &CodexHistoryJsonlAdapter,
         path,
         &ProviderAdapterContext {
             machine_id: options.machine_id,
@@ -2041,7 +2131,8 @@ pub fn import_codex_session_jsonl(
         .source_path
         .clone()
         .unwrap_or_else(|| path.to_path_buf());
-    let normalization = CodexSessionJsonlAdapter.normalize_path(
+    let normalization = normalize_path_timed(
+        &CodexSessionJsonlAdapter,
         path,
         &ProviderAdapterContext {
             machine_id: options.machine_id,
@@ -2463,7 +2554,8 @@ fn normalize_codex_session_path(
     path: &Path,
     options: &CodexSessionImportOptions,
 ) -> Result<ProviderNormalizationResult> {
-    CodexSessionJsonlAdapter.normalize_path(
+    normalize_path_timed(
+        &CodexSessionJsonlAdapter,
         path,
         &ProviderAdapterContext {
             machine_id: options.machine_id.clone(),
@@ -3300,7 +3392,8 @@ pub fn import_pi_session_jsonl(
         .source_path
         .clone()
         .unwrap_or_else(|| path.to_path_buf());
-    let normalization = PiSessionJsonlAdapter.normalize_path(
+    let normalization = normalize_path_timed(
+        &PiSessionJsonlAdapter,
         path,
         &ProviderAdapterContext {
             machine_id: options.machine_id,
@@ -3335,7 +3428,8 @@ pub fn import_claude_projects_jsonl_tree(
         .source_path
         .clone()
         .unwrap_or_else(|| path.to_path_buf());
-    let normalization = ClaudeProjectsJsonlAdapter.normalize_path(
+    let normalization = normalize_path_timed(
+        &ClaudeProjectsJsonlAdapter,
         path,
         &ProviderAdapterContext {
             machine_id: options.machine_id,
@@ -3370,7 +3464,8 @@ pub fn import_opencode_sqlite(
         .source_path
         .clone()
         .unwrap_or_else(|| path.to_path_buf());
-    let normalization = OpenCodeSqliteAdapter.normalize_path(
+    let normalization = normalize_path_timed(
+        &OpenCodeSqliteAdapter,
         path,
         &ProviderAdapterContext {
             machine_id: options.machine_id,
@@ -3424,7 +3519,8 @@ pub fn import_hermes_sqlite(
         .source_path
         .clone()
         .unwrap_or_else(|| path.to_path_buf());
-    let normalization = HermesSqliteAdapter.normalize_path(
+    let normalization = normalize_path_timed(
+        &HermesSqliteAdapter,
         path,
         &ProviderAdapterContext {
             machine_id: options.machine_id,
@@ -3458,7 +3554,8 @@ pub fn import_nanoclaw_project(
         .source_path
         .clone()
         .unwrap_or_else(|| path.to_path_buf());
-    let normalization = NanoClawProjectAdapter.normalize_path(
+    let normalization = normalize_path_timed(
+        &NanoClawProjectAdapter,
         path,
         &ProviderAdapterContext {
             machine_id: options.machine_id,
@@ -3492,7 +3589,8 @@ pub fn import_astrbot_sqlite(
         .source_path
         .clone()
         .unwrap_or_else(|| path.to_path_buf());
-    let normalization = AstrBotSqliteAdapter.normalize_path(
+    let normalization = normalize_path_timed(
+        &AstrBotSqliteAdapter,
         path,
         &ProviderAdapterContext {
             machine_id: options.machine_id,
@@ -3628,7 +3726,8 @@ fn import_native_jsonl_tree<A: ProviderCaptureAdapter>(
     let source_path = request
         .source_path
         .unwrap_or_else(|| request.path.to_path_buf());
-    let normalization = adapter.normalize_path(
+    let normalization = normalize_path_timed(
+        &adapter,
         request.path,
         &ProviderAdapterContext {
             machine_id: request.machine_id,

@@ -5,7 +5,24 @@ Index freshness
 prints a `freshness:` line and JSON output includes `freshness.ran`,
 `freshness.status`, `freshness.reason`, `freshness.duration_ms`,
 `freshness.index_age_seconds`, and import totals including imported, skipped,
-unchanged, and failed counts.
+unchanged, and failed counts. Refresh diagnostics also include aggregate
+`freshness.phases` entries for `native_plugin_discovery`,
+`provider_observation_catalog`, `provider_normalization`, `ctx_import_decision`,
+and `health_persistence`. Each entry contains only a bounded aggregate
+`duration_ms` and `count`; it never contains a path, source identifier,
+transcript text, provider error, or per-source timing label. The human
+`freshness phases:` line presents the same aggregate values.
+
+Phase timings are measured only at stable refresh seams. A zero duration or
+count means that the seam did not run (or is not measured by that refresh
+path); it does not claim that unmeasured work took zero time. The phase values
+are aggregate observations and may overlap when a phase contains nested work
+or provider imports run concurrently. They are diagnostic attribution, not a
+wall-clock decomposition of `freshness.duration_ms`. The phase contract is
+additive: existing freshness fields and reason values remain unchanged. Phase
+`count` values describe measured seam work units (for example, discovery
+attempts or normalization calls), not source identities or per-source records;
+`source_count` and import totals retain their existing meanings.
 
 `--refresh off` is the strict read-only mode: it does not discover provider
 sources, execute history-source plugins, create config/data-root files, open the
@@ -25,6 +42,11 @@ value, or `auto` when the file or key is absent. Config syntax and values are
 validated before search refresh begins. A configured `off` has the same
 read-only/no-discovery behavior as `--refresh off`, including on an uninitialized
 root (which fails rather than creating a store).
+
+Both explicit `--refresh off` and configured `refresh = "off"` leave every
+phase duration and count at zero. They perform no discovery, plugin execution,
+store write, or refresh read; the query opens the existing current store
+read-only as before.
 
 `unchanged_sources` counts provider sources proven unchanged by metadata/cursor
 state without importing new rows: manifested provider roots persist file path,

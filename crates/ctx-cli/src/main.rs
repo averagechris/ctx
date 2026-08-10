@@ -43,8 +43,8 @@ use ctx_history_capture::{
     CursorNativeImportOptions, CustomHistoryJsonlV1ImportOptions, FactoryAiDroidImportOptions,
     GeminiCliImportOptions, HermesSqliteImportOptions, NanoClawImportOptions,
     OpenClawImportOptions, OpenCodeSqliteImportOptions, PiSessionImportOptions,
-    ProviderImportSummary, ProviderImportSupport, ProviderSource, ProviderSourceStatus,
-    OPENCODE_CURSOR_V2_PREFIX,
+    ProviderImportSummary, ProviderImportSupport, ProviderImportTiming, ProviderSource,
+    ProviderSourceStatus, OPENCODE_CURSOR_V2_PREFIX,
 };
 use ctx_history_core::{
     database_path, default_data_root, utc_now, CaptureProvider, CtxHistoryJsonlRecord, CtxIdPrefix,
@@ -1180,6 +1180,7 @@ struct ImportTotals {
     unchanged_sources: usize,
     zero_yield_anomaly_sources: usize,
     health_persistence_failures: usize,
+    phase_timings: SearchRefreshPhaseTimings,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1315,6 +1316,7 @@ impl ImportTotals {
         self.skipped += summary.skipped;
         self.failed += summary.failed;
         self.unchanged_sources += summary.unchanged_sources;
+        self.phase_timings.add_provider_timing(&summary.timing);
         if health.zero_yield_anomaly_count > 0 {
             self.zero_yield_anomaly_sources += 1;
         }
@@ -1324,6 +1326,76 @@ impl ImportTotals {
         self.source_files += stats.files;
         self.source_bytes = self.source_bytes.saturating_add(stats.bytes);
         self.failed_sources += 1;
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SearchRefreshPhase {
+    duration_ms: u64,
+    count: u64,
+}
+
+impl SearchRefreshPhase {
+    fn record(&mut self, started: Instant, count: u64) {
+        self.duration_ms = self
+            .duration_ms
+            .saturating_add(started.elapsed().as_millis().min(u64::MAX as u128) as u64);
+        self.count = self.count.saturating_add(count);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SearchRefreshPhaseTimings {
+    native_plugin_discovery: SearchRefreshPhase,
+    provider_observation_catalog: SearchRefreshPhase,
+    provider_normalization: SearchRefreshPhase,
+    ctx_import_decision: SearchRefreshPhase,
+    health_persistence: SearchRefreshPhase,
+}
+
+impl SearchRefreshPhaseTimings {
+    fn add_provider_timing(&mut self, timing: &ctx_history_capture::ProviderImportTiming) {
+        self.provider_observation_catalog.duration_ms = self
+            .provider_observation_catalog
+            .duration_ms
+            .saturating_add(timing.observation_catalog_duration_ms);
+        self.provider_observation_catalog.count = self
+            .provider_observation_catalog
+            .count
+            .saturating_add(timing.observation_catalog_count);
+        self.provider_normalization.duration_ms = self
+            .provider_normalization
+            .duration_ms
+            .saturating_add(timing.normalization_duration_ms);
+        self.provider_normalization.count = self
+            .provider_normalization
+            .count
+            .saturating_add(timing.normalization_count);
+        self.ctx_import_decision.duration_ms = self
+            .ctx_import_decision
+            .duration_ms
+            .saturating_add(timing.import_decision_duration_ms);
+        self.ctx_import_decision.count = self
+            .ctx_import_decision
+            .count
+            .saturating_add(timing.import_decision_count);
+    }
+
+    fn to_json(self) -> Value {
+        fn phase_json(phase: SearchRefreshPhase) -> Value {
+            json!({
+                "duration_ms": phase.duration_ms,
+                "count": phase.count,
+            })
+        }
+
+        json!({
+            "native_plugin_discovery": phase_json(self.native_plugin_discovery),
+            "provider_observation_catalog": phase_json(self.provider_observation_catalog),
+            "provider_normalization": phase_json(self.provider_normalization),
+            "ctx_import_decision": phase_json(self.ctx_import_decision),
+            "health_persistence": phase_json(self.health_persistence),
+        })
     }
 }
 
@@ -1374,6 +1446,7 @@ struct SearchRefreshReport {
     index_age_seconds: Option<i64>,
     reason: &'static str,
     error: Option<String>,
+    phases: SearchRefreshPhaseTimings,
 }
 
 struct DelayedRefreshProgress {
@@ -1421,6 +1494,7 @@ impl SearchRefreshReport {
             index_age_seconds: None,
             reason: status,
             error: None,
+            phases: SearchRefreshPhaseTimings::default(),
         }
     }
 
@@ -1429,6 +1503,7 @@ impl SearchRefreshReport {
         source_count: usize,
         totals: ImportTotals,
         duration_ms: u128,
+        phases: SearchRefreshPhaseTimings,
     ) -> Self {
         let status = if totals.zero_yield_anomaly_sources > 0 {
             "degraded_zero_yield"
@@ -1450,10 +1525,17 @@ impl SearchRefreshReport {
                 _ => "health_persistence_failed",
             },
             error: None,
+            phases,
         }
     }
 
-    fn failed(mode: RefreshArg, source_count: usize, error: String, duration_ms: u128) -> Self {
+    fn failed(
+        mode: RefreshArg,
+        source_count: usize,
+        error: String,
+        duration_ms: u128,
+        phases: SearchRefreshPhaseTimings,
+    ) -> Self {
         Self {
             mode,
             status: "failed",
@@ -1463,6 +1545,7 @@ impl SearchRefreshReport {
             index_age_seconds: None,
             reason: "refresh_failed",
             error: Some(error),
+            phases,
         }
     }
 
@@ -1483,6 +1566,7 @@ impl SearchRefreshReport {
             "index_age_seconds": self.index_age_seconds,
             "reason": self.reason,
             "totals": import_totals_json(&self.totals),
+            "phases": self.phases.to_json(),
             "error": self.error,
         }))
     }
@@ -5519,6 +5603,19 @@ fn run_search(mut args: SearchArgs, data_root: PathBuf) -> Result<()> {
             refresh.totals.unchanged_sources,
             refresh.totals.failed,
         );
+        output.push_str(&format!(
+            "freshness phases: native/plugin discovery {}ms/{}; provider observation/catalog {}ms/{}; provider normalization {}ms/{}; ctx import decision {}ms/{}; health persistence {}ms/{}\n",
+            refresh.phases.native_plugin_discovery.duration_ms,
+            refresh.phases.native_plugin_discovery.count,
+            refresh.phases.provider_observation_catalog.duration_ms,
+            refresh.phases.provider_observation_catalog.count,
+            refresh.phases.provider_normalization.duration_ms,
+            refresh.phases.provider_normalization.count,
+            refresh.phases.ctx_import_decision.duration_ms,
+            refresh.phases.ctx_import_decision.count,
+            refresh.phases.health_persistence.duration_ms,
+            refresh.phases.health_persistence.count,
+        ));
         if page.results.is_empty() {
             if let Some(file) = args
                 .file
@@ -5867,13 +5964,20 @@ fn refresh_before_search(args: &SearchArgs, data_root: &Path) -> Result<SearchRe
             "custom history source filters can only be combined with --provider custom"
         ));
     }
+    let mut phases = SearchRefreshPhaseTimings::default();
     let sources = if source_identity.is_empty() {
-        search_refresh_sources(args.provider)
+        let discovery_started = Instant::now();
+        let sources = search_refresh_sources(args.provider);
+        phases.native_plugin_discovery.record(discovery_started, 1);
+        sources
     } else {
         Vec::new()
     };
-    let plugin_sources =
-        match search_refresh_plugin_sources(data_root, args.provider, &source_identity) {
+    let plugin_sources = if matches!(args.provider, None | Some(ProviderArg::Custom)) {
+        let discovery_started = Instant::now();
+        let result = search_refresh_plugin_sources(data_root, args.provider, &source_identity);
+        phases.native_plugin_discovery.record(discovery_started, 1);
+        match result {
             Ok(sources) => sources,
             Err(err) if args.refresh_mode() == RefreshArg::Auto => {
                 return Ok(SearchRefreshReport::failed(
@@ -5881,10 +5985,14 @@ fn refresh_before_search(args: &SearchArgs, data_root: &Path) -> Result<SearchRe
                     sources.len(),
                     error_summary(&err),
                     started.elapsed().as_millis(),
+                    phases,
                 ));
             }
             Err(err) => return Err(err.context("search refresh failed")),
-        };
+        }
+    } else {
+        Vec::new()
+    };
     if sources.is_empty() && plugin_sources.is_empty() {
         if args.refresh_mode() == RefreshArg::Strict {
             return Err(anyhow!(
@@ -5894,6 +6002,7 @@ fn refresh_before_search(args: &SearchArgs, data_root: &Path) -> Result<SearchRe
         let mut report = SearchRefreshReport::skipped(args.refresh_mode(), "no_sources");
         report.reason = "no_sources";
         report.duration_ms = started.elapsed().as_millis();
+        report.phases = phases;
         return Ok(report);
     }
     let source_count = sources.len().saturating_add(plugin_sources.len());
@@ -5904,7 +6013,9 @@ fn refresh_before_search(args: &SearchArgs, data_root: &Path) -> Result<SearchRe
         args.refresh_mode(),
         args.json,
     ) {
-        Ok(totals) => {
+        Ok(mut totals) => {
+            totals.phase_timings.native_plugin_discovery = phases.native_plugin_discovery;
+            let report_phases = totals.phase_timings;
             if args.refresh_mode() == RefreshArg::Strict && totals.zero_yield_anomaly_sources > 0 {
                 return Err(anyhow!("strict search refresh detected zero-yield import anomaly; run `ctx import --strict` or `ctx doctor`"));
             }
@@ -5913,6 +6024,7 @@ fn refresh_before_search(args: &SearchArgs, data_root: &Path) -> Result<SearchRe
                 source_count,
                 totals,
                 started.elapsed().as_millis(),
+                report_phases,
             ))
         }
         Err(err) if args.refresh_mode() == RefreshArg::Auto => Ok(SearchRefreshReport::failed(
@@ -5920,6 +6032,7 @@ fn refresh_before_search(args: &SearchArgs, data_root: &Path) -> Result<SearchRe
             source_count,
             error_summary(&err),
             started.elapsed().as_millis(),
+            phases,
         )),
         Err(err) => Err(err.context("search refresh failed")),
     }
@@ -6038,7 +6151,8 @@ fn refresh_sources_for_search(
             let health = classify_import_health(&outcome.stats, &outcome.summary);
             totals.add_with_health(&outcome.summary, &outcome.stats, &health);
             let health_store = Store::open(&db_path)?;
-            if let Err(err) = persist_source_health(
+            let health_started = Instant::now();
+            let health_result = persist_source_health(
                 &health_store,
                 outcome.source.provider.as_str(),
                 outcome.source.source_format,
@@ -6046,7 +6160,12 @@ fn refresh_sources_for_search(
                 "",
                 &health,
                 !source_uses_import_file_manifest(&outcome.source),
-            ) {
+            );
+            totals
+                .phase_timings
+                .health_persistence
+                .record(health_started, 1);
+            if let Err(err) = health_result {
                 totals.health_persistence_failures += 1;
                 emit_health_persistence_warning(progress_arg, &err);
             }
@@ -6069,7 +6188,8 @@ fn refresh_sources_for_search(
             )?;
             let health = classify_import_health(&stats, &summary);
             totals.add_with_health(&summary, &stats, &health);
-            if let Err(err) = persist_source_health(
+            let health_started = Instant::now();
+            let health_result = persist_source_health(
                 &store,
                 source.provider.as_str(),
                 source.source_format,
@@ -6077,7 +6197,12 @@ fn refresh_sources_for_search(
                 "",
                 &health,
                 !source_uses_import_file_manifest(&source),
-            ) {
+            );
+            totals
+                .phase_timings
+                .health_persistence
+                .record(health_started, 1);
+            if let Err(err) = health_result {
                 totals.health_persistence_failures += 1;
                 emit_health_persistence_warning(progress_arg, &err);
             }
@@ -6104,7 +6229,8 @@ fn refresh_sources_for_search(
             let health =
                 history_source_plugin_health(&outcome.stats, &outcome.summary, outcome.source_only);
             totals.add_with_health(&outcome.summary, &outcome.stats, &health);
-            if let Err(err) = persist_source_health(
+            let health_started = Instant::now();
+            let health_result = persist_source_health(
                 &store,
                 &plugin_source.provider_key,
                 &plugin_source.source_format,
@@ -6112,7 +6238,12 @@ fn refresh_sources_for_search(
                 &plugin_source.source_id,
                 &health,
                 true,
-            ) {
+            );
+            totals
+                .phase_timings
+                .health_persistence
+                .record(health_started, 1);
+            if let Err(err) = health_result {
                 totals.health_persistence_failures += 1;
                 emit_health_persistence_warning(progress_arg, &err);
             }
@@ -6926,6 +7057,7 @@ fn import_manifested_source(
     progress: Option<CodexSessionImportProgressCallback>,
 ) -> Result<ProviderImportSummary> {
     let source_root = source.path.display().to_string();
+    let observation_started = Instant::now();
     let files = collect_source_import_files(source)
         .with_context(|| format!("catalog import files from {}", source.path.display()))?;
     if files.is_empty() {
@@ -6959,15 +7091,24 @@ fn import_manifested_source(
         }
     }
 
+    let decision_started = Instant::now();
     let pending = store.list_pending_source_import_files(source.provider, &source_root)?;
+    let mut phase_timing = ProviderImportTiming::default();
+    phase_timing.record_observation_catalog(observation_started);
+    phase_timing.record_import_decision(decision_started);
     if pending.is_empty() {
-        return Ok(ProviderImportSummary {
+        let mut summary = ProviderImportSummary {
             unchanged_sources: 1,
             ..ProviderImportSummary::default()
-        });
+        };
+        summary.timing = phase_timing;
+        return Ok(summary);
     }
 
-    let mut summary = ProviderImportSummary::default();
+    let mut summary = ProviderImportSummary {
+        timing: phase_timing,
+        ..ProviderImportSummary::default()
+    };
     for pending_file in pending {
         let path = PathBuf::from(&pending_file.source_path);
         let mut pending_source = explicit_path_source(source.provider, path);
@@ -7083,6 +7224,30 @@ fn merge_provider_import_summary(
     summary.empty_files += other.empty_files;
     summary.failures.extend(other.failures);
     summary.notes.extend(other.notes);
+    summary.timing.observation_catalog_duration_ms = summary
+        .timing
+        .observation_catalog_duration_ms
+        .saturating_add(other.timing.observation_catalog_duration_ms);
+    summary.timing.observation_catalog_count = summary
+        .timing
+        .observation_catalog_count
+        .saturating_add(other.timing.observation_catalog_count);
+    summary.timing.normalization_duration_ms = summary
+        .timing
+        .normalization_duration_ms
+        .saturating_add(other.timing.normalization_duration_ms);
+    summary.timing.normalization_count = summary
+        .timing
+        .normalization_count
+        .saturating_add(other.timing.normalization_count);
+    summary.timing.import_decision_duration_ms = summary
+        .timing
+        .import_decision_duration_ms
+        .saturating_add(other.timing.import_decision_duration_ms);
+    summary.timing.import_decision_count = summary
+        .timing
+        .import_decision_count
+        .saturating_add(other.timing.import_decision_count);
 }
 
 fn collect_source_import_files(source: &SourceInfo) -> Result<Vec<SourceImportFile>> {
@@ -7192,6 +7357,7 @@ fn import_incremental_codex_session_tree(
     progress: Option<CodexSessionImportProgressCallback>,
 ) -> Result<ProviderImportSummary> {
     let source_root = source.path.display().to_string();
+    let observation_started = Instant::now();
     catalog_codex_session_tree(
         &source.path,
         store,
@@ -7203,15 +7369,24 @@ fn import_incremental_codex_session_tree(
     )
     .with_context(|| format!("catalog Codex sessions from {}", source.path.display()))?;
 
+    let decision_started = Instant::now();
     let pending = store.list_pending_catalog_sessions(CaptureProvider::Codex, &source_root)?;
+    let mut phase_timing = ProviderImportTiming::default();
+    phase_timing.record_observation_catalog(observation_started);
+    phase_timing.record_import_decision(decision_started);
     if pending.is_empty() {
-        return Ok(ProviderImportSummary {
+        let mut summary = ProviderImportSummary {
             unchanged_sources: 1,
             ..ProviderImportSummary::default()
-        });
+        };
+        summary.timing = phase_timing;
+        return Ok(summary);
     }
 
-    let mut summary = ProviderImportSummary::default();
+    let mut summary = ProviderImportSummary {
+        timing: phase_timing,
+        ..ProviderImportSummary::default()
+    };
     let mut full_import_sessions = Vec::new();
     for session in &pending {
         let state = store.catalog_source_index_state(
@@ -8130,12 +8305,18 @@ mod tests {
 
     #[test]
     fn search_refresh_completed_degrades_when_import_health_has_anomaly() {
-        use super::{RefreshArg, SearchRefreshReport};
+        use super::{RefreshArg, SearchRefreshPhaseTimings, SearchRefreshReport};
         let totals = ImportTotals {
             zero_yield_anomaly_sources: 1,
             ..ImportTotals::default()
         };
-        let report = SearchRefreshReport::completed(RefreshArg::Auto, 1, totals, 7);
+        let report = SearchRefreshReport::completed(
+            RefreshArg::Auto,
+            1,
+            totals,
+            7,
+            SearchRefreshPhaseTimings::default(),
+        );
         assert_eq!(report.status, "degraded_zero_yield");
         assert_eq!(report.reason, "zero_yield_anomaly");
         assert_eq!(report.to_json()["status"], "degraded_zero_yield");

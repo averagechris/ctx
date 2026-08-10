@@ -24,6 +24,8 @@ mod config;
 mod docs;
 mod history_source_plugins;
 mod mcp;
+#[cfg(unix)]
+mod storage_reclaim;
 mod storage_status;
 
 use config::CONFIG_FILE;
@@ -193,6 +195,20 @@ enum CommandRoot {
     Archive(ArchiveArgs),
     #[command(about = "Export a bounded private evidence bundle")]
     Evidence(EvidenceArgs),
+    #[command(about = "Explicit local storage maintenance")]
+    Storage(StorageArgs),
+}
+
+#[derive(Debug, Args)]
+struct StorageArgs {
+    #[command(subcommand)]
+    command: StorageCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum StorageCommand {
+    #[command(about = "Explicitly reclaim unused SQLite pages")]
+    Reclaim(JsonArgs),
 }
 
 #[derive(Debug, Args)]
@@ -2217,6 +2233,14 @@ fn main_result() -> Result<()> {
         CommandRoot::Doctor(args) => run_doctor(args, data_root.clone()),
         CommandRoot::Archive(args) => run_archive(args, data_root),
         CommandRoot::Evidence(args) => run_evidence(args, data_root),
+        CommandRoot::Storage(args) => match args.command {
+            #[cfg(unix)]
+            StorageCommand::Reclaim(args) => storage_reclaim::run(&data_root, args.json),
+            #[cfg(not(unix))]
+            StorageCommand::Reclaim(_) => {
+                anyhow::bail!("physical reclaim requires Unix filesystem APIs")
+            }
+        },
     }
 }
 

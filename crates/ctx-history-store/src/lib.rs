@@ -12,6 +12,12 @@ use std::{
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::{
+    fs::OpenOptions,
+    os::fd::AsRawFd,
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
+};
 
 use chrono::{DateTime, Utc};
 use ctx_history_core::{
@@ -2343,6 +2349,8 @@ pub struct Store {
     path: PathBuf,
     object_dir: PathBuf,
     conn: Connection,
+    #[cfg(unix)]
+    _reclaim_lock: ReclaimLock,
     busy_timeout: Duration,
     event_search_page_executions: std::cell::Cell<u64>,
     event_search_rows_hydrated: std::cell::Cell<u64>,
@@ -2353,6 +2361,60 @@ pub struct Store {
     relation_batch_executions: std::cell::Cell<u64>,
     #[cfg(feature = "test-utils")]
     search_hydration_loader_executions: std::cell::Cell<[u64; 2]>,
+}
+
+#[cfg(unix)]
+pub struct ReclaimLock {
+    _file: fs::File,
+}
+
+#[cfg(unix)]
+impl ReclaimLock {
+    fn shared(db_path: &Path) -> Result<Self> {
+        Self::acquire(db_path, libc::LOCK_SH)
+    }
+
+    pub fn exclusive_nonblocking(db_path: &Path) -> Result<Self> {
+        Self::acquire(db_path, libc::LOCK_EX | libc::LOCK_NB)
+    }
+
+    fn acquire(db_path: &Path, operation: libc::c_int) -> Result<Self> {
+        let parent = db_path.parent().ok_or_else(|| {
+            StoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "database has no data root",
+            ))
+        })?;
+        let path = parent.join(".ctx-reclaim.lock");
+        fs::create_dir_all(parent)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)?;
+        restrict_private_file(&path)?;
+        if unsafe { libc::flock(file.as_raw_fd(), operation) } != 0 {
+            let error = std::io::Error::last_os_error();
+            return Err(StoreError::Io(std::io::Error::new(
+                error.kind(),
+                "physical reclaim refused because a ctx store handle is active",
+            )));
+        }
+        Ok(Self { _file: file })
+    }
+}
+
+#[cfg(unix)]
+fn test_open_marker(path: &Path) {
+    let Some(marker) = std::env::var_os("CTX_TEST_RECLAIM_OPEN_MARKER") else {
+        return;
+    };
+    let Ok(inode) = fs::metadata(path).map(|metadata| metadata.ino()) else {
+        return;
+    };
+    let _ = fs::write(marker, inode.to_string());
 }
 
 impl Store {
@@ -2386,11 +2448,15 @@ impl Store {
 
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
+        #[cfg(unix)]
+        let reclaim_lock = ReclaimLock::shared(&path)?;
         let object_dir = path
             .parent()
             .map(|parent| parent.join(OBJECTS_DIR))
             .unwrap_or_else(|| PathBuf::from(OBJECTS_DIR));
         let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        #[cfg(unix)]
+        test_open_marker(&path);
         configure_read_only_connection(&conn, BUSY_TIMEOUT)?;
         let user_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if user_version != SCHEMA_VERSION {
@@ -2400,6 +2466,8 @@ impl Store {
             path,
             object_dir,
             conn,
+            #[cfg(unix)]
+            _reclaim_lock: reclaim_lock,
             busy_timeout: BUSY_TIMEOUT,
             event_search_page_executions: std::cell::Cell::new(0),
             event_search_rows_hydrated: std::cell::Cell::new(0),
@@ -2461,6 +2529,8 @@ impl Store {
 
     pub fn open_with_busy_timeout(path: impl AsRef<Path>, busy_timeout: Duration) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
+        #[cfg(unix)]
+        let reclaim_lock = ReclaimLock::shared(&path)?;
         let mut migrated_legacy_layout = false;
         let existed = path.exists();
         if !existed {
@@ -2488,6 +2558,8 @@ impl Store {
             .map(|parent| parent.join(OBJECTS_DIR))
             .unwrap_or_else(|| PathBuf::from(OBJECTS_DIR));
         let conn = Connection::open(&path)?;
+        #[cfg(unix)]
+        test_open_marker(&path);
         if !existed {
             // The database file was just created empty by SQLite (or just
             // moved from the already-validated legacy layout); restrict it
@@ -2500,6 +2572,8 @@ impl Store {
             path,
             object_dir,
             conn,
+            #[cfg(unix)]
+            _reclaim_lock: reclaim_lock,
             busy_timeout,
             event_search_page_executions: std::cell::Cell::new(0),
             event_search_rows_hydrated: std::cell::Cell::new(0),

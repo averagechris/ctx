@@ -4,7 +4,7 @@ use ctx_history_store::verify_archive_bundle;
 #[cfg(unix)]
 use ctx_history_store::{SourceRefreshClaim, SourceRefreshErrorCode, Store};
 use predicates::prelude::*;
-use rusqlite::{params, Connection};
+use rusqlite::{params, types::ValueRef, Connection};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
@@ -16,8 +16,787 @@ use std::{
 };
 use tempfile::{Builder, TempDir};
 
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
 fn tempdir() -> TempDir {
     Builder::new().prefix("ctx-search-mvp-").tempdir().unwrap()
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReclaimDbSnapshot {
+    schema: Vec<(String, String, String)>,
+    tables: Vec<(String, Vec<Vec<String>>)>,
+}
+
+#[cfg(unix)]
+fn reclaim_db_snapshot(path: &Path) -> ReclaimDbSnapshot {
+    let conn =
+        Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let schema = conn
+        .prepare(
+            "SELECT type,name,COALESCE(sql,'') FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    let names = conn
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+
+    let tables = names
+        .into_iter()
+        .map(|name| {
+            let quoted = name.replace('"', "\"\"");
+            let columns = conn
+                .prepare(&format!("PRAGMA table_info(\"{quoted}\")"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let order = (1..=columns.len())
+                .map(|index| index.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!("SELECT * FROM \"{quoted}\" ORDER BY {order}");
+            let mut statement = conn.prepare(&sql).unwrap();
+            let width = statement.column_count();
+            let mut rows = statement.query([]).unwrap();
+            let mut values = Vec::new();
+            while let Some(row) = rows.next().unwrap() {
+                values.push(
+                    (0..width)
+                        .map(|index| snapshot_sql_value(row.get_ref(index).unwrap()))
+                        .collect(),
+                );
+            }
+            (name, values)
+        })
+        .collect();
+    ReclaimDbSnapshot { schema, tables }
+}
+
+#[cfg(unix)]
+fn snapshot_sql_value(value: ValueRef<'_>) -> String {
+    match value {
+        ValueRef::Null => "null".to_owned(),
+        ValueRef::Integer(value) => format!("i:{value}"),
+        ValueRef::Real(value) => format!("r:{:016x}", value.to_bits()),
+        ValueRef::Text(value) => format!("t:{}", hex_bytes(value)),
+        ValueRef::Blob(value) => format!("b:{}", hex_bytes(value)),
+    }
+}
+
+#[cfg(unix)]
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(unix)]
+fn reclaim_sidecar_snapshot(root: &Path) -> Vec<(PathBuf, u64, String)> {
+    fn walk(root: &Path, path: &Path, output: &mut Vec<(PathBuf, u64, String)>) {
+        let mut entries = fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        entries.sort();
+        for entry in entries {
+            let metadata = fs::symlink_metadata(&entry).unwrap();
+            assert!(!metadata.file_type().is_symlink());
+            if metadata.is_dir() {
+                walk(root, &entry, output);
+            } else {
+                let bytes = fs::read(&entry).unwrap();
+                output.push((
+                    entry.strip_prefix(root).unwrap().to_path_buf(),
+                    bytes.len() as u64,
+                    hex_bytes(&Sha256::digest(bytes)),
+                ));
+            }
+        }
+    }
+
+    let mut output = Vec::new();
+    for name in ["objects", "spool"] {
+        let path = root.join(name);
+        if path.exists() {
+            walk(root, &path, &mut output);
+        }
+    }
+    output
+}
+
+#[cfg(unix)]
+fn seed_reclaim_fixture(temp: &TempDir) {
+    json_output(ctx(temp).args(["setup", "--catalog-only", "--progress", "none", "--json"]));
+    let db = temp.path().join("work.sqlite");
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch(
+        r#"
+        PRAGMA foreign_keys=ON;
+        INSERT INTO capture_sources
+          (id,kind,provider,machine_id,started_at_ms,ended_at_ms,fidelity,metadata_json)
+        VALUES
+          ('source-reclaim-fixture','provider_import','opencode','machine-reclaim',1700000000000,1700000001000,'full','{"fixture":true}');
+        INSERT INTO history_records
+          (id,title,summary,status,started_at_ms,last_activity_at_ms,confidence,created_at_ms,updated_at_ms,source_id,body,tags_json,kind,workspace,created_at,updated_at)
+        VALUES
+          ('11111111-1111-7111-8111-111111111111','reclaim fixture record','reclaim fixture summary','completed',1700000000000,1700000001000,'explicit',1700000000000,1700000001000,'source-reclaim-fixture','reclaim fixture body','["reclaim"]','note','/private/workspace','2023-11-14T22:13:20Z','2023-11-14T22:13:21Z');
+        INSERT INTO artifacts
+          (id,kind,blob_hash,blob_path,byte_size,media_type,preview_text,redaction_state,created_at_ms,updated_at_ms,source_id,metadata_json)
+        VALUES
+          ('33333333-3333-7333-8333-333333333333','transcript','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','objects/aa/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',4096,'text/plain','reclaim object','raw',1700000000000,1700000000000,'source-reclaim-fixture','{"fixture":true}');
+        INSERT INTO sessions
+          (id,history_record_id,capture_source_id,provider,external_session_id,agent_type,is_primary,status,fidelity,transcript_blob_id,started_at_ms,ended_at_ms,created_at_ms,updated_at_ms,metadata_json)
+        VALUES
+          ('22222222-2222-7222-8222-222222222222','11111111-1111-7111-8111-111111111111','source-reclaim-fixture','opencode','reclaim-session','primary',1,'completed','full','33333333-3333-7333-8333-333333333333',1700000000000,1700000001000,1700000000000,1700000001000,'{"fixture":true}');
+        INSERT INTO events
+          (id,seq,history_record_id,session_id,event_type,role,occurred_at_ms,capture_source_id,payload_json,dedupe_key,redaction_state,fidelity,metadata_json)
+        VALUES
+          ('44444444-4444-7444-8444-444444444444',1,'11111111-1111-7111-8111-111111111111','22222222-2222-7222-8222-222222222222','message','user',1700000000001,'source-reclaim-fixture','{"text":"reclaim fixture searchable marker"}','reclaim-fixture-event','raw','full','{"fixture":true}');
+        INSERT INTO ctx_history_search(rowid,record_id,title,summary,primary_user_text,decision_text,context_text,tag_text)
+          VALUES (1,'11111111-1111-7111-8111-111111111111','reclaim fixture record','reclaim fixture summary','reclaim fixture searchable marker','','','reclaim');
+        INSERT INTO record_search_rowids(record_id,search_rowid)
+          VALUES ('11111111-1111-7111-8111-111111111111',1);
+        INSERT INTO event_search(rowid,event_id,history_record_id,session_id,role,safe_preview_text,rank_bucket)
+          VALUES (1,'44444444-4444-7444-8444-444444444444','11111111-1111-7111-8111-111111111111','22222222-2222-7222-8222-222222222222','user','reclaim fixture searchable marker',0);
+        INSERT INTO event_search_rowids(event_id,search_rowid)
+          VALUES ('44444444-4444-7444-8444-444444444444',1);
+        INSERT INTO source_health(source_key,classification,updated_at_ms)
+          VALUES ('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb','zero_yield_anomaly',1700000002000);
+        INSERT INTO source_refresh_state
+          (source_key,successful_signature,observed_signature,attempt_count,success_count,last_attempt_at_ms,last_success_at_ms,failure_count,next_retry_at_ms,last_error_code,lease_token,lease_expires_at_ms,incremental_cursor)
+          VALUES ('cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',zeroblob(32),zeroblob(32),3,2,1700000003000,1700000003001,1,1700000004000,'provider_read_failed',NULL,NULL,'opencode-cursor-3');
+        INSERT INTO compaction_archives
+          (archive_id,format_family,format_version,scope_kind,manifest_sha256,plan_digest,closure_digest,membership_digest,root_set_digest,deletion_set_digest,deletion_member_count,source_schema_version,origin_device_id,created_at_ms,published_at_ms,verified_at_ms,updated_at_ms)
+          VALUES ('archive-reclaim-fixture','ctx-selective-archive',1,'selective',
+            '1111111111111111111111111111111111111111111111111111111111111111',
+            '2222222222222222222222222222222222222222222222222222222222222222',
+            '3333333333333333333333333333333333333333333333333333333333333333',
+            '4444444444444444444444444444444444444444444444444444444444444444',
+            '5555555555555555555555555555555555555555555555555555555555555555',
+            '6666666666666666666666666666666666666666666666666666666666666666',1,1005,'fixture-device',1700000005000,1700000005001,1700000005002,1700000005003);
+        INSERT INTO compaction_archive_roots
+          (archive_id,root_session_id,root_disposition,cutoff_ms,observed_status,observed_ended_at_ms,root_closure_digest,root_member_count,root_deletion_member_count,created_at_ms)
+          VALUES ('archive-reclaim-fixture','22222222-2222-7222-8222-222222222222','selected',1700000000000,'completed',1700000001000,'3333333333333333333333333333333333333333333333333333333333333333',2,1,1700000005000);
+        INSERT INTO compaction_archive_members
+          (archive_id,entity_kind,entity_key,content_key,disposition,ownership,membership_state,hot_state,created_at_ms,updated_at_ms)
+          VALUES
+            ('archive-reclaim-fixture','sessions','22222222-2222-7222-8222-222222222222','7777777777777777777777777777777777777777777777777777777777777777','selected_root','exclusive','verified','present',1700000005000,1700000005001),
+            ('archive-reclaim-fixture','object_blob','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','owned_child','exclusive','verified','present',1700000005000,1700000005001);
+        INSERT INTO compaction_deletion_members
+          (archive_id,entity_kind,entity_key,content_key,authorization_reason,created_at_ms)
+          VALUES ('archive-reclaim-fixture','object_blob','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','owned_child',1700000005000);
+        INSERT INTO compaction_suppression_facts
+          (identity_key,content_key,effective_state,origin_device_id,created_at_ms,updated_at_ms,last_error_code)
+          VALUES ('8888888888888888888888888888888888888888888888888888888888888888','9999999999999999999999999999999999999999999999999999999999999999','active','fixture-device',1700000005000,1700000005001,NULL);
+        INSERT INTO compaction_archive_suppressions
+          (archive_id,identity_key,content_key,association_state,origin_device_id,created_at_ms,updated_at_ms,last_error_code)
+          VALUES ('archive-reclaim-fixture','8888888888888888888888888888888888888888888888888888888888888888','9999999999999999999999999999999999999999999999999999999999999999','active','fixture-device',1700000005000,1700000005001,NULL);
+        INSERT INTO compaction_suppression_conflicts
+          (identity_key,content_key,conflict_state,resolution,created_at_ms,updated_at_ms)
+          VALUES ('8888888888888888888888888888888888888888888888888888888888888888','9999999999999999999999999999999999999999999999999999999999999999','resolved','override',1700000005000,1700000005001);
+        INSERT INTO compaction_restore_markers
+          (archive_id,identity_key,content_key,canonical_marker,created_at_ms)
+          VALUES ('archive-reclaim-fixture','8888888888888888888888888888888888888888888888888888888888888888','9999999999999999999999999999999999999999999999999999999999999999','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1700000005002);
+        INSERT INTO compaction_operations
+          (operation_id,operation_kind,archive_id,request_digest,scope_kind,phase,attempt_count,last_error_code,created_at_ms,updated_at_ms)
+          VALUES ('operation-reclaim-fixture','reclaim','archive-reclaim-fixture','dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd','selective','committed',1,NULL,1700000005000,1700000005003);
+        INSERT INTO compaction_operation_objects
+          (operation_id,blob_hash,content_key,byte_size,object_state,updated_at_ms)
+          VALUES ('operation-reclaim-fixture','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',4096,'verified',1700000005003);
+        "#,
+    )
+    .unwrap();
+    drop(conn);
+
+    let object_dir = temp.path().join("objects/aa");
+    let spool_dir = temp.path().join("spool/reclaim");
+    fs::create_dir_all(&object_dir).unwrap();
+    fs::create_dir_all(&spool_dir).unwrap();
+    fs::write(
+        object_dir.join("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        vec![b'o'; 4096],
+    )
+    .unwrap();
+    fs::write(spool_dir.join("fixture.spool"), vec![b's'; 3072]).unwrap();
+
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE reclaim_padding(value BLOB); INSERT INTO reclaim_padding VALUES(zeroblob(4194304)); DROP TABLE reclaim_padding;",
+    )
+    .unwrap();
+}
+
+#[cfg(unix)]
+fn assert_reclaim_state_absent(root: &Path) {
+    for name in [
+        ".work.sqlite.reclaim-backup",
+        ".work.sqlite.reclaim-output",
+        ".work.sqlite.reclaim-journal",
+        ".work.sqlite.reclaim-journal-new",
+    ] {
+        assert!(!root.join(name).exists(), "stale reclaim state: {name}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn storage_reclaim_cli_preserves_every_fixture_row_and_sidecar_digest() {
+    let temp = tempdir();
+    seed_reclaim_fixture(&temp);
+    let db = temp.path().join("work.sqlite");
+    let before_db = reclaim_db_snapshot(&db);
+    let before_sidecars = reclaim_sidecar_snapshot(temp.path());
+    let before_bytes = fs::metadata(&db).unwrap().len();
+
+    let report = json_output(ctx(&temp).args(["storage", "reclaim", "--json"]));
+    assert_eq!(report["status"], "completed", "{report}");
+    assert!(report["before"]["freelist_bytes"].as_u64().unwrap() > 0);
+    assert!(report["after"]["freelist_bytes"].as_u64().unwrap() == 0);
+    assert!(
+        report["after"]["main_db_bytes"].as_u64().unwrap() < before_bytes,
+        "reclaim did not shrink the canonical file: {report}"
+    );
+
+    assert_eq!(reclaim_db_snapshot(&db), before_db);
+    assert_eq!(reclaim_sidecar_snapshot(temp.path()), before_sidecars);
+    assert_reclaim_state_absent(temp.path());
+
+    let second = json_output(ctx(&temp).args(["storage", "reclaim", "--json"]));
+    assert_eq!(second["status"], "skipped", "{second}");
+    assert_eq!(reclaim_db_snapshot(&db), before_db);
+    assert_eq!(reclaim_sidecar_snapshot(temp.path()), before_sidecars);
+}
+
+#[cfg(unix)]
+#[test]
+fn storage_reclaim_crash_hooks_recover_exact_fixture_for_every_durable_boundary() {
+    let stages = [
+        "checkpoint",
+        "output",
+        "validation",
+        "journal",
+        "journal-prepared-file-fsync",
+        "journal-prepared-rename",
+        "journal-prepared-dir-fsync",
+        "db-rename",
+        "db-dir-fsync",
+        "journal-backup-durable-file-fsync",
+        "journal-backup-durable-rename",
+        "journal-backup-durable-dir-fsync",
+        "rename",
+        "candidate-rename",
+        "candidate-dir-fsync",
+        "journal-candidate-installed-file-fsync",
+        "journal-candidate-installed-rename",
+        "journal-candidate-installed-dir-fsync",
+        "fsync",
+        "journal-validated-commit-file-fsync",
+        "journal-validated-commit-rename",
+        "journal-validated-commit-dir-fsync",
+        "commit",
+        "cleanup-backup-remove",
+        "cleanup-backup-dir-fsync",
+        "cleanup-journal-remove",
+        "cleanup-journal-dir-fsync",
+        "cleanup",
+    ];
+
+    for stage in stages {
+        let temp = tempdir();
+        seed_reclaim_fixture(&temp);
+        let db = temp.path().join("work.sqlite");
+        let expected_rows = reclaim_db_snapshot(&db);
+        let expected_sidecars = reclaim_sidecar_snapshot(temp.path());
+        ctx(&temp)
+            .env("CTX_TEST_RECLAIM_CRASH", stage)
+            .args(["storage", "reclaim", "--json"])
+            .assert()
+            .code(86);
+
+        let recovered = json_output(ctx(&temp).args(["storage", "reclaim", "--json"]));
+        assert!(
+            recovered["status"] == "completed" || recovered["status"] == "skipped",
+            "stage {stage}: {recovered}"
+        );
+        assert_eq!(reclaim_db_snapshot(&db), expected_rows, "stage {stage}");
+        assert_eq!(
+            reclaim_sidecar_snapshot(temp.path()),
+            expected_sidecars,
+            "stage {stage}"
+        );
+        assert_reclaim_state_absent(temp.path());
+        Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap()
+            .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+            .unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn storage_reclaim_cleanup_and_initial_stale_boundaries_recover_exact_fixture() {
+    let cases = [
+        ("cleanup-output-remove", Some("commit"), true, false),
+        ("cleanup-output-dir-fsync", Some("commit"), true, false),
+        ("cleanup-journal-new-remove", Some("commit"), false, true),
+        ("cleanup-journal-new-dir-fsync", Some("commit"), false, true),
+        ("initial-stale-output-remove", None, true, false),
+        ("initial-stale-output-dir-fsync", None, true, false),
+        ("initial-stale-journal-new-remove", None, false, true),
+        ("initial-stale-journal-new-dir-fsync", None, false, true),
+    ];
+
+    for (stage, seed_crash, output, journal_new) in cases {
+        let temp = tempdir();
+        seed_reclaim_fixture(&temp);
+        let db = temp.path().join("work.sqlite");
+        let expected_rows = reclaim_db_snapshot(&db);
+        let expected_sidecars = reclaim_sidecar_snapshot(temp.path());
+
+        if let Some(seed_crash) = seed_crash {
+            ctx(&temp)
+                .env("CTX_TEST_RECLAIM_CRASH", seed_crash)
+                .args(["storage", "reclaim", "--json"])
+                .assert()
+                .code(86);
+        }
+        if output {
+            fs::write(
+                temp.path().join(".work.sqlite.reclaim-output"),
+                b"stale output boundary",
+            )
+            .unwrap();
+        }
+        if journal_new {
+            fs::write(
+                temp.path().join(".work.sqlite.reclaim-journal-new"),
+                b"stale journal-new boundary",
+            )
+            .unwrap();
+        }
+        for name in [
+            ".work.sqlite.reclaim-output",
+            ".work.sqlite.reclaim-journal-new",
+        ] {
+            let path = temp.path().join(name);
+            if path.exists() {
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        }
+
+        ctx(&temp)
+            .env("CTX_TEST_RECLAIM_CRASH", stage)
+            .args(["storage", "reclaim", "--json"])
+            .assert()
+            .code(86);
+        let recovered = json_output(ctx(&temp).args(["storage", "reclaim", "--json"]));
+        assert!(
+            recovered["status"] == "completed" || recovered["status"] == "skipped",
+            "stage {stage}: {recovered}"
+        );
+        assert_eq!(reclaim_db_snapshot(&db), expected_rows, "stage {stage}");
+        assert_eq!(
+            reclaim_sidecar_snapshot(temp.path()),
+            expected_sidecars,
+            "stage {stage}"
+        );
+        assert_reclaim_state_absent(temp.path());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn storage_reclaim_recovery_covers_journal_phases_and_file_presence_matrix() {
+    struct Case {
+        name: &'static str,
+        phase: Option<&'static str>,
+        db: bool,
+        backup: bool,
+        output: bool,
+        journal_new: bool,
+        expect_success: bool,
+    }
+    let cases = [
+        Case {
+            name: "valid-commit-db-backup-output-new",
+            phase: Some("validated_commit"),
+            db: true,
+            backup: true,
+            output: true,
+            journal_new: true,
+            expect_success: true,
+        },
+        Case {
+            name: "valid-commit-db-only",
+            phase: Some("validated_commit"),
+            db: true,
+            backup: false,
+            output: false,
+            journal_new: true,
+            expect_success: true,
+        },
+        Case {
+            name: "valid-commit-backup-only",
+            phase: Some("validated_commit"),
+            db: false,
+            backup: true,
+            output: true,
+            journal_new: true,
+            expect_success: true,
+        },
+        Case {
+            name: "valid-prepared-db-backup",
+            phase: Some("prepared"),
+            db: true,
+            backup: true,
+            output: true,
+            journal_new: false,
+            expect_success: true,
+        },
+        Case {
+            name: "invalid-phase-db-backup",
+            phase: Some("invalid_phase"),
+            db: true,
+            backup: true,
+            output: true,
+            journal_new: true,
+            expect_success: true,
+        },
+        Case {
+            name: "invalid-phase-db-only",
+            phase: Some("invalid_phase"),
+            db: true,
+            backup: false,
+            output: true,
+            journal_new: true,
+            expect_success: true,
+        },
+        Case {
+            name: "invalid-phase-no-canonical",
+            phase: Some("invalid_phase"),
+            db: false,
+            backup: false,
+            output: true,
+            journal_new: true,
+            expect_success: false,
+        },
+        Case {
+            name: "no-journal-db-output",
+            phase: None,
+            db: true,
+            backup: false,
+            output: true,
+            journal_new: true,
+            expect_success: true,
+        },
+        Case {
+            name: "no-journal-backup-output",
+            phase: None,
+            db: false,
+            backup: true,
+            output: true,
+            journal_new: true,
+            expect_success: true,
+        },
+        Case {
+            name: "no-journal-ambiguous",
+            phase: None,
+            db: true,
+            backup: true,
+            output: false,
+            journal_new: false,
+            expect_success: false,
+        },
+        Case {
+            name: "no-journal-no-canonical",
+            phase: None,
+            db: false,
+            backup: false,
+            output: true,
+            journal_new: true,
+            expect_success: false,
+        },
+    ];
+
+    for case in cases {
+        let temp = tempdir();
+        seed_reclaim_fixture(&temp);
+        let db = temp.path().join("work.sqlite");
+        let expected_rows = reclaim_db_snapshot(&db);
+        let expected_sidecars = reclaim_sidecar_snapshot(temp.path());
+        ctx(&temp)
+            .env("CTX_TEST_RECLAIM_CRASH", "commit")
+            .args(["storage", "reclaim", "--json"])
+            .assert()
+            .code(86);
+        let candidate = fs::read(&db).unwrap();
+        let backup = fs::read(temp.path().join(".work.sqlite.reclaim-backup")).unwrap();
+        let mut journal = fs::read(temp.path().join(".work.sqlite.reclaim-journal")).unwrap();
+        if case.phase == Some("invalid_phase") {
+            let text = String::from_utf8(journal)
+                .unwrap()
+                .replace("validated_commit", "invalid_phase");
+            journal = text.into_bytes();
+        } else if let Some(phase) = case.phase {
+            let text = String::from_utf8(journal)
+                .unwrap()
+                .replace("validated_commit", phase);
+            journal = text.into_bytes();
+        }
+
+        for name in [
+            "work.sqlite",
+            ".work.sqlite.reclaim-backup",
+            ".work.sqlite.reclaim-output",
+            ".work.sqlite.reclaim-journal",
+            ".work.sqlite.reclaim-journal-new",
+        ] {
+            let path = temp.path().join(name);
+            if path.exists() {
+                fs::remove_file(path).unwrap();
+            }
+        }
+        if case.db {
+            fs::write(&db, &candidate).unwrap();
+        }
+        if case.backup {
+            fs::write(temp.path().join(".work.sqlite.reclaim-backup"), &backup).unwrap();
+        }
+        if case.output {
+            fs::write(
+                temp.path().join(".work.sqlite.reclaim-output"),
+                b"stale output",
+            )
+            .unwrap();
+        }
+        if case.phase.is_some() {
+            fs::write(temp.path().join(".work.sqlite.reclaim-journal"), &journal).unwrap();
+        }
+        if case.journal_new {
+            fs::write(
+                temp.path().join(".work.sqlite.reclaim-journal-new"),
+                b"stale journal",
+            )
+            .unwrap();
+        }
+        if db.exists() {
+            fs::set_permissions(&db, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        for name in [
+            ".work.sqlite.reclaim-backup",
+            ".work.sqlite.reclaim-output",
+            ".work.sqlite.reclaim-journal",
+            ".work.sqlite.reclaim-journal-new",
+        ] {
+            let path = temp.path().join(name);
+            if path.exists() {
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        }
+
+        let mut command = ctx(&temp);
+        command.args(["storage", "reclaim", "--json"]);
+        if case.expect_success {
+            let result = json_output(&mut command);
+            assert!(
+                result["status"] == "completed" || result["status"] == "skipped",
+                "{}: {result}",
+                case.name
+            );
+            assert_eq!(reclaim_db_snapshot(&db), expected_rows, "{}", case.name);
+            assert_eq!(
+                reclaim_sidecar_snapshot(temp.path()),
+                expected_sidecars,
+                "{}",
+                case.name
+            );
+            assert_reclaim_state_absent(temp.path());
+        } else {
+            command.assert().failure();
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn storage_reclaim_serializes_read_only_and_writable_openers_before_sqlite_open() {
+    let temp = tempdir();
+    seed_reclaim_fixture(&temp);
+    let db = temp.path().join("work.sqlite");
+    let old_inode = fs::metadata(&db).unwrap().ino();
+    let hold_marker = temp.path().join("reclaim-held");
+    let release = temp.path().join("reclaim-release");
+    fs::write(&release, b"hold").unwrap();
+    let mut reclaim_command = StdCommand::new(env!("CARGO_BIN_EXE_ctx"));
+    reclaim_command
+        .env("CTX_DATA_ROOT", temp.path())
+        .env("HOME", temp.path())
+        .env("CTX_TEST_RECLAIM_HOLD_MARKER", &hold_marker)
+        .env("CTX_TEST_RECLAIM_HOLD_RELEASE", &release)
+        .args(["storage", "reclaim", "--json"]);
+    let mut reclaim = reclaim_command.spawn().unwrap();
+    wait_for_child_file(&mut reclaim, &hold_marker);
+
+    let read_marker = temp.path().join("read-opened");
+    let writable_marker = temp.path().join("writable-opened");
+    let mut read_command = StdCommand::new(env!("CARGO_BIN_EXE_ctx"));
+    read_command
+        .env("CTX_DATA_ROOT", temp.path())
+        .env("HOME", temp.path())
+        .env("CTX_TEST_RECLAIM_OPEN_MARKER", &read_marker)
+        .args(["sql", "SELECT 1", "--json"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut read_only = read_command.spawn().unwrap();
+    let mut writable_command = StdCommand::new(env!("CARGO_BIN_EXE_ctx"));
+    writable_command
+        .env("CTX_DATA_ROOT", temp.path())
+        .env("HOME", temp.path())
+        .env("CTX_TEST_RECLAIM_OPEN_MARKER", &writable_marker)
+        .args(["setup", "--catalog-only", "--progress", "none", "--json"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut writable = writable_command.spawn().unwrap();
+
+    for (child, marker, kind) in [
+        (&mut read_only, &read_marker, "read-only"),
+        (&mut writable, &writable_marker, "writable"),
+    ] {
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while Instant::now() < deadline {
+            assert!(!marker.exists(), "{kind} opener reached SQLite too early");
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("{kind} opener exited before reclaim published: {status}");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fs::remove_file(&release).unwrap();
+    let reclaim_status = reclaim.wait().unwrap();
+    assert!(reclaim_status.success(), "reclaim exited {reclaim_status}");
+    let read_status = read_only.wait().unwrap();
+    let writable_status = writable.wait().unwrap();
+    assert!(
+        read_status.success(),
+        "read-only opener exited {read_status}"
+    );
+    assert!(
+        writable_status.success(),
+        "writable opener exited {writable_status}"
+    );
+
+    let published_inode = fs::metadata(&db).unwrap().ino();
+    assert_ne!(
+        published_inode, old_inode,
+        "reclaim did not publish a new inode"
+    );
+    assert_eq!(
+        fs::read_to_string(&read_marker).unwrap().trim(),
+        published_inode.to_string()
+    );
+    assert_eq!(
+        fs::read_to_string(&writable_marker).unwrap().trim(),
+        published_inode.to_string()
+    );
+    assert_reclaim_state_absent(temp.path());
+}
+
+#[cfg(unix)]
+#[test]
+fn storage_reclaim_crash_recovery_and_exclusion_are_process_safe() {
+    for stage in [
+        "checkpoint",
+        "output",
+        "validation",
+        "journal",
+        "rename",
+        "fsync",
+        "commit",
+        "cleanup",
+    ] {
+        let temp = tempdir();
+        json_output(ctx(&temp).args(["setup", "--catalog-only", "--progress", "none", "--json"]));
+        let db = temp.path().join("work.sqlite");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TABLE reclaim_fixture(value BLOB); INSERT INTO reclaim_fixture VALUES(zeroblob(1048576)); DROP TABLE reclaim_fixture;").unwrap();
+        drop(conn);
+        let before_version: i64 = Connection::open(&db)
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        ctx(&temp)
+            .env("CTX_TEST_RECLAIM_CRASH", stage)
+            .args(["storage", "reclaim", "--json"])
+            .assert()
+            .code(86);
+        ctx(&temp)
+            .args(["storage", "reclaim", "--json"])
+            .assert()
+            .success();
+        let store = Store::open_read_only(&db).unwrap();
+        assert_eq!(
+            store.schema_generation().unwrap().0,
+            before_version,
+            "stage {stage}"
+        );
+        assert!(!temp.path().join(".work.sqlite.reclaim-backup").exists());
+        assert!(!temp.path().join(".work.sqlite.reclaim-output").exists());
+        assert!(!temp.path().join(".work.sqlite.reclaim-journal").exists());
+    }
+
+    let temp = tempdir();
+    json_output(ctx(&temp).args(["setup", "--catalog-only", "--progress", "none", "--json"]));
+    let db = temp.path().join("work.sqlite");
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch("CREATE TABLE reclaim_fixture(value BLOB); INSERT INTO reclaim_fixture VALUES(zeroblob(65536)); DROP TABLE reclaim_fixture;").unwrap();
+    drop(conn);
+    let held = Store::open_read_only(&db).unwrap();
+    ctx(&temp)
+        .args(["storage", "reclaim", "--json"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("storage_reclaim_failed"));
+    drop(held);
+    ctx(&temp)
+        .env("CTX_TEST_RECLAIM_AVAILABLE_BYTES", "0")
+        .args(["storage", "reclaim", "--json"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("\"status\":\"failed\""));
+
+    // A durable commit marker is not permission to trust a damaged candidate:
+    // recovery verifies the journal's full fingerprint and restores the exact
+    // pre-reclaim backup.
+    let temp = tempdir();
+    json_output(ctx(&temp).args(["setup", "--catalog-only", "--progress", "none", "--json"]));
+    let db = temp.path().join("work.sqlite");
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch("CREATE TABLE reclaim_fixture(value BLOB); INSERT INTO reclaim_fixture VALUES(zeroblob(1048576)); DROP TABLE reclaim_fixture;").unwrap();
+    drop(conn);
+    ctx(&temp)
+        .env("CTX_TEST_RECLAIM_CRASH", "commit")
+        .args(["storage", "reclaim", "--json"])
+        .assert()
+        .code(86);
+    fs::write(&db, b"not a sqlite database").unwrap();
+    ctx(&temp)
+        .args(["storage", "reclaim", "--json"])
+        .assert()
+        .success();
+    Store::open_read_only(&db).unwrap();
 }
 
 #[test]
@@ -4742,7 +5521,10 @@ fn mcp_non_status_tools_report_version_guidance_without_mutating() {
             }
         }
         assert_eq!(fs::read(&db_path).unwrap(), bytes_before);
-        assert_eq!(sorted_dir_entries(temp.path()), entries_before);
+        let mut expected_entries = entries_before;
+        expected_entries.push(".ctx-reclaim.lock".to_string());
+        expected_entries.sort();
+        assert_eq!(sorted_dir_entries(temp.path()), expected_entries);
     }
 }
 

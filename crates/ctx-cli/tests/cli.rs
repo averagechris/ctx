@@ -10203,6 +10203,98 @@ fn opencode_incremental_fallback_reason_is_reported_once() {
 }
 
 #[test]
+fn opencode_auto_refresh_retries_partial_legacy_fallback_after_repair() {
+    let temp = tempdir();
+    let query = "opencode-legacy-repair-oracle";
+    let source = PathBuf::from(write_native_opencode_fixture(&temp, query));
+    let discovered = temp.path().join(".local/share/opencode/opencode.db");
+    fs::create_dir_all(discovered.parent().unwrap()).unwrap();
+    fs::copy(&source, &discovered).unwrap();
+
+    let source_conn = Connection::open(&discovered).unwrap();
+    source_conn
+        .execute(
+            "UPDATE message SET data = 'not json' WHERE id = 'opencode-cli-native-user'",
+            [],
+        )
+        .unwrap();
+    drop(source_conn);
+
+    let first = ctx(&temp)
+        .args(["search", query, "--provider", "opencode", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        !first.status.success(),
+        "partial refresh unexpectedly succeeded"
+    );
+
+    let db_path = temp.path().join("work.sqlite");
+    let source_key = {
+        let store = Store::open(&db_path).unwrap();
+        store
+            .source_refresh_lock_key("opencode", "opencode_sqlite", &discovered, "")
+            .unwrap()
+    };
+    let conn = Connection::open(&db_path).unwrap();
+    let (successful, cursor, next_retry, last_error): (
+        Option<Vec<u8>>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+    ) = conn
+        .query_row(
+            "SELECT successful_signature, incremental_cursor, next_retry_at_ms, last_error_code
+             FROM source_refresh_state WHERE source_key = ?1",
+            params![source_key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert!(successful.is_none());
+    assert!(cursor.is_none());
+    assert!(next_retry.is_some());
+    assert_eq!(last_error.as_deref(), Some("provider_read_failed"));
+    assert_eq!(sqlite_count(&conn, "SELECT COUNT(*) FROM events"), 0);
+    drop(conn);
+
+    let source_conn = Connection::open(&discovered).unwrap();
+    source_conn
+        .execute(
+            "UPDATE message SET data = ?1 WHERE id = 'opencode-cli-native-user'",
+            [r#"{"role":"user","time":{"created":1782259200000}}"#],
+        )
+        .unwrap();
+    drop(source_conn);
+
+    let repaired =
+        json_output(ctx(&temp).args(["search", query, "--provider", "opencode", "--json"]));
+    assert_eq!(repaired["freshness"]["status"], "completed");
+    assert_eq!(repaired["freshness"]["totals"]["imported_events"], 1);
+    assert_search_provider_oracle(&repaired, "opencode", query, 1, "message");
+
+    let conn = Connection::open(&db_path).unwrap();
+    let (successful, cursor, success_count, failure_count): (
+        Option<Vec<u8>>,
+        Option<String>,
+        i64,
+        i64,
+    ) = conn
+        .query_row(
+            "SELECT successful_signature, incremental_cursor, success_count, failure_count
+             FROM source_refresh_state WHERE source_key = ?1",
+            params![source_key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert!(successful.is_some());
+    // Legacy fallback has no durable incremental cursor, but the repaired
+    // source may now advance its successful source signature.
+    assert!(cursor.is_none());
+    assert_eq!(success_count, 1);
+    assert_eq!(failure_count, 0);
+}
+
+#[test]
 fn personal_agent_provider_imports_are_idempotent_and_incremental() {
     for (cli_provider, stored_provider, fixture, append_event) in [
         (

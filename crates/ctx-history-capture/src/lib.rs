@@ -3636,7 +3636,39 @@ pub fn import_opencode_sqlite_incremental(
         Ok(snapshot) => snapshot,
         Err(_) => {
             drop(conn);
-            let summary = import_opencode_sqlite_inner(path, store, options, None)?;
+            let owns_transaction = options.wrap_transaction;
+            if owns_transaction {
+                store.begin_immediate_batch()?;
+            }
+            let result = import_opencode_sqlite_inner(
+                path,
+                store,
+                OpenCodeSqliteImportOptions {
+                    wrap_transaction: false,
+                    ..options
+                },
+                None,
+            );
+            let summary = match result {
+                Ok(summary) => {
+                    if let Err(error) = reject_partial_opencode_import(&summary) {
+                        if owns_transaction {
+                            let _ = store.rollback_batch();
+                        }
+                        return Err(error);
+                    }
+                    if owns_transaction {
+                        store.commit_batch()?;
+                    }
+                    summary
+                }
+                Err(error) => {
+                    if owns_transaction {
+                        let _ = store.rollback_batch();
+                    }
+                    return Err(error);
+                }
+            };
             return Ok(OpenCodeIncrementalImportResult {
                 summary,
                 cursor_json: None,
@@ -3715,13 +3747,7 @@ pub fn import_opencode_sqlite_incremental(
             fast_event_inserts: true,
         },
     )?;
-    if summary.failed > summary.suppression_conflicts
-        || summary.failures.len() > summary.suppression_conflicts
-    {
-        return Err(CaptureError::InvalidPayload(
-            "OpenCode import was partial; incremental cursor was not advanced".into(),
-        ));
-    }
+    reject_partial_opencode_import(&summary)?;
     let incremental = plan.is_some();
     let mut next = snapshot;
     if incremental {
@@ -3751,6 +3777,17 @@ pub fn import_opencode_sqlite_incremental(
         part_rows_scanned: scanned.2,
         journal_rows_scanned: scanned.3,
     })
+}
+
+fn reject_partial_opencode_import(summary: &ProviderImportSummary) -> Result<()> {
+    if summary.failed > summary.suppression_conflicts
+        || summary.failures.len() > summary.suppression_conflicts
+    {
+        return Err(CaptureError::InvalidPayload(
+            "OpenCode import was partial; incremental cursor was not advanced".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn opencode_journal_fallback(
@@ -15377,6 +15414,30 @@ mod tests {
             import_opencode_sqlite(&corrupt, &mut store, OpenCodeSqliteImportOptions::default())
                 .unwrap_err();
         assert!(err.to_string().contains("not a database"));
+    }
+
+    #[test]
+    fn opencode_incremental_rejects_partial_legacy_fallback() {
+        let temp = tempdir();
+        let fixture = write_opencode_smoke_db(&temp, true);
+        let mut store = Store::open(temp.path().join("work.sqlite")).unwrap();
+
+        let error = import_opencode_sqlite_incremental(
+            &fixture,
+            &mut store,
+            OpenCodeSqliteImportOptions {
+                allow_partial_failures: true,
+                ..OpenCodeSqliteImportOptions::default()
+            },
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("OpenCode import was partial; incremental cursor was not advanced"));
+        assert_eq!(store.capture_source_count().unwrap(), 0);
+        assert_eq!(store.indexed_history_item_count().unwrap(), 0);
     }
 
     #[test]

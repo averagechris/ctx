@@ -2862,7 +2862,9 @@ fn open_read_nofollow(path: &Path, directory: bool) -> Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
         OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            // O_NONBLOCK keeps a raced FIFO from blocking this durability
+            // boundary before the metadata check below rejects it.
+            .custom_flags(libc::O_NOFOLLOW | if directory { 0 } else { libc::O_NONBLOCK })
             .open(path)
             .map_err(|error| {
                 let code = if error.raw_os_error() == Some(libc::ELOOP) {
@@ -4751,7 +4753,7 @@ fn verify_completion(stage: &Path, manifest: &[u8], marker: &[u8]) -> Result<()>
     Ok(())
 }
 
-fn sync_tree(root: &Path) -> Result<()> {
+pub(crate) fn sync_tree(root: &Path) -> Result<()> {
     // The staging tree is created 0700 and is never exposed before the
     // exclusive rename. Path enumeration is therefore protected from other
     // users; every file and directory is nevertheless reopened with
@@ -4763,6 +4765,14 @@ fn sync_tree(root: &Path) -> Result<()> {
             sync_tree(&path)?;
         } else if metadata.is_file() {
             open_read_nofollow(&path, false)?.sync_all()?;
+        } else {
+            return Err(verification_error(
+                ArchiveVerificationCode::SpecialFile,
+                format!(
+                    "archive sync encountered non-regular child: {}",
+                    path.display()
+                ),
+            ));
         }
     }
     sync_directory(root)

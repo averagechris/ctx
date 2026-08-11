@@ -8,14 +8,19 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    archive::{verify_archive_bundle_internal, ArchiveVerifyOptions},
+    archive::{sync_tree, verify_archive_bundle_internal, ArchiveVerifyOptions},
     compaction::plan,
     utc_now, Result, Store, StoreError, EVENT_SEARCH_ROWID_MAP, RECORD_SEARCH_ROWID_MAP,
 };
 
 #[cfg(test)]
+type VerifyHook = Box<dyn FnOnce() -> Result<()>>;
+#[cfg(test)]
 thread_local! {
     static FAIL_PHASE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+    static TRACE: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
+    static VERIFY_HOOK: std::cell::RefCell<Option<VerifyHook>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -28,6 +33,29 @@ fn injected(phase: &'static str) -> Result<()> {
 #[cfg(not(test))]
 fn injected(_: &'static str) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+fn trace(phase: &'static str) {
+    TRACE.with(|trace| trace.borrow_mut().push(phase));
+}
+
+#[cfg(test)]
+fn set_verify_hook(hook: impl FnOnce() -> Result<()> + 'static) {
+    VERIFY_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_verify_hook() -> Result<()> {
+    VERIFY_HOOK.with(|slot| match slot.borrow_mut().take() {
+        Some(hook) => hook(),
+        None => Ok(()),
+    })
+}
+
+#[cfg(test)]
+fn clear_verify_hook() {
+    VERIFY_HOOK.with(|slot| slot.borrow_mut().take());
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -111,6 +139,8 @@ impl Store {
             .as_ref()
             .ok_or_else(|| reject("selective evidence is missing"))?;
         let expected_suppressions = verified.selective_suppression_facts()?;
+        #[cfg(test)]
+        run_verify_hook()?;
         let suppressible_roots = archived
             .members
             .iter()
@@ -261,13 +291,31 @@ impl Store {
                 "authorized deletion members are missing or duplicated",
             ));
         }
+        for (kind, _, _) in &members {
+            match kind.as_str() {
+                "object_blob" => return Err(reject("object blobs are never hot-deletion members")),
+                other if ROW_KINDS.iter().any(|(known, _, _)| *known == other) => {}
+                _ => return Err(reject("unknown authorized entity kind")),
+            }
+        }
+
+        // The archive is the source of truth once its verification and ledger
+        // matching have passed. Make that accepted bundle durable before any
+        // canonical, projection, or ledger deletion can commit. Reuse the
+        // archive writer's no-follow traversal so files and directories are
+        // synced without weakening its symlink/privacy checks.
+        injected("archive_sync")?;
+        sync_tree(bundle)?;
+        #[cfg(test)]
+        trace("archive_sync");
+
+        #[cfg(test)]
+        trace("deletion");
         for (kind, key, _) in &members {
             match kind.as_str() {
                 "history_records" => RECORD_SEARCH_ROWID_MAP.delete_projection_rows(&tx, key)?,
                 "events" => EVENT_SEARCH_ROWID_MAP.delete_projection_rows(&tx, key)?,
-                "object_blob" => return Err(reject("object blobs are never hot-deletion members")),
-                other if ROW_KINDS.iter().any(|(known, _, _)| *known == other) => {}
-                _ => return Err(reject("unknown authorized entity kind")),
+                _ => {}
             }
         }
         injected("projection")?;
@@ -319,7 +367,12 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, os::unix::process::ExitStatusExt, process::Command};
+    use std::{
+        ffi::CString,
+        fs,
+        os::unix::{ffi::OsStrExt, process::ExitStatusExt},
+        process::Command,
+    };
     use tempfile::tempdir;
 
     const SELECTED_SESSION: &str = "70000000-0000-7000-8000-000000000099";
@@ -327,7 +380,7 @@ mod tests {
     const SELECTED_ARTIFACT: &str = "70000000-0000-7000-8000-000000000104";
 
     fn atomic_snapshot(store: &Store) -> Vec<String> {
-        [
+        let mut queries: Vec<String> = vec![
             "SELECT id FROM sessions ORDER BY id",
             "SELECT id FROM events ORDER BY id",
             "SELECT rowid || ':' || event_id FROM event_search ORDER BY rowid",
@@ -340,16 +393,23 @@ mod tests {
             "SELECT operation_id || ':' || operation_kind || ':' || phase FROM compaction_operations ORDER BY operation_id",
         ]
         .into_iter()
-        .map(|sql| {
-            let mut statement = store.conn.prepare(sql).unwrap();
-            statement
-                .query_map([], |row| row.get::<_, String>(0))
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap()
-                .join("|")
-        })
-        .collect()
+        .map(str::to_owned)
+        .collect();
+        queries.extend(ROW_KINDS.iter().map(|(_, table, key_expression)| {
+            format!("SELECT {key_expression} FROM {table} ORDER BY {key_expression}")
+        }));
+        queries
+            .into_iter()
+            .map(|sql| {
+                let mut statement = store.conn.prepare(&sql).unwrap();
+                statement
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+                    .join("|")
+            })
+            .collect()
     }
 
     fn fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
@@ -1076,7 +1136,7 @@ mod tests {
 
     #[test]
     fn every_deletion_phase_failure_rolls_back_base_projection_and_ledger() {
-        for phase in ["projection", "base", "ledger"] {
+        for phase in ["archive_sync", "projection", "base", "ledger"] {
             let (_temp, db, bundle) = fixture();
             let mut store = Store::open(&db).unwrap();
             store.conn.execute("INSERT INTO event_search(event_id,history_record_id,session_id,role,safe_preview_text,rank_bucket) VALUES(?1,'','',NULL,'secret',0)", ["70000000-0000-7000-8000-000000000100"]).unwrap();
@@ -1088,6 +1148,53 @@ mod tests {
             FAIL_PHASE.with(|slot| slot.set(None));
             assert_eq!(atomic_snapshot(&store), before, "phase {phase}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_substitution_after_verification_aborts_deletion_without_mutation() {
+        for mode in ["symlink", "hardlink", "fifo"] {
+            let (_temp, db, bundle) = fixture();
+            let mut store = Store::open(&db).unwrap();
+            store.conn.execute("INSERT INTO event_search(event_id,history_record_id,session_id,role,safe_preview_text,rank_bucket) VALUES(?1,'','',NULL,'secret',0)", [SELECTED_EVENT]).unwrap();
+            let before = atomic_snapshot(&store);
+            let child = bundle.join("streams/01-capture_sources.jsonl");
+            let replacement = bundle.join("manifest.json");
+            set_verify_hook(move || {
+                fs::remove_file(&child)?;
+                match mode {
+                    "symlink" => std::os::unix::fs::symlink(&replacement, &child)?,
+                    "hardlink" => fs::hard_link(&replacement, &child)?,
+                    "fifo" => {
+                        let path = CString::new(child.as_os_str().as_bytes()).unwrap();
+                        if unsafe { libc::mkfifo(path.as_ptr(), 0o600) } != 0 {
+                            return Err(std::io::Error::last_os_error().into());
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                Ok(())
+            });
+            assert!(store
+                .commit_archive_deletion(&bundle, ArchiveDeletionOptions::default())
+                .is_err());
+            clear_verify_hook();
+            assert_eq!(atomic_snapshot(&store), before, "mode {mode}");
+        }
+    }
+
+    #[test]
+    fn successful_deletion_syncs_archive_before_deleting_members() {
+        let (_temp, db, bundle) = fixture();
+        let mut store = Store::open(&db).unwrap();
+        TRACE.with(|trace| trace.borrow_mut().clear());
+
+        store
+            .commit_archive_deletion(&bundle, ArchiveDeletionOptions::default())
+            .unwrap();
+
+        let phases = TRACE.with(|trace| trace.borrow().clone());
+        assert_eq!(phases, ["archive_sync", "deletion"]);
     }
 
     #[test]

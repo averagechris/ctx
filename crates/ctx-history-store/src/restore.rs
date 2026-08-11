@@ -5,8 +5,8 @@
 
 use crate::{
     archive::{
-        read_capped_line, verify_archive_bundle_internal, AnchoredDir, ArchiveVerifyOptions,
-        ManifestInfo, VerifiedArchive,
+        read_capped_line, sync_tree, verify_archive_bundle_internal, AnchoredDir,
+        ArchiveVerifyOptions, ManifestInfo, VerifiedArchive,
     },
     object_relative_path, rebuild_search_projection, Result, Store, StoreError,
 };
@@ -405,6 +405,28 @@ fn run_restore_phase_hook() -> Result<()> {
 }
 
 #[cfg(test)]
+type RestoreSyncHook = Box<dyn FnOnce(&Path) -> Result<()>>;
+#[cfg(test)]
+thread_local! {
+    static RESTORE_SYNC_HOOK: std::cell::RefCell<Option<RestoreSyncHook>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+fn set_restore_sync_hook(hook: impl FnOnce(&Path) -> Result<()> + 'static) {
+    RESTORE_SYNC_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+#[cfg(test)]
+fn clear_restore_sync_hook() {
+    RESTORE_SYNC_HOOK.with(|slot| slot.borrow_mut().take());
+}
+#[cfg(test)]
+fn run_restore_sync_hook(stage: &Path) -> Result<()> {
+    RESTORE_SYNC_HOOK.with(|slot| match slot.borrow_mut().take() {
+        Some(hook) => hook(stage),
+        None => Ok(()),
+    })
+}
+
+#[cfg(test)]
 thread_local! { static SELECTIVE_FAIL_PHASE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) }; }
 #[cfg(test)]
 pub(crate) fn set_selective_fail_phase(phase: Option<&'static str>) {
@@ -503,6 +525,8 @@ pub fn restore_archive_bundle(
     postcheck(&store, &verified.manifest)?;
     drop(store);
     sidecars(&db)?;
+    #[cfg(test)]
+    run_restore_sync_hook(&stage)?;
     sync_tree(&stage)?;
     publish(&stage, target, &parent_anchor)?;
     cleanup.0 = PathBuf::new();
@@ -1784,18 +1808,6 @@ fn sidecars(db: &Path) -> Result<()> {
     }
     Ok(())
 }
-fn sync_tree(p: &Path) -> Result<()> {
-    for e in fs::read_dir(p)? {
-        let p = e?.path();
-        if p.is_dir() {
-            sync_tree(&p)?
-        } else {
-            open_safe(&p, false)?.sync_all()?
-        }
-    }
-    open_safe(p, true)?.sync_all()?;
-    Ok(())
-}
 #[cfg(unix)]
 fn publish(stage: &Path, target: &Path, parent: &AnchoredDir) -> Result<()> {
     use std::{
@@ -1836,6 +1848,7 @@ fn publish(stage: &Path, target: &Path, parent: &AnchoredDir) -> Result<()> {
 mod tests {
     use super::*;
     use crate::{verify_archive_bundle, ArchiveOptions};
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
 
     fn bundle() -> (tempfile::TempDir, PathBuf) {
         let temp = tempfile::Builder::new()
@@ -1864,6 +1877,46 @@ mod tests {
             .to_string_lossy()
             .starts_with("restored.tmp-")));
         verify_archive_bundle(&bundle).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_child_substitution_aborts_restore_without_publication() {
+        for mode in ["symlink", "hardlink", "fifo"] {
+            let (temp, bundle) = bundle();
+            let target = temp.path().join("restored");
+            set_restore_sync_hook(move |stage| {
+                let child = stage.join("streams/01-capture_sources.jsonl");
+                let replacement = stage.join("COMPLETE");
+                fs::remove_file(&child)?;
+                match mode {
+                    "symlink" => std::os::unix::fs::symlink(&replacement, &child)?,
+                    "hardlink" => fs::hard_link(&replacement, &child)?,
+                    "fifo" => {
+                        let path = CString::new(child.as_os_str().as_bytes()).unwrap();
+                        if unsafe { libc::mkfifo(path.as_ptr(), 0o600) } != 0 {
+                            return Err(std::io::Error::last_os_error().into());
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                Ok(())
+            });
+            assert!(
+                restore_archive_bundle(&bundle, &target, ArchiveVerifyOptions::default()).is_err(),
+                "mode {mode}"
+            );
+            clear_restore_sync_hook();
+            assert!(!target.exists(), "mode {mode}");
+            assert!(!fs::read_dir(temp.path()).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("restored.tmp-")
+            }));
+            verify_archive_bundle(&bundle).unwrap();
+        }
     }
 
     #[test]

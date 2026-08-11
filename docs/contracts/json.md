@@ -7,6 +7,47 @@ redacts it.
 Command result JSON currently uses `schema_version: 1`. Progress-event JSON is
 stderr progress output and does not include `schema_version`.
 
+## Storage reclaim
+
+```bash
+ctx storage reclaim --json
+```
+
+On a successful attempt the single stdout object contains `status`, `reason`,
+`before`, `after`, and `estimated_temporary_bytes`. `status` is `completed`
+when a compact database was installed, or `skipped` when there was nothing to
+reclaim. The skipped reason is `nothing_reclaimable`; `after` is null for that
+case. A snapshot contains `main_db_bytes`, `wal_bytes`, `shm_bytes`,
+`objects_bytes`, `spool_bytes`, `freelist_bytes`, `available_space_bytes`, and
+`temporary_bytes`. `reason` is null after reclaim and otherwise a stable reason
+when the operation safely declines. On failure, JSON mode writes no result to
+stdout and emits `{ "status": "failed", "error": { "code":
+"storage_reclaim_failed", ... } }` to stderr, exiting 1; the message is not a
+diagnostic contract. The operation is physical compaction only: it does not
+logically delete history, object files, or spool data. These sizing fields are
+private local metadata and contain no transcript content or paths.
+
+## Archive compaction and suppression
+
+`archive create --cutoff-ms N` returns the normal archive result shape with
+`format: "ctx-selective-archive"`; it selects completed sessions ending at or
+before inclusive cutoff and their authenticated closure. Without the option,
+`format` is `"ctx-archive"`. Creation does not delete rows.
+
+Selective restore JSON includes `format`, `format_version`, `archive_id`,
+`source_schema_version`, `path`, `restored`, `entity_count`, `objects` (with
+`count` and `total_bytes`), `inserted_count`, `reused_count`, and
+`selected_root_count`. `--session-id` may be repeated; duplicate IDs are
+harmless, and an empty list means all authenticated roots in a selective
+bundle. The success path includes `path`, so treat it as private.
+
+`archive suppression-status --json` returns exactly the bounded counts
+`active`, `conflict`, `restored`, and `overridden`; it is read-only and
+path-free. `archive override --json` returns `operation_id`,
+`affected_associations`, and `effective_state`. Override is an audited ledger
+operation, not a change to canonical history. Consumers must ignore additive
+future fields and must not treat these objects as share-safe.
+
 ## Setup
 
 ```bash

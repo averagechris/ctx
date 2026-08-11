@@ -71,6 +71,7 @@ This table describes core command effects.
 | `ctx archive verify` | archive bundle and its private verifier scratch state | private sibling `.ctxar-verify-<id>/state.sqlite` scratch database, normally removed; bundle contents are not changed |
 | `ctx archive restore` | verified archive bundle and current binary's store schema | full bundles: absent private root, atomically published; registered selective bundles: explicit authenticated closure merged into the existing private root |
 | `ctx doctor --storage` | SQLite index, data root metadata, file sizes, SQLite page/freelist metrics | none |
+| `ctx storage reclaim` | SQLite and local object/spool sizing | WAL checkpoint and atomically replaced compact SQLite file; no logical history deletion |
 
 `ctx status` and `ctx doctor --storage` do not migrate schemas, import history,
 checkpoint WAL files, vacuum, optimize, or write growth-tracking state. They use
@@ -111,6 +112,25 @@ FTS-derived bytes via `dbstat` when available. Missing `dbstat` or filesystem fr
 bounded diagnostic, not a fatal error. Low-space thresholds are documented as
 512 MiB warning and 128 MiB critical because imports and SQLite maintenance may
 need temporary working space in addition to the final database footprint.
+
+## Logical deletion versus physical reclaim
+
+Selective archive workflows have two distinct destructive boundaries. `archive
+commit --yes` logically deletes the selected canonical rows and active search
+projections after re-verifying the archive and closure. It does not unlink
+object files, checkpoint WAL, vacuum, or return SQLite freelist pages to the
+filesystem. `storage reclaim` is the later, explicit physical operation: it
+requires an exclusive reclaim lock and enough temporary free space, checkpoints
+and truncates WAL, validates a compact replacement, and atomically swaps the
+database. It preserves object and spool content and refuses on unsafe changes,
+active handles, unsupported schema, or insufficient space. A failed or
+interrupted reclaim is recovered from its journal; it does not broaden a
+logical deletion set.
+
+The reclaim report is local and private. It contains byte counts for the main
+database, WAL, SHM, objects, spool, freelist, available space, and temporary
+working requirement, plus status/reason and (on success) an after snapshot. It
+does not include transcript text or filesystem paths. See the [JSON contract](contracts/json.md#storage-reclaim).
 
 Setup, import, and search do not require source repository writes, model APIs,
 API keys, or remote accounts.

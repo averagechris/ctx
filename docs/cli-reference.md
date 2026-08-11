@@ -111,6 +111,11 @@ CTX_DATA_ROOT="$source_root" ctx archive register "$bundle"
 CTX_DATA_ROOT="$source_root" ctx archive commit "$bundle" --dry-run
 CTX_DATA_ROOT="$source_root" ctx archive commit "$bundle" --yes
 ctx archive restore "$bundle" "$restored_root"
+ctx archive restore "$bundle" "$source_root" --session-id SESSION_UUID
+ctx archive suppression-status --json
+ctx archive override --identity-key IDENTITY_KEY --content-key CONTENT_KEY \
+  --reason "reviewed duplicate" --json
+ctx storage reclaim --json
 ```
 
 The complete user workflow, including fresh temporary paths, privacy, and
@@ -173,6 +178,28 @@ publication: exclusive rename is the publication point, but a parent `fsync`
 can fail after the complete target exists. Verification and restore accept
 the lowering-only bounds `--max-entities`, `--max-objects`,
 `--max-object-bytes`, and `--max-bytes`.
+
+### Selective restore, suppression, and physical reclaim
+
+`archive create --cutoff-ms <INTEGER> TARGET` makes a selective archive from a
+fresh plan: only completed sessions with non-null end time at or before the
+inclusive cutoff, plus their authenticated dependency closure, are included.
+Without the option, creation is complete. Creation never deletes source data;
+logical deletion is the separate explicit `archive commit TARGET --yes` step.
+
+`archive restore BUNDLE TARGET --session-id UUID` is repeatable. Duplicate IDs
+are harmless, and no IDs means every authenticated root in a selective bundle.
+Selective restore merges into an existing current root; full archives require
+an absent target. `archive suppression-status` is read-only and returns bounded,
+path-free counts for `active`, `conflict`, `restored`, and `overridden`.
+`archive override` requires identity key, content key, and an audit reason;
+`--archive-id` optionally narrows the association and does not alter history.
+
+`storage reclaim` performs physical maintenance only: it locks the store,
+checkpoints/truncates WAL, validates a `VACUUM INTO` replacement, and atomically
+installs it. It preserves object/spool files and refuses unsafe or
+insufficient-space conditions. It does not logically delete sessions. Reports
+are private sizing metadata and contain no transcript content or paths.
 
 ## Sources
 

@@ -20,6 +20,7 @@ const OUTPUT: &str = ".work.sqlite.reclaim-output";
 const BACKUP: &str = ".work.sqlite.reclaim-backup";
 const JOURNAL: &str = ".work.sqlite.reclaim-journal";
 const JOURNAL_NEW: &str = ".work.sqlite.reclaim-journal-new";
+const JSON_ERROR_MESSAGE_LIMIT: usize = 512;
 
 #[derive(Debug, Serialize)]
 struct Report {
@@ -72,14 +73,25 @@ pub fn run(root: &Path, json: bool) -> Result<()> {
             Ok(())
         }
         Err(e) if json => {
+            let message = bounded_error_message(&e);
             eprintln!(
                 "{}",
-                serde_json::json!({"status":"failed","error":{"code":"storage_reclaim_failed","message":"physical reclaim was refused or failed"}})
+                serde_json::json!({"status":"failed","error":{"code":"storage_reclaim_failed","message":message}})
             );
-            let _ = e;
             Err(anyhow!(crate::SilentExit { code: 1 }))
         }
         Err(e) => Err(e),
+    }
+}
+
+fn bounded_error_message(error: &anyhow::Error) -> String {
+    let message = error.to_string();
+    let mut chars = message.chars();
+    let bounded: String = chars.by_ref().take(JSON_ERROR_MESSAGE_LIMIT).collect();
+    if chars.next().is_some() {
+        format!("{bounded}…")
+    } else {
+        bounded
     }
 }
 

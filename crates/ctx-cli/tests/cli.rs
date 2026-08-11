@@ -764,18 +764,36 @@ fn storage_reclaim_crash_recovery_and_exclusion_are_process_safe() {
     conn.execute_batch("CREATE TABLE reclaim_fixture(value BLOB); INSERT INTO reclaim_fixture VALUES(zeroblob(65536)); DROP TABLE reclaim_fixture;").unwrap();
     drop(conn);
     let held = Store::open_read_only(&db).unwrap();
-    ctx(&temp)
+    let held_failure = ctx(&temp)
         .args(["storage", "reclaim", "--json"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("storage_reclaim_failed"));
+        .get_output()
+        .stderr
+        .clone();
+    let held_json: Value = serde_json::from_slice(&held_failure).unwrap();
+    assert_eq!(
+        held_json["error"]["message"],
+        "io error: physical reclaim refused because a ctx store handle is active"
+    );
+    assert!(!held_json["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains(temp.path().to_str().unwrap()));
     drop(held);
-    ctx(&temp)
+    let low_space_failure = ctx(&temp)
         .env("CTX_TEST_RECLAIM_AVAILABLE_BYTES", "0")
         .args(["storage", "reclaim", "--json"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("\"status\":\"failed\""));
+        .get_output()
+        .stderr
+        .clone();
+    let low_space_json: Value = serde_json::from_slice(&low_space_failure).unwrap();
+    assert_eq!(
+        low_space_json["error"]["message"],
+        "insufficient temporary space"
+    );
 
     // A durable commit marker is not permission to trust a damaged candidate:
     // recovery verifies the journal's full fingerprint and restores the exact

@@ -2,11 +2,28 @@
 
 ## Unreleased
 
+### Added
+
+- Added a persistent automatic-refresh policy with source health, refresh
+  leases, path-free state, and bounded incremental OpenCode refreshes. Search
+  now attributes refresh phases and coalesces concurrent stateful refresh work.
+- Added deterministic, read-only compaction planning and verified selective
+  archive bundles, followed by archive-backed deletion, archived-reimport
+  suppression, selective restore, and explicit physical SQLite reclaim.
+- Documented the archive-first compaction contract, archive format, storage
+  operations, and the compaction and reclaim CLI and JSON interfaces.
+
 ### Changed
 
 - Adopted the fleet's fail-closed, resumable release workflow, including a
   documented readiness check and a Nix contract check that prevents the release
   CLI and operator instructions from drifting.
+
+### Fixed
+
+- Kept fallback OpenCode refreshes fail-closed when a source scan is partial,
+  stabilized crash-lease coverage, synchronized archives before deletion, and
+  reported reclaim failures consistently in JSON output.
 
 ## v1.1.0 - 2026-08-09
 

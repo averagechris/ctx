@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+
+## v1.2.0 - 2026-08-11
+
 ### Added
 
 - Added a persistent automatic-refresh policy with source health, refresh
@@ -24,7 +27,6 @@
 - Kept fallback OpenCode refreshes fail-closed when a source scan is partial,
   stabilized crash-lease coverage, synchronized archives before deletion, and
   reported reclaim failures consistently in JSON output.
-
 ## v1.1.0 - 2026-08-09
 
 ### Added

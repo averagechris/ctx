@@ -1,0 +1,60 @@
+name: Build release artifacts (manual publication required)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing annotated tag selected from main (vX.Y.Z)
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: tag
+        name: Validate trusted annotated tag
+        env:
+          REQUESTED_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REPOSITORY" == "averagechris/ctx" ]] || { echo 'untrusted repository' >&2; exit 1; }
+          [[ "$REQUESTED_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'tag must be vX.Y.Z' >&2; exit 1; }
+          remote=$(git ls-remote --tags origin "refs/tags/$REQUESTED_TAG" "refs/tags/$REQUESTED_TAG^{}")
+          object=$(awk -v ref="refs/tags/$REQUESTED_TAG" '$2 == ref {print $1}' <<<"$remote")
+          commit=$(awk -v ref="refs/tags/$REQUESTED_TAG^{}" '$2 == ref {print $1}' <<<"$remote")
+          [[ -n "$object" && -n "$commit" ]] || { echo 'tag is absent or is not annotated on origin' >&2; exit 1; }
+          git fetch --force --no-tags origin "refs/tags/$REQUESTED_TAG:refs/tags/$REQUESTED_TAG"
+          [[ "$(git cat-file -t "$REQUESTED_TAG")" == tag ]] || { echo 'release tag must be annotated' >&2; exit 1; }
+          [[ "$(git rev-parse "$REQUESTED_TAG^{tag}")" == "$object" ]] || exit 1
+          [[ "$(git rev-parse "$REQUESTED_TAG^{commit}")" == "$commit" ]] || exit 1
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            [[ "$GITHUB_REF" == "refs/tags/$REQUESTED_TAG" ]] || exit 1
+            [[ "$GITHUB_SHA" == "$commit" ]] || { echo 'tag push SHA does not resolve to tag commit' >&2; exit 1; }
+          else
+            [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$GITHUB_REF" == refs/heads/main ]] || { echo 'manual recovery must run from main' >&2; exit 1; }
+            git merge-base --is-ancestor "$commit" "$GITHUB_SHA" || { echo 'tag commit is not an ancestor of selected main' >&2; exit 1; }
+          fi
+          echo "tag=$REQUESTED_TAG" >> "$GITHUB_OUTPUT"
+
+  artifacts:
+    needs: validate
+    permissions:
+      contents: read
+    uses: averagechris/fleet/.github/workflows/release.yml@e31a02573d79dfeb2496fec6c21cf74a0ece4d79
+    with:
+      tag: ${{ needs.validate.outputs.tag }}
+      platforms: '[{"name":"aarch64-darwin","runner":"macos-14"},{"name":"x86_64-linux","runner":"ubuntu-24.04"}]'

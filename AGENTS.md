@@ -1,20 +1,22 @@
 # AGENTS.md
 
 This is a hard fork of [ctxrs/ctx](https://github.com/ctxrs/ctx) maintained at
-`git.sr.ht/~averagechris/ctx`. Decision record and phased plan:
+`github.com/averagechris/ctx`. Decision record and phased plan:
 [docs/fork-plan.md](docs/fork-plan.md).
 
 ## Working in this repo
 
 - Use `jj`, not `git`. Trunk bookmark is `main` → remote `origin`
-  (`git@git.sr.ht:~averagechris/ctx`). Remote `upstream` is
+  (`git@github.com:averagechris/ctx.git`). Remote `upstream` is
   github.com/ctxrs/ctx and is fetch-only, used for selectively porting fixes.
+  The `sourcehut` remote is archival and must not be used for releases.
 - Build/test via the Nix flake: `nix develop` for a cargo devShell, then
   `cargo fmt --all --check`, `cargo clippy --locked --all-targets -- -D warnings`,
   `cargo test --workspace`. Or run the CI wrappers directly: `nix run .#ci-fmt`,
   `nix run .#ci-clippy`, `nix run .#ci-test`, `nix run .#ci-docs`.
-  `nix flake check` builds the package with the full test suite. SourceHut CI
-  runs the same wrappers via `.builds/ci.yml`. `jj lint` runs the fast gates
+  `nix flake check` builds the package with the full test suite. The archival
+  SourceHut CI manifest runs the same wrappers via `.builds/ci.yml`. `jj lint`
+  runs the fast gates
   (`ci-fmt`, `ci-clippy`, `ci-docs`) from `.jj-lint.toml` — run it before
   pushing.
 - `crates/ctx-cli/tests/cli.rs` is the behavioral contract — lean on it when
@@ -38,8 +40,8 @@ This is a hard fork of [ctxrs/ctx](https://github.com/ctxrs/ctx) maintained at
 - **No network calls from the binary, ever.** This fork removed telemetry
   (`analytics.rs`, `identity.rs`), self-upgrade (`upgrade.rs`), and all
   `ctx.rs` endpoints. Do not reintroduce phone-home, update checks, or any
-  HTTP client dependency. Releases are SourceHut `vX.Y.Z` tags; Nix owns the
-  binary lifecycle.
+  HTTP client dependency. Releases are annotated GitHub `vX.Y.Z` tags with
+  manually published GitHub Release assets; Nix owns the binary lifecycle.
 - **No SDKs / wire contracts.** `sdks/`, `ctx-sdk`, `ctx-protocol`, and
   `contracts/` were deleted. The programmatic surface is CLI `--json` output
   and the MCP server. Recover from upstream history if genuinely needed.
@@ -80,30 +82,24 @@ This is a hard fork of [ctxrs/ctx](https://github.com/ctxrs/ctx) maintained at
 
 ## Release flow
 
-- The routine release interface is exactly these two commands; Tiny should run
-  the readiness check first and proceed only when it succeeds:
+- The routine release interface is exactly these two commands. Run the read-only
+  readiness check first and proceed only when it succeeds:
 
     nix run .#release -- --version X.Y.Z --check
-    nix run .#release -- --version X.Y.Z [--submit-linux-build]
+    nix run .#release -- --version X.Y.Z
 
-  The non-mutating check fails fast on a dirty/stale/diverged checkout, missing
-  origin or SourceHut authentication, an invalid/downgrade version, and local or
-  remote tag conflicts. The release then prepares the versioned tree; validates
-  that prepared tree with fmt, clippy, tests, and docs; builds and verifies the
-  artifact and checksum; and atomically publishes `main` plus an annotated tag
-  with a lease. Artifact uploads and the downloads-site refresh are idempotent;
-  Linux submission is also idempotent when requested. If publication succeeded
-  but a later step failed, rerun the exact same command: only an exact matching
-  version, tag, and main state resumes, while mismatches fail closed. Successful
-  publication leaves a new empty `@` above `main`.
-- `builds/release-linux-x86_64.yml` builds the Linux `release-artifact` and
-  uploads it and requests a downloads-site refresh. It lives in `builds/` (not
-  `.builds/`) so it does not auto-run on every push; request it through the
-  routine release command's optional argument.
-- `prepare-release`, `release-tag`, `build-pages`, and `publish-pages` are
-  lower-level recovery tools only. Do not compose them into the
-  normal release path; inspect their help and release state before using one
-  during manual recovery.
+  The real release preserves the Cargo version and lockfile stamping, validates
+  the prepared tree with fmt, clippy, tests, and docs, then atomically publishes
+  `main` and an annotated tag. GitHub Actions builds the macOS Apple silicon and
+  Linux x86_64 artifacts with read-only permissions. It never publishes a
+  GitHub Release.
+- A person verifies tag identity, sidecars, uploaded bytes, and digests before
+  removing draft status. Follow [docs/release.md](docs/release.md). Do not add
+  secrets, an automatic publisher, a PR release workflow, or an automatic Pages
+  dispatch; after publication, follow the documented manual Pages workflow
+  dispatch with `project=ctx`.
+- `prepare-release` and `release-tag` are lower-level recovery tools only. Do
+  not compose them into the normal release path.
 
 ## Upstream review memory
 

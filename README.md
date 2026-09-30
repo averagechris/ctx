@@ -6,10 +6,11 @@ then gives you and your agents fast search, read-only SQL, and an MCP server
 over that history.
 
 This is a hard fork of [ctxrs/ctx](https://github.com/ctxrs/ctx) maintained at
-[https://git.sr.ht/~averagechris/ctx](https://git.sr.ht/~averagechris/ctx).
+[https://github.com/averagechris/ctx](https://github.com/averagechris/ctx).
 The fork makes **no network calls**: telemetry, self-update, and all hosted
-endpoints were removed. Updates ship as SourceHut release tags and are managed
-by Nix. See [docs/fork-plan.md](docs/fork-plan.md) for the decision record.
+endpoints were removed. Updates ship as annotated GitHub tags and manually
+verified GitHub Release assets, and are managed by Nix. See
+[docs/fork-plan.md](docs/fork-plan.md) for the decision record.
 
 ## Install
 
@@ -17,19 +18,20 @@ With Nix (flakes):
 
 ```bash
 # run directly from the latest release tag
-nix run 'git+https://git.sr.ht/~averagechris/ctx?ref=refs/tags/v1.0.0'
+nix run 'github:averagechris/ctx/v1.2.0'
 
 # or track main
-nix run sourcehut:~averagechris/ctx
+nix run github:averagechris/ctx
 
 # or build locally
 nix build .#ctx
 ```
 
-Or add `sourcehut:~averagechris/ctx` as a flake input.
+Or add `github:averagechris/ctx` as a flake input.
 
-Hosted release downloads and checksums:
-[https://averagechris.srht.site/ctx/](https://averagechris.srht.site/ctx/)
+Release downloads and checksums are attached to
+[GitHub Releases](https://github.com/averagechris/ctx/releases). The manual
+release policy is documented in [docs/release.md](docs/release.md).
 
 From source with cargo:
 

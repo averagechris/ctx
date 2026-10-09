@@ -103,8 +103,15 @@ This is a hard fork of [ctxrs/ctx](https://github.com/ctxrs/ctx) maintained at
 
 ## Upstream review memory
 
-- Forked at upstream `main` commit `38241f0c` ("Require search intent in
-  SDKs", 2026-07-02). Future upstream review starts after `38241f0c`.
+- Fork review boundary was upstream `38241f0c1d167b2f98b358d8d8fa1c37807f66ac`
+  ("Require search intent in SDKs", 2026-07-02). The 2026-10-09 review
+  watermark is upstream `main` `56aaf35233ce7f8aa739c207525a3d67e6ddddbd`.
+  This is not a linear continuation of the old SHA: compare reports 3,690
+  commits unique to current main and 51 unique to the old lineage, with merge
+  base `647d7889d0a404ca7ebf3ca02a66e174cc2b3165`. See
+  `docs/upstream-review-2026-10-09.md` and its full commit inventory for scope
+  and dispositions. Future reviews start from this watermark and remain
+  selective.
 - Permanently excluded from porting: analytics/identity, upgrade/self-update/
   release signing, SDKs/protocol/contracts, Bazel and Buildkite plumbing,
   hosted installer scripts, docs marketing gates.

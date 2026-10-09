@@ -42,6 +42,52 @@ pub use provider_sources::{
 };
 
 pub const CAPTURE_SCHEMA_VERSION: u32 = 1;
+const MAX_PROVIDER_JSONL_LINE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PROVIDER_SQLITE_VALUE_BYTES: usize = 16 * 1024 * 1024;
+
+enum ProviderJsonlLineRead {
+    Eof,
+    Line { bytes: usize },
+    Oversized { bytes: usize },
+}
+
+fn read_provider_jsonl_line(
+    reader: &mut impl BufRead,
+    buffer: &mut Vec<u8>,
+) -> std::io::Result<ProviderJsonlLineRead> {
+    buffer.clear();
+    let mut total = 0usize;
+    let mut oversized = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(if total == 0 {
+                ProviderJsonlLineRead::Eof
+            } else if oversized {
+                ProviderJsonlLineRead::Oversized { bytes: total }
+            } else {
+                ProviderJsonlLineRead::Line { bytes: total }
+            });
+        }
+        let newline_index = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline_index.map_or(available.len(), |index| index + 1);
+        total = total.saturating_add(consumed);
+        if !oversized && total <= MAX_PROVIDER_JSONL_LINE_BYTES {
+            buffer.extend_from_slice(&available[..consumed]);
+        } else {
+            oversized = true;
+            buffer.clear();
+        }
+        reader.consume(consumed);
+        if newline_index.is_some() {
+            return Ok(if oversized {
+                ProviderJsonlLineRead::Oversized { bytes: total }
+            } else {
+                ProviderJsonlLineRead::Line { bytes: total }
+            });
+        }
+    }
+}
 #[derive(Debug, Error)]
 pub enum CaptureError {
     #[error("io error: {0}")]
@@ -1335,10 +1381,15 @@ impl ProviderCaptureAdapter for CodexSessionJsonlAdapter {
         let mut line_number = 0usize;
         let mut line = Vec::new();
         loop {
-            line.clear();
-            let read = reader.read_until(b'\n', &mut line)?;
-            if read == 0 {
-                break;
+            match read_provider_jsonl_line(&mut reader, &mut line)? {
+                ProviderJsonlLineRead::Eof => break,
+                ProviderJsonlLineRead::Line { .. } => {}
+                ProviderJsonlLineRead::Oversized { .. } => {
+                    line_number += 1;
+                    result.summary.skipped += 1;
+                    result.summary.skipped_events += 1;
+                    continue;
+                }
             }
             line_number += 1;
             if line.iter().all(u8::is_ascii_whitespace) {
@@ -2367,21 +2418,26 @@ pub fn import_codex_session_jsonl_tail(
         let mut line_number = 0usize;
         let mut position = 0u64;
 
-        let read = reader.read_until(b'\n', &mut line)?;
-        if read == 0 {
-            return Ok(summary);
-        }
+        let read = match read_provider_jsonl_line(&mut reader, &mut line)? {
+            ProviderJsonlLineRead::Eof => return Ok(summary),
+            ProviderJsonlLineRead::Line { bytes } => bytes,
+            ProviderJsonlLineRead::Oversized { .. } => {
+                return Err(CaptureError::InvalidPayload(
+                    "Codex session header exceeds provider JSONL line limit".to_owned(),
+                ));
+            }
+        };
         line_number += 1;
         position = position.saturating_add(read as u64);
         let header_value: Value = serde_json::from_slice(&line)?;
         let header = codex_session_header(header_value)?;
 
         while position < start_offset {
-            line.clear();
-            let read = reader.read_until(b'\n', &mut line)?;
-            if read == 0 {
-                return Ok(summary);
-            }
+            let read = match read_provider_jsonl_line(&mut reader, &mut line)? {
+                ProviderJsonlLineRead::Eof => return Ok(summary),
+                ProviderJsonlLineRead::Line { bytes }
+                | ProviderJsonlLineRead::Oversized { bytes } => bytes,
+            };
             line_number += 1;
             position = position.saturating_add(read as u64);
         }
@@ -2401,11 +2457,17 @@ pub fn import_codex_session_jsonl_tail(
         let mut call_contexts: BTreeMap<String, CodexToolCallContext> = BTreeMap::new();
         let mut completed_bytes = 0u64;
         loop {
-            line.clear();
-            let read = reader.read_until(b'\n', &mut line)?;
-            if read == 0 {
-                break;
-            }
+            let read = match read_provider_jsonl_line(&mut reader, &mut line)? {
+                ProviderJsonlLineRead::Eof => break,
+                ProviderJsonlLineRead::Line { bytes } => bytes,
+                ProviderJsonlLineRead::Oversized { bytes } => {
+                    line_number += 1;
+                    completed_bytes = completed_bytes.saturating_add(bytes as u64);
+                    summary.skipped += 1;
+                    summary.skipped_events += 1;
+                    continue;
+                }
+            };
             line_number += 1;
             completed_bytes = completed_bytes.saturating_add(read as u64);
             if line.iter().all(u8::is_ascii_whitespace) {
@@ -2898,10 +2960,15 @@ fn import_codex_session_path_fast(
     let mut line_number = 0usize;
     let mut line = Vec::new();
     loop {
-        line.clear();
-        let read = reader.read_until(b'\n', &mut line)?;
-        if read == 0 {
-            break;
+        match read_provider_jsonl_line(&mut reader, &mut line)? {
+            ProviderJsonlLineRead::Eof => break,
+            ProviderJsonlLineRead::Line { .. } => {}
+            ProviderJsonlLineRead::Oversized { .. } => {
+                line_number += 1;
+                summary.skipped += 1;
+                summary.skipped_events += 1;
+                continue;
+            }
         }
         line_number += 1;
         if line.iter().all(u8::is_ascii_whitespace) {
@@ -9633,6 +9700,7 @@ fn normalize_opencode_sqlite_with_hook(
     let mut skipped_bookkeeping_parts = 0usize;
     let mut skipped_partless_messages = 0usize;
     let mut deduped_fallback_rows = 0usize;
+    let mut oversized_source_rows = 0usize;
 
     if has_message {
         normalize_opencode_message_parts(
@@ -9650,11 +9718,15 @@ fn normalize_opencode_sqlite_with_hook(
             &mut sessions_with_events,
             &mut skipped_bookkeeping_parts,
             &mut skipped_partless_messages,
+            &mut oversized_source_rows,
             selected_sessions,
         )?;
     }
     if has_session_message {
-        let rows = opencode_session_message_rows(&conn)?;
+        let (rows, oversized_rows) = opencode_session_message_rows(&conn)?;
+        oversized_source_rows += oversized_rows;
+        result.summary.skipped += oversized_rows;
+        result.summary.skipped_events += oversized_rows;
         emit_opencode_fallback_rows(
             rows,
             &mut ctx,
@@ -9665,7 +9737,10 @@ fn normalize_opencode_sqlite_with_hook(
         );
     }
     if has_session_entry {
-        let rows = opencode_session_entry_rows(&conn)?;
+        let (rows, oversized_rows) = opencode_session_entry_rows(&conn)?;
+        oversized_source_rows += oversized_rows;
+        result.summary.skipped += oversized_rows;
+        result.summary.skipped_events += oversized_rows;
         emit_opencode_fallback_rows(
             rows,
             &mut ctx,
@@ -9712,7 +9787,11 @@ fn normalize_opencode_sqlite_with_hook(
         ));
     }
     let total_source_rows = message_rows + session_message_rows + session_entry_rows;
-    if !session_order.is_empty() && event_captures == 0 && total_source_rows > 0 {
+    if !session_order.is_empty()
+        && event_captures == 0
+        && total_source_rows > 0
+        && oversized_source_rows == 0
+    {
         result.summary.failed += 1;
         result.summary.failures.push(ProviderImportFailure {
             line: 0,
@@ -9740,6 +9819,7 @@ fn normalize_opencode_message_parts(
     sessions_with_events: &mut BTreeSet<String>,
     skipped_bookkeeping_parts: &mut usize,
     skipped_partless_messages: &mut usize,
+    oversized_source_rows: &mut usize,
     selected_sessions: Option<&BTreeSet<String>>,
 ) -> Result<()> {
     let msg_columns = sqlite_table_columns(conn, "message")?;
@@ -9759,8 +9839,10 @@ fn normalize_opencode_message_parts(
         .filter(|ids| !ids.is_empty())
         .map(|ids| format!(" where session_id in ({})", sql_string_list(ids)))
         .unwrap_or_default();
+    let bounded_message_data = bounded_opencode_sqlite_value("data");
+    let message_data_oversized = opencode_sqlite_value_is_oversized("data");
     let msg_sql = format!(
-        "select id, session_id, {m_time_created}, {m_time_updated}, data from message{selection} order by {order_by}"
+        "select id, session_id, {m_time_created}, {m_time_updated}, {bounded_message_data}, {message_data_oversized} from message{selection} order by {order_by}"
     );
 
     let mut part_stmt = if parts_populated {
@@ -9772,8 +9854,10 @@ fn normalize_opencode_message_parts(
         )?;
         let p_time_created = optional_column_expr(&part_columns, "time_created", "0");
         let p_time_updated = optional_column_expr(&part_columns, "time_updated", p_time_created);
+        let bounded_part_data = bounded_opencode_sqlite_value("data");
+        let part_data_oversized = opencode_sqlite_value_is_oversized("data");
         Some(conn.prepare(&format!(
-            "select id, {p_time_created}, {p_time_updated}, data from part where message_id = ?1 order by id"
+            "select id, {p_time_created}, {p_time_updated}, {bounded_part_data}, {part_data_oversized} from part where message_id = ?1 order by id"
         ))?)
     } else {
         None
@@ -9795,7 +9879,9 @@ fn normalize_opencode_message_parts(
         let session_id: String = row.get(1)?;
         let time_created: i64 = row.get(2)?;
         let time_updated: i64 = row.get(3)?;
-        let data: String = row.get(4)?;
+        let raw_data: Option<String> = row.get(4)?;
+        let data_oversized: bool = row.get(5)?;
+        let data = opencode_required_bounded_data(raw_data, data_oversized, 4)?;
         known_row_ids.insert(message_id.clone());
         let line = ctx.next_line();
         let Some(session) = ctx.sessions_by_id.get(&session_id).cloned() else {
@@ -9808,18 +9894,26 @@ fn normalize_opencode_message_parts(
             });
             continue;
         };
-        let message_data: Value = match serde_json::from_str(&data) {
-            Ok(data) => data,
-            Err(err) => {
-                result.summary.failed += 1;
-                result.summary.failures.push(ProviderImportFailure {
-                    line,
-                    error: format!("invalid JSON in message {message_id}: {err}"),
-                });
-                continue;
+        let oversized_message_data = data.is_none();
+        let message_data: Value = match data {
+            Some(data) => match serde_json::from_str(&data) {
+                Ok(data) => data,
+                Err(err) => {
+                    result.summary.failed += 1;
+                    result.summary.failures.push(ProviderImportFailure {
+                        line,
+                        error: format!("invalid JSON in message {message_id}: {err}"),
+                    });
+                    continue;
+                }
+            },
+            None => {
+                *oversized_source_rows += 1;
+                result.summary.skipped += 1;
+                result.summary.skipped_events += 1;
+                Value::Null
             }
         };
-        drop(data);
 
         let mut had_parts = false;
         if let Some(stmt) = part_stmt.as_mut() {
@@ -9829,21 +9923,31 @@ fn normalize_opencode_message_parts(
                 let part_id: String = part_row.get(0)?;
                 let part_time_created: i64 = part_row.get(1)?;
                 let part_time_updated: i64 = part_row.get(2)?;
-                let part_data_raw: String = part_row.get(3)?;
+                let raw_part_data: Option<String> = part_row.get(3)?;
+                let part_data_oversized: bool = part_row.get(4)?;
+                let part_data_raw =
+                    opencode_required_bounded_data(raw_part_data, part_data_oversized, 3)?;
                 known_row_ids.insert(part_id.clone());
                 let part_line = ctx.next_line();
-                let part_data: Value = match serde_json::from_str(&part_data_raw) {
-                    Ok(data) => data,
-                    Err(err) => {
-                        result.summary.failed += 1;
-                        result.summary.failures.push(ProviderImportFailure {
-                            line: part_line,
-                            error: format!("invalid JSON in part {part_id}: {err}"),
-                        });
+                let part_data: Value = match part_data_raw {
+                    Some(data) => match serde_json::from_str(&data) {
+                        Ok(data) => data,
+                        Err(err) => {
+                            result.summary.failed += 1;
+                            result.summary.failures.push(ProviderImportFailure {
+                                line: part_line,
+                                error: format!("invalid JSON in part {part_id}: {err}"),
+                            });
+                            continue;
+                        }
+                    },
+                    None => {
+                        *oversized_source_rows += 1;
+                        result.summary.skipped += 1;
+                        result.summary.skipped_events += 1;
                         continue;
                     }
                 };
-                drop(part_data_raw);
                 let part_type = part_data
                     .get("type")
                     .and_then(Value::as_str)
@@ -9889,6 +9993,9 @@ fn normalize_opencode_message_parts(
         }
 
         if !had_parts {
+            if oversized_message_data {
+                continue;
+            }
             if parts_populated {
                 // Current-schema databases keep all content in part rows;
                 // a message without parts is content-free (or mid-write by a
@@ -10056,7 +10163,7 @@ fn opencode_sessions(
         .map_err(CaptureError::from)
 }
 
-fn opencode_session_message_rows(conn: &Connection) -> Result<Vec<OpenCodeMessageRow>> {
+fn opencode_session_message_rows(conn: &Connection) -> Result<(Vec<OpenCodeMessageRow>, usize)> {
     let columns = sqlite_table_columns(conn, "session_message")?;
     ensure_sqlite_table_columns(
         &columns,
@@ -10073,8 +10180,10 @@ fn opencode_session_message_rows(conn: &Connection) -> Result<Vec<OpenCodeMessag
     } else {
         ("NULL", "id")
     };
+    let bounded_data = bounded_opencode_sqlite_value("data");
+    let data_oversized = opencode_sqlite_value_is_oversized("data");
     let sql = format!(
-        "select id, session_id, {entry_type}, {seq_expr}, {time_created}, {time_updated}, data \
+        "select id, session_id, {entry_type}, {seq_expr}, {time_created}, {time_updated}, {bounded_data}, {data_oversized} \
          from session_message order by session_id, {order_expr}"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -10086,15 +10195,20 @@ fn opencode_session_message_rows(conn: &Connection) -> Result<Vec<OpenCodeMessag
             row.get::<_, Option<i64>>(3)?,
             row.get::<_, i64>(4)?,
             row.get::<_, i64>(5)?,
-            row.get::<_, String>(6)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, bool>(7)?,
         ))
     })?;
-    let rows = rows
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(CaptureError::from)?;
+    let mut skipped_oversized = 0usize;
     let mut messages = Vec::new();
     let mut next_seq_by_session = BTreeMap::<String, i64>::new();
-    for (id, session_id, entry_type, seq, time_created, time_updated, data) in rows {
+    for row in rows {
+        let (id, session_id, entry_type, seq, time_created, time_updated, data, oversized) = row?;
+        let data = opencode_required_bounded_data(data, oversized, 6)?;
+        let Some(data) = data else {
+            skipped_oversized += 1;
+            continue;
+        };
         let seq = seq.unwrap_or_else(|| next_opencode_seq(&mut next_seq_by_session, &session_id));
         messages.push(OpenCodeMessageRow {
             id,
@@ -10106,10 +10220,10 @@ fn opencode_session_message_rows(conn: &Connection) -> Result<Vec<OpenCodeMessag
             data,
         });
     }
-    Ok(messages)
+    Ok((messages, skipped_oversized))
 }
 
-fn opencode_session_entry_rows(conn: &Connection) -> Result<Vec<OpenCodeMessageRow>> {
+fn opencode_session_entry_rows(conn: &Connection) -> Result<(Vec<OpenCodeMessageRow>, usize)> {
     let columns = sqlite_table_columns(conn, "session_entry")?;
     ensure_sqlite_table_columns(
         &columns,
@@ -10123,10 +10237,12 @@ fn opencode_session_entry_rows(conn: &Connection) -> Result<Vec<OpenCodeMessageR
             "data",
         ],
     )?;
-    let mut stmt = conn.prepare(
-        "select id, session_id, type, time_created, time_updated, data \
+    let bounded_data = bounded_opencode_sqlite_value("data");
+    let data_oversized = opencode_sqlite_value_is_oversized("data");
+    let mut stmt = conn.prepare(&format!(
+        "select id, session_id, type, time_created, time_updated, {bounded_data}, {data_oversized} \
          from session_entry order by session_id, time_created, id",
-    )?;
+    ))?;
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -10134,13 +10250,20 @@ fn opencode_session_entry_rows(conn: &Connection) -> Result<Vec<OpenCodeMessageR
             row.get::<_, String>(2)?,
             row.get::<_, i64>(3)?,
             row.get::<_, i64>(4)?,
-            row.get::<_, String>(5)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, bool>(6)?,
         ))
     })?;
     let mut messages = Vec::new();
+    let mut skipped_oversized = 0usize;
     let mut next_seq_by_session = BTreeMap::<String, i64>::new();
     for row in rows {
-        let (id, session_id, entry_type, time_created, time_updated, data) = row?;
+        let (id, session_id, entry_type, time_created, time_updated, data, oversized) = row?;
+        let data = opencode_required_bounded_data(data, oversized, 5)?;
+        let Some(data) = data else {
+            skipped_oversized += 1;
+            continue;
+        };
         let seq = next_opencode_seq(&mut next_seq_by_session, &session_id);
         messages.push(OpenCodeMessageRow {
             id,
@@ -10152,7 +10275,40 @@ fn opencode_session_entry_rows(conn: &Connection) -> Result<Vec<OpenCodeMessageR
             data,
         });
     }
-    Ok(messages)
+    Ok((messages, skipped_oversized))
+}
+
+fn bounded_opencode_sqlite_value(column: &str) -> String {
+    format!(
+        "case when typeof({column}) in ('text', 'blob') \
+              and octet_length({column}) > {MAX_PROVIDER_SQLITE_VALUE_BYTES} \
+         then null else {column} end"
+    )
+}
+
+fn opencode_sqlite_value_is_oversized(column: &str) -> String {
+    format!(
+        "case when typeof({column}) in ('text', 'blob') \
+              and octet_length({column}) > {MAX_PROVIDER_SQLITE_VALUE_BYTES} \
+         then 1 else 0 end"
+    )
+}
+
+fn opencode_required_bounded_data(
+    data: Option<String>,
+    oversized: bool,
+    column_index: usize,
+) -> Result<Option<String>> {
+    if oversized {
+        return Ok(None);
+    }
+    data.map(Some).ok_or_else(|| {
+        CaptureError::from(rusqlite::Error::InvalidColumnType(
+            column_index,
+            "data".to_owned(),
+            rusqlite::types::Type::Null,
+        ))
+    })
 }
 
 fn next_opencode_seq(next_seq_by_session: &mut BTreeMap<String, i64>, session_id: &str) -> i64 {
@@ -14545,6 +14701,54 @@ mod tests {
     }
 
     #[test]
+    fn codex_session_jsonl_skips_oversized_line_and_keeps_following_events() {
+        let temp = tempdir();
+        let path = temp.path().join("oversized-codex.jsonl");
+        let mut file = File::create(&path).unwrap();
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-06-24T01:00:00.000Z","type":"session_meta","payload":{{"id":"codex-oversized-skip","timestamp":"2026-06-24T01:00:00.000Z","cwd":"/repo/ctx","originator":"codex-cli","cli_version":"test","source":"cli","model_provider":"openai"}}}}"#
+        )
+        .unwrap();
+        writeln!(file, r#"{{"timestamp":"2026-06-24T01:00:01.000Z","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"before oversized event"}}]}}}}"#).unwrap();
+        file.write_all(br#"{"timestamp":"2026-06-24T01:00:02.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":""#).unwrap();
+        let oversized_payload = vec![b'x'; MAX_PROVIDER_JSONL_LINE_BYTES];
+        file.write_all(&oversized_payload).unwrap();
+        file.write_all(
+            br#""}]}}
+"#,
+        )
+        .unwrap();
+        writeln!(file, r#"{{"timestamp":"2026-06-24T01:00:03.000Z","type":"response_item","payload":{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"after oversized event"}}]}}}}"#).unwrap();
+        drop(file);
+
+        let mut store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let summary = import_codex_session_jsonl(
+            &path,
+            &mut store,
+            CodexSessionImportOptions {
+                imported_at: "2026-06-24T01:00:04Z".parse().unwrap(),
+                ..CodexSessionImportOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(summary.failed, 0, "{:?}", summary.failures);
+        assert_eq!(summary.skipped_events, 1);
+        assert_eq!(summary.imported_events, 2);
+        let session_id = provider_session_uuid(CaptureProvider::Codex, "codex-oversized-skip");
+        let events = store.events_for_session(session_id).unwrap();
+        let payloads = events
+            .iter()
+            .map(|event| event.payload.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(payloads.contains("before oversized event"), "{payloads}");
+        assert!(payloads.contains("after oversized event"), "{payloads}");
+        assert!(!payloads.contains(&"x".repeat(1024)));
+    }
+
+    #[test]
     fn codex_failures_output_mode_skips_success_and_keeps_failures() {
         let success = br#"{"timestamp":"2026-06-24T01:00:04.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-success","output":"Chunk ID: ok\nProcess exited with code 0\nOutput:\nunit tests passed\n"}}"#;
         let failure = br#"{"timestamp":"2026-06-24T01:00:04.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-failure","output":"Chunk ID: fail\nProcess exited with code 101\nOutput:\ntest failed\n"}}"#;
@@ -15354,6 +15558,92 @@ mod tests {
             events[0].sync.metadata["source_format"].as_str(),
             Some(OPENCODE_SQLITE_SOURCE_FORMAT)
         );
+    }
+
+    #[test]
+    fn native_opencode_skips_oversized_message_and_part_values() {
+        let temp = tempdir();
+        let fixture = write_opencode_current_schema_db(&temp, true);
+        let conn = Connection::open(&fixture).unwrap();
+        let oversized_data = format!(
+            "{{\"role\":\"user\",\"text\":\"{}\"}}",
+            "x".repeat(MAX_PROVIDER_SQLITE_VALUE_BYTES + 1)
+        );
+        conn.execute(
+            "update message set data = ?1 where id = 'current-message-1'",
+            [&oversized_data],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into part values ('current-part-valid', 'current-message-1', 'current-root', 'text', 1782259200000, 1782259200000, ?1)",
+            [r#"{"type":"text","text":"valid OpenCode part"}"#],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into part values ('current-part-oversized', 'current-message-1', 'current-root', 'text', 1782259200001, 1782259200001, ?1)",
+            [&oversized_data],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let summary =
+            import_opencode_sqlite(&fixture, &mut store, OpenCodeSqliteImportOptions::default())
+                .unwrap();
+
+        assert_eq!(summary.failed, 0, "{:?}", summary.failures);
+        assert_eq!(summary.skipped_events, 2);
+        assert_eq!(summary.imported_events, 1);
+        let session_id = provider_session_uuid(CaptureProvider::OpenCode, "current-root");
+        let events = store.events_for_session(session_id).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0]
+            .payload
+            .to_string()
+            .contains("valid OpenCode part"));
+        assert!(!events[0].payload.to_string().contains(&"x".repeat(1024)));
+
+        let empty_temp = tempdir();
+        let empty_fixture = write_opencode_current_schema_db(&empty_temp, true);
+        let empty_conn = Connection::open(&empty_fixture).unwrap();
+        empty_conn
+            .execute(
+                "update message set data = ?1 where id = 'current-message-1'",
+                [&oversized_data],
+            )
+            .unwrap();
+        empty_conn
+            .execute(
+                "insert into part values ('current-part-only-oversized', 'current-message-1', 'current-root', 'text', 1782259200000, 1782259200000, ?1)",
+                [&oversized_data],
+            )
+            .unwrap();
+        drop(empty_conn);
+
+        let mut empty_store = Store::open(empty_temp.path().join("work.sqlite")).unwrap();
+        let empty_summary = import_opencode_sqlite(
+            &empty_fixture,
+            &mut empty_store,
+            OpenCodeSqliteImportOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(empty_summary.failed, 0, "{:?}", empty_summary.failures);
+        assert_eq!(empty_summary.skipped_events, 2);
+        assert_eq!(empty_summary.imported_events, 0);
+    }
+
+    #[test]
+    fn opencode_sqlite_null_data_keeps_the_existing_error_behavior() {
+        let error = opencode_required_bounded_data(None, false, 4).unwrap_err();
+        assert!(matches!(
+            error,
+            CaptureError::Sqlite(rusqlite::Error::InvalidColumnType(
+                4,
+                _,
+                rusqlite::types::Type::Null
+            ))
+        ));
+        assert_eq!(opencode_required_bounded_data(None, true, 4).unwrap(), None);
     }
 
     #[test]
